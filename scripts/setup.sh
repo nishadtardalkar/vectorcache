@@ -68,6 +68,10 @@ default_host_triple() {
     esac
 }
 
+stable_toolchain_name() {
+    echo "stable-$(default_host_triple)"
+}
+
 # Some cluster login nodes preload broken libs (NoMachine, etc.) that crash rustc.
 rust_cmd() {
     (
@@ -77,7 +81,15 @@ rust_cmd() {
 }
 
 stable_rustc() {
-    echo "$RUSTUP_HOME/toolchains/$(default_host_triple)/bin/rustc"
+    if rustup_in_cargo_home; then
+        local rustc
+        rustc="$(rust_cmd rustup which rustc 2>/dev/null || true)"
+        if [[ -n "$rustc" && -x "$rustc" ]]; then
+            echo "$rustc"
+            return
+        fi
+    fi
+    echo "$RUSTUP_HOME/toolchains/$(stable_toolchain_name)/bin/rustc"
 }
 
 rustc_works() {
@@ -105,7 +117,7 @@ fix_rustup_settings() {
 
 purge_stable_toolchain() {
     rustup toolchain uninstall stable >/dev/null 2>&1 || true
-    rm -rf "$RUSTUP_HOME/toolchains/$(default_host_triple)"
+    rm -rf "$RUSTUP_HOME/toolchains/$(stable_toolchain_name)"
 }
 
 install_rustup() {
@@ -187,7 +199,7 @@ Rust installation did not produce a working rustc/cargo.
 
 Common fixes on clusters:
   unset LD_PRELOAD
-  rm -rf "$RUSTUP_HOME/toolchains/$(default_host_triple)"
+  rm -rf "$RUSTUP_HOME/toolchains/$(stable_toolchain_name)"
   bash scripts/setup.sh
 
 If rustc fails with a glibc error, load a newer gcc module or ask admins
