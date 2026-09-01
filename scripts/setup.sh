@@ -36,37 +36,126 @@ step() {
     echo "==> $1"
 }
 
+source_cargo_env() {
+    if [[ -f "${HOME}/.cargo/env" ]]; then
+        # shellcheck disable=SC1091
+        source "${HOME}/.cargo/env"
+    fi
+}
+
+cargo_works() {
+    cargo --version >/dev/null 2>&1
+}
+
 ensure_rust() {
-    if command -v cargo >/dev/null 2>&1; then
+    source_cargo_env
+
+    if cargo_works; then
         echo "Rust already installed: $(cargo --version)"
         return
     fi
 
+    if command -v rustup >/dev/null 2>&1; then
+        echo "Rustup found but no working toolchain; installing stable ..."
+        rustup toolchain install stable
+        rustup default stable
+        source_cargo_env
+        if cargo_works; then
+            echo "Rust ready: $(cargo --version)"
+            return
+        fi
+    fi
+
     echo "Rust not found. Installing via rustup ..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-    # shellcheck disable=SC1091
-    source "${HOME}/.cargo/env"
-}
+    source_cargo_env
 
-ensure_python() {
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON=python3
-    elif command -v python >/dev/null 2>&1; then
-        PYTHON=python
-    else
+    if ! cargo_works; then
         cat >&2 <<'EOF'
-Python 3 not found.
+Rust installation did not produce a working cargo.
 
-Install Python 3.10+ using your system package manager, then re-run this script.
+If rustup is installed, run:
+  rustup default stable
+  source "$HOME/.cargo/env"
 EOF
         exit 1
     fi
 
-    echo "Python already installed: $($PYTHON --version)"
+    echo "Rust installed: $(cargo --version)"
+}
+
+find_python() {
+    local candidates=()
+
+    if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+        candidates+=("${VIRTUAL_ENV}/bin/python")
+    fi
+    if [[ -x "$ROOT/.venv/bin/python" ]]; then
+        candidates+=("$ROOT/.venv/bin/python")
+    fi
+    if [[ -x "$ROOT/env/bin/python" ]]; then
+        candidates+=("$ROOT/env/bin/python")
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        candidates+=("python3")
+    fi
+    if command -v python >/dev/null 2>&1; then
+        candidates+=("python")
+    fi
+
+    local py
+    for py in "${candidates[@]}"; do
+        if "$py" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+            echo "$py"
+            return
+        fi
+    done
+}
+
+ensure_python() {
+    PYTHON="$(find_python || true)"
+    if [[ -z "$PYTHON" ]]; then
+        cat >&2 <<'EOF'
+Python 3.10+ not found.
+
+Install Python 3.10+ using your system package manager or a module load, then re-run
+this script. On clusters, a local venv often works:
+
+  python3 -m venv .venv
+  source .venv/bin/activate
+  ./scripts/setup.sh
+EOF
+        exit 1
+    fi
+
+    echo "Using Python: $PYTHON ($($PYTHON --version))"
+}
+
+ensure_pip() {
+    if "$PYTHON" -m pip --version >/dev/null 2>&1; then
+        return
+    fi
+
+    echo "pip not found for $PYTHON; bootstrapping with ensurepip ..."
+    if ! "$PYTHON" -m ensurepip --upgrade >/dev/null 2>&1; then
+        cat >&2 <<EOF
+Could not bootstrap pip for $PYTHON.
+
+Recreate the virtualenv with pip included, for example:
+  rm -rf .venv
+  python3 -m venv .venv
+  source .venv/bin/activate
+  ./scripts/setup.sh
+
+Or install pip for your system Python (e.g. python3-pip / pip module).
+EOF
+        exit 1
+    fi
 }
 
 install_python_deps() {
     step "Installing Python packages"
+    ensure_pip
     "$PYTHON" -m pip install --upgrade pip
     "$PYTHON" -m pip install -r "$ROOT/scripts/requirements.txt"
 }
