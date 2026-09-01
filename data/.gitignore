@@ -1,0 +1,6 @@
+*.hdf5
+*.h5
+*.npy
+*.tmp
+*.parquet
+.cache/
