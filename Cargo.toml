@@ -17,6 +17,10 @@ path = "src/bin/fetch_datasets.rs"
 name = "ingest-sample"
 path = "src/bin/ingest_sample.rs"
 
+[[bin]]
+name = "ingest-bench"
+path = "src/bin/ingest_bench.rs"
+
 [dependencies]
 anyhow = "1"
 arrow-array = "54"
