@@ -16,6 +16,7 @@ export RUSTUP_HOME="${RUSTUP_HOME:-$CACHE_ROOT/rustup}"
 export CARGO_HOME="${CARGO_HOME:-$CACHE_ROOT/cargo}"
 export TMPDIR="${TMPDIR:-$CACHE_ROOT}"
 mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$TMPDIR"
+export PATH="$CARGO_HOME/bin:$PATH"
 
 WITH_GLOVE=0
 FETCH_DATASETS=0
@@ -46,10 +47,23 @@ source_cargo_env() {
     if [[ -f "${CARGO_HOME}/env" ]]; then
         # shellcheck disable=SC1091
         source "${CARGO_HOME}/env"
-    elif [[ -f "${HOME}/.cargo/env" ]]; then
-        # shellcheck disable=SC1091
-        source "${HOME}/.cargo/env"
     fi
+    export PATH="$CARGO_HOME/bin:$PATH"
+}
+
+rustup_in_cargo_home() {
+    [[ -x "$CARGO_HOME/bin/rustup" ]]
+}
+
+install_rustup() {
+    echo "Installing rustup into $CARGO_HOME (toolchains in $RUSTUP_HOME) ..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+    source_cargo_env
+}
+
+install_stable_toolchain() {
+    rustup toolchain install stable --profile minimal
+    rustup default stable
 }
 
 cargo_works() {
@@ -64,10 +78,13 @@ ensure_rust() {
         return
     fi
 
-    if command -v rustup >/dev/null 2>&1; then
-        echo "Rustup found but no working toolchain; installing stable ..."
-        rustup toolchain install stable
-        rustup default stable
+    if rustup_in_cargo_home; then
+        echo "Rustup found in $CARGO_HOME; installing stable toolchain ..."
+        if ! install_stable_toolchain; then
+            echo "Stable toolchain looks corrupt; reinstalling ..."
+            rustup toolchain uninstall stable >/dev/null 2>&1 || true
+            install_stable_toolchain
+        fi
         source_cargo_env
         if cargo_works; then
             echo "Rust ready: $(cargo --version)"
@@ -75,15 +92,25 @@ ensure_rust() {
         fi
     fi
 
-    echo "Rust not found. Installing via rustup ..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-    source_cargo_env
+    install_rustup
 
     if ! cargo_works; then
-        cat >&2 <<'EOF'
+        echo "Repairing stable toolchain in $RUSTUP_HOME ..."
+        rustup toolchain uninstall stable >/dev/null 2>&1 || true
+        install_stable_toolchain
+        source_cargo_env
+    fi
+
+    if ! cargo_works; then
+        cat >&2 <<EOF
 Rust installation did not produce a working cargo.
 
-If rustup is installed, run:
+Cache locations:
+  RUSTUP_HOME=$RUSTUP_HOME
+  CARGO_HOME=$CARGO_HOME
+
+Try:
+  export PATH="$CARGO_HOME/bin:\$PATH"
   rustup default stable
   source "$CARGO_HOME/env"
 EOF
@@ -254,6 +281,7 @@ fetch_datasets() {
 
 step "vectorcache setup"
 echo "Project root: $ROOT"
+echo "Rust cache: RUSTUP_HOME=$RUSTUP_HOME CARGO_HOME=$CARGO_HOME TMPDIR=$TMPDIR"
 
 ensure_rust
 ensure_python
