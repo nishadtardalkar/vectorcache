@@ -1,12 +1,11 @@
-//! Ingest a sample of vectors and report per-vector dimension variance.
+//! Ingest a sample of vectors into L1 bitcode blocks.
 //!
-//! Pre-ingestion variance is computed on raw dataset vectors.
-//! Post-ingestion variance is computed on L2-normalized + SRHT-rotated vectors.
+//! Use `--variance` to report per-vector dimension variance before/after SRHT.
 //!
 //! Usage:
 //! ```text
 //! cargo run --release --bin ingest-sample -- --npy data/.cache/glove-sample-100.npy
-//! cargo run --release --features glove --bin ingest-sample -- --dataset glove --limit 100
+//! cargo run --release --features glove --bin ingest-sample -- --dataset glove --limit 100 --variance
 //! ```
 
 use std::path::PathBuf;
@@ -25,7 +24,7 @@ use vectorcache::transform::{l2_normalize_in_place, padded_dim, SrhtRotation};
 #[derive(Debug, Parser)]
 #[command(
     name = "ingest-sample",
-    about = "Ingest a limited number of vectors and report per-vector dimension variance"
+    about = "Ingest vectors and optionally report per-vector dimension variance"
 )]
 struct Args {
     /// Pre-extracted float32 NPY matrix (bypasses dataset reader)
@@ -55,6 +54,10 @@ struct Args {
     /// Number of consecutive SRHT rounds to apply during ingestion
     #[arg(long, default_value_t = 1)]
     rounds: usize,
+
+    /// Report per-vector dimension variance before/after SRHT
+    #[arg(long)]
+    variance: bool,
 
     /// Print the stored vector at this index after ingestion
     #[arg(long)]
@@ -88,7 +91,7 @@ impl DatasetReader for SampleReader {
 struct LimitedReader<R> {
     inner: R,
     remaining: usize,
-    pre_variances: Vec<f64>,
+    pre_variances: Option<Vec<f64>>,
 }
 
 impl<R: DatasetReader> DatasetReader for LimitedReader<R> {
@@ -101,13 +104,12 @@ impl<R: DatasetReader> DatasetReader for LimitedReader<R> {
             return Ok(false);
         }
 
-        if !self
-            .inner
-            .next_vector_into(out)?
-        {
+        if !self.inner.next_vector_into(out)? {
             bail!("reader exhausted before reaching ingest limit");
         }
-        self.pre_variances.push(variance_across_dims(out));
+        if let Some(pre) = &mut self.pre_variances {
+            pre.push(variance_across_dims(out));
+        }
         self.remaining -= 1;
         Ok(true)
     }
@@ -142,7 +144,7 @@ impl VectorHook for VarianceHook {
 struct MultiRoundReader<R> {
     inner: R,
     remaining: usize,
-    pre_variances: Vec<f64>,
+    pre_variances: Option<Vec<f64>>,
     rounds: usize,
     seed: u64,
     round_variances: Vec<Vec<f64>>,
@@ -164,7 +166,9 @@ impl<R: DatasetReader> DatasetReader for MultiRoundReader<R> {
         if !self.inner.next_vector_into(&mut self.raw)? {
             bail!("reader exhausted before reaching ingest limit");
         }
-        self.pre_variances.push(variance_across_dims(&self.raw));
+        if let Some(pre) = &mut self.pre_variances {
+            pre.push(variance_across_dims(&self.raw));
+        }
         self.remaining -= 1;
 
         self.output.copy_from_slice(&self.raw);
@@ -173,10 +177,9 @@ impl<R: DatasetReader> DatasetReader for MultiRoundReader<R> {
             let rot = SrhtRotation::new(self.output.len(), self.seed + round as u64);
             self.scratch.resize(rot.padded_dim(), 0.0);
             rot.apply(&self.output, &mut self.scratch)?;
-            if self.round_variances.len() <= round {
-                self.round_variances.push(Vec::new());
+            if !self.round_variances.is_empty() {
+                self.round_variances[round].push(variance_across_dims(&self.scratch));
             }
-            self.round_variances[round].push(variance_across_dims(&self.scratch));
             self.output.copy_from_slice(&self.scratch);
         }
 
@@ -226,17 +229,20 @@ fn main() -> Result<()> {
     let meta = reader.meta();
     let limit = args.limit.min(meta.count);
     let padded = padded_dim(meta.dim);
-    let capture_vectors = args.show_index.is_some();
+    let track_variance = args.variance;
+    let capture_vectors = args.show_index.is_some() && track_variance;
 
     println!(
         "Dataset: {} (dim={}, padded={}, available={}, ingesting={}, srht_seed={}, rounds={})",
         meta.label, meta.dim, padded, meta.count, limit, args.seed, args.rounds
     );
 
-    let mut hook = VarianceHook::new(capture_vectors);
-    hook.post_variances.reserve(limit);
-    if capture_vectors {
-        hook.vectors.reserve(limit);
+    let mut variance_hook = VarianceHook::new(capture_vectors);
+    if track_variance {
+        variance_hook.post_variances.reserve(limit);
+        if capture_vectors {
+            variance_hook.vectors.reserve(limit);
+        }
     }
 
     let ingest_start = Instant::now();
@@ -245,21 +251,37 @@ fn main() -> Result<()> {
         let mut limited = LimitedReader {
             inner: reader,
             remaining: limit,
-            pre_variances: Vec::with_capacity(limit),
+            pre_variances: track_variance.then(|| Vec::with_capacity(limit)),
         };
         let mut engine = IngestionEngine::with_rotation(meta.dim, args.seed);
         engine.reserve_vectors(limit);
-        let mut hook_ref = Some(&mut hook);
-        let report = engine.ingest(&mut limited, &mut hook_ref)?;
-        (limited.pre_variances, Vec::new(), report, engine)
+        let report = if track_variance {
+            let mut hook_ref = Some(&mut variance_hook);
+            engine.ingest_with_hook(&mut limited, &mut hook_ref)?
+        } else {
+            engine.ingest(&mut limited)?
+        };
+        (
+            limited.pre_variances.unwrap_or_default(),
+            Vec::new(),
+            report,
+            engine,
+        )
     } else {
+        let round_variances = if track_variance {
+            (0..args.rounds)
+                .map(|_| Vec::with_capacity(limit))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut limited = MultiRoundReader {
             inner: reader,
             remaining: limit,
-            pre_variances: Vec::with_capacity(limit),
+            pre_variances: track_variance.then(|| Vec::with_capacity(limit)),
             rounds: args.rounds,
             seed: args.seed,
-            round_variances: Vec::new(),
+            round_variances,
             raw: vec![0.0; meta.dim],
             scratch: Vec::new(),
             output: vec![0.0; meta.dim],
@@ -273,10 +295,14 @@ fn main() -> Result<()> {
         };
         let mut engine = IngestionEngine::from_rotated(store_dim);
         engine.reserve_vectors(limit);
-        let mut hook_ref = Some(&mut hook);
-        let report = engine.ingest(&mut limited, &mut hook_ref)?;
+        let report = if track_variance {
+            let mut hook_ref = Some(&mut variance_hook);
+            engine.ingest_with_hook(&mut limited, &mut hook_ref)?
+        } else {
+            engine.ingest(&mut limited)?
+        };
         (
-            limited.pre_variances,
+            limited.pre_variances.unwrap_or_default(),
             limited.round_variances,
             report,
             engine,
@@ -285,11 +311,13 @@ fn main() -> Result<()> {
 
     let elapsed_ns = ingest_start.elapsed().as_nanos() as u64;
 
-    print_variance_stats("Pre-ingestion (raw)", &pre_variances);
-    for (i, round_stats) in round_variances.iter().enumerate() {
-        print_variance_stats(&format!("After SRHT round {}", i + 1), round_stats);
+    if track_variance {
+        print_variance_stats("Pre-ingestion (raw)", &pre_variances);
+        for (i, round_stats) in round_variances.iter().enumerate() {
+            print_variance_stats(&format!("After SRHT round {}", i + 1), round_stats);
+        }
+        print_variance_stats("Post-ingestion (stored)", &variance_hook.post_variances);
     }
-    print_variance_stats("Post-ingestion (stored)", &hook.post_variances);
 
     println!("Ingested: {} vectors", report.vectors_ingested);
     println!(
@@ -318,8 +346,10 @@ fn main() -> Result<()> {
             );
         }
         print_stored_l1_codes(index, &engine, padded);
-        if let Some(vector) = hook.vectors.get(index) {
+        if let Some(vector) = variance_hook.vectors.get(index) {
             print_rotated_vector(index, vector);
+        } else if args.show_index.is_some() && !track_variance {
+            println!("(pass --variance with --show-index to also print the rotated f32 vector)");
         }
     }
 

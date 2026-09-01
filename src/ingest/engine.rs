@@ -84,7 +84,14 @@ impl IngestionEngine {
         self.store.push_l1_codes(codes)
     }
 
-    pub fn ingest<H: VectorHook + ?Sized>(
+    /// Ingest vectors with no per-vector hook (default).
+    pub fn ingest(&mut self, reader: &mut dyn DatasetReader) -> Result<IngestReport> {
+        let mut hook: Option<&mut crate::ingest::NoopHook> = None;
+        self.ingest_with_hook(reader, &mut hook)
+    }
+
+    /// Ingest vectors, invoking `hook` on each rotated vector before L1 storage.
+    pub fn ingest_with_hook<H: VectorHook + ?Sized>(
         &mut self,
         reader: &mut dyn DatasetReader,
         hook: &mut Option<&mut H>,
@@ -193,10 +200,8 @@ mod tests {
     use crate::transform::padded_dim;
 
     use crate::ingest::block::BLOCK_SIZE;
-    use crate::ingest::hook::NoopHook;
 
     use super::*;
-
     struct MockReader {
         vectors: Vec<Vec<f32>>,
         index: usize,
@@ -256,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_with_timing_and_hook() {
+    fn ingest_default_has_no_hook() {
         let dim = 4;
         let n = BLOCK_SIZE * 2 + 5;
         let vectors: Vec<Vec<f32>> = (0..n)
@@ -265,12 +270,8 @@ mod tests {
 
         let mut reader = MockReader::new(vectors, dim);
         let mut engine = IngestionEngine::with_rotation(dim, 42);
-        let mut hook = CountingHook { count: 0 };
-        let mut hook_ref = Some(&mut hook);
+        let report = engine.ingest(&mut reader).unwrap();
 
-        let report = engine.ingest(&mut reader, &mut hook_ref).unwrap();
-
-        assert_eq!(hook.count, n as u64);
         assert_eq!(report.vectors_ingested, n as u64);
         assert_eq!(report.full_blocks, 2);
         assert_eq!(report.partial_len, 5);
@@ -278,13 +279,15 @@ mod tests {
     }
 
     #[test]
-    fn ingest_without_hook() {
+    fn ingest_with_hook_counts_vectors() {
         let dim = 4;
         let vectors = vec![vec![1.0, 2.0, 3.0, 4.0]];
         let mut reader = MockReader::new(vectors, dim);
         let mut engine = IngestionEngine::with_rotation(dim, 42);
-        let mut no_hook: Option<&mut NoopHook> = None;
-        let report = engine.ingest(&mut reader, &mut no_hook).unwrap();
+        let mut hook = CountingHook { count: 0 };
+        let mut hook_ref = Some(&mut hook);
+        let report = engine.ingest_with_hook(&mut reader, &mut hook_ref).unwrap();
+        assert_eq!(hook.count, 1);
         assert_eq!(report.vectors_ingested, 1);
     }
 
@@ -305,7 +308,7 @@ mod tests {
         assert_eq!(engine.store().l1_words_per_vec(), words_per_vec);
 
         let mut hook_ref = Some(&mut hook);
-        let report = engine.ingest(&mut reader, &mut hook_ref).unwrap();
+        let report = engine.ingest_with_hook(&mut reader, &mut hook_ref).unwrap();
 
         assert_eq!(report.vectors_ingested, n as u64);
         assert_eq!(engine.store().total_vectors(), n);
@@ -327,7 +330,7 @@ mod tests {
         let mut hook = CapturingHook { last: None };
 
         let mut hook_ref = Some(&mut hook);
-        engine.ingest(&mut reader, &mut hook_ref).unwrap();
+        engine.ingest_with_hook(&mut reader, &mut hook_ref).unwrap();
 
         let rotated = hook.last.unwrap();
         let norm: f32 = rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -346,8 +349,7 @@ mod tests {
         let mut reader = MockReader::new(vec![vector], dim);
         let mut engine = IngestionEngine::from_rotated(dim);
 
-        let mut no_hook: Option<&mut NoopHook> = None;
-        engine.ingest(&mut reader, &mut no_hook).unwrap();
+        engine.ingest(&mut reader).unwrap();
 
         let stored = engine.store().partial_block().as_slice();
         assert_eq!(stored, expected.as_slice());
