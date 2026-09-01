@@ -18,6 +18,11 @@ export TMPDIR="${TMPDIR:-$CACHE_ROOT}"
 mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$TMPDIR"
 export PATH="$CARGO_HOME/bin:$PATH"
 
+if [[ -n "${LD_PRELOAD:-}" ]]; then
+    echo "Unsetting LD_PRELOAD for Rust (was: $LD_PRELOAD)"
+    unset LD_PRELOAD
+fi
+
 WITH_GLOVE=0
 FETCH_DATASETS=0
 SKIP_BUILD=0
@@ -55,69 +60,143 @@ rustup_in_cargo_home() {
     [[ -x "$CARGO_HOME/bin/rustup" ]]
 }
 
+default_host_triple() {
+    case "$(uname -m)" in
+        x86_64) echo "x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
+        *) echo "$(uname -m)-unknown-linux-gnu" ;;
+    esac
+}
+
+# Some cluster login nodes preload broken libs (NoMachine, etc.) that crash rustc.
+rust_cmd() {
+    (
+        unset LD_PRELOAD
+        "$@"
+    )
+}
+
+stable_rustc() {
+    echo "$RUSTUP_HOME/toolchains/$(default_host_triple)/bin/rustc"
+}
+
+rustc_works() {
+    local rustc
+    rustc="$(stable_rustc)"
+    [[ -x "$rustc" ]] && rust_cmd "$rustc" --version >/dev/null 2>&1
+}
+
+cargo_works() {
+    rust_cmd cargo --version >/dev/null 2>&1
+}
+
+fix_rustup_settings() {
+    local host expected
+    expected="$(default_host_triple)"
+    if [[ ! -f "$RUSTUP_HOME/settings.toml" ]]; then
+        return
+    fi
+    host="$(grep -E '^default_host' "$RUSTUP_HOME/settings.toml" 2>/dev/null | sed 's/.*= *"\([^"]*\)".*/\1/' || true)"
+    if [[ -n "$host" && "$host" != "$expected" ]]; then
+        echo "Removing stale rustup settings (default_host=$host, expected $expected) ..."
+        rm -f "$RUSTUP_HOME/settings.toml"
+    fi
+}
+
+purge_stable_toolchain() {
+    rustup toolchain uninstall stable >/dev/null 2>&1 || true
+    rm -rf "$RUSTUP_HOME/toolchains/$(default_host_triple)"
+}
+
 install_rustup() {
     echo "Installing rustup into $CARGO_HOME (toolchains in $RUSTUP_HOME) ..."
+    fix_rustup_settings
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
     source_cargo_env
 }
 
 install_stable_toolchain() {
-    rustup toolchain install stable --profile minimal
-    rustup default stable
+    purge_stable_toolchain
+    rust_cmd rustup toolchain install stable --profile minimal
+    rust_cmd rustup default stable
 }
 
-cargo_works() {
-    cargo --version >/dev/null 2>&1
+diagnose_rustc_failure() {
+    local rustc
+    rustc="$(stable_rustc)"
+    echo "=== Rust diagnostics ===" >&2
+    echo "Host triple: $(default_host_triple)" >&2
+    echo "RUSTUP_HOME=$RUSTUP_HOME" >&2
+    echo "CARGO_HOME=$CARGO_HOME" >&2
+    echo "LD_PRELOAD=${LD_PRELOAD:-<unset>}" >&2
+    if [[ -f "$RUSTUP_HOME/settings.toml" ]]; then
+        echo "settings.toml:" >&2
+        cat "$RUSTUP_HOME/settings.toml" >&2
+    fi
+    if [[ -f "$rustc" ]]; then
+        ls -la "$rustc" >&2
+        echo "rustc --version:" >&2
+        rust_cmd "$rustc" --version >&2 2>&1 || true
+        if command -v ldd >/dev/null 2>&1; then
+            echo "ldd rustc:" >&2
+            ldd "$rustc" >&2 2>&1 || true
+            echo "glibc: $(ldd --version 2>&1 | head -1)" >&2
+        fi
+    else
+        echo "rustc not found at $rustc" >&2
+    fi
+    if command -v df >/dev/null 2>&1; then
+        echo "disk: $(df -h "$RUSTUP_HOME" 2>/dev/null | tail -1 || true)" >&2
+    fi
+    echo "========================" >&2
 }
 
 ensure_rust() {
     source_cargo_env
 
-    if cargo_works; then
-        echo "Rust already installed: $(cargo --version)"
+    if cargo_works && rustc_works; then
+        echo "Rust already installed: $(rust_cmd cargo --version)"
         return
     fi
 
     if rustup_in_cargo_home; then
         echo "Rustup found in $CARGO_HOME; installing stable toolchain ..."
-        if ! install_stable_toolchain; then
+        if ! install_stable_toolchain || ! rustc_works; then
             echo "Stable toolchain looks corrupt; reinstalling ..."
-            rustup toolchain uninstall stable >/dev/null 2>&1 || true
             install_stable_toolchain
         fi
         source_cargo_env
-        if cargo_works; then
-            echo "Rust ready: $(cargo --version)"
+        if cargo_works && rustc_works; then
+            echo "Rust ready: $(rust_cmd cargo --version)"
             return
         fi
     fi
 
     install_rustup
 
-    if ! cargo_works; then
+    if ! rustc_works; then
         echo "Repairing stable toolchain in $RUSTUP_HOME ..."
-        rustup toolchain uninstall stable >/dev/null 2>&1 || true
         install_stable_toolchain
         source_cargo_env
     fi
 
-    if ! cargo_works; then
+    if ! cargo_works || ! rustc_works; then
+        diagnose_rustc_failure
         cat >&2 <<EOF
-Rust installation did not produce a working cargo.
+Rust installation did not produce a working rustc/cargo.
 
-Cache locations:
-  RUSTUP_HOME=$RUSTUP_HOME
-  CARGO_HOME=$CARGO_HOME
+Common fixes on clusters:
+  unset LD_PRELOAD
+  rm -rf "$RUSTUP_HOME/toolchains/$(default_host_triple)"
+  bash scripts/setup.sh
 
-Try:
-  export PATH="$CARGO_HOME/bin:\$PATH"
-  rustup default stable
-  source "$CARGO_HOME/env"
+If rustc fails with a glibc error, load a newer gcc module or ask admins
+for a system Rust module instead of rustup.
 EOF
         exit 1
     fi
 
-    echo "Rust installed: $(cargo --version)"
+    echo "Rust installed: $(rust_cmd cargo --version)"
 }
 
 find_python() {
