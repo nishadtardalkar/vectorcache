@@ -1,8 +1,10 @@
 //! Stage-level ingestion profiler (timing lives in support scripts, not the engine).
 //!
 //! ```text
-//! cargo run --release --bin ingest-bench -- --limit 10000
-//! cargo run --release --bin ingest-bench -- --npy data/.cache/glove-sample.npy --limit 50000
+//! cargo run --release --bin ingest-bench
+//! cargo run --release --features glove --bin ingest-bench -- --dataset glove
+//! cargo run --release --bin ingest-bench -- --npy data/openai-1536.npy --limit 50000
+//! cargo run --release --bin ingest-bench -- --synthetic --limit 10000 --dim 200
 //! ```
 
 use std::path::PathBuf;
@@ -13,7 +15,10 @@ use clap::Parser;
 use ndarray::Array2;
 use ndarray_npy::WriteNpyExt;
 use vectorcache::datasets::npy::NpyReader;
-use vectorcache::datasets::reader::DatasetReader;
+use vectorcache::datasets::reader::{DatasetMeta, DatasetReader, DatasetSplit};
+#[cfg(feature = "glove")]
+use vectorcache::datasets::reader::open_dataset;
+use vectorcache::datasets::DatasetKind;
 use vectorcache::ingest::{IngestionEngine, TimingSummary};
 use vectorcache::quantize::{l1_words_per_vector, quantize_4d_to_1bit_into};
 use vectorcache::transform::{l2_normalize_in_place, padded_dim, SrhtRotation};
@@ -22,24 +27,86 @@ use vectorcache::transform::{l2_normalize_in_place, padded_dim, SrhtRotation};
 #[command(name = "ingest-bench", about = "Profile ingestion stage hot paths")]
 struct Args {
     /// Pre-extracted float32 NPY matrix
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["dataset", "synthetic"])]
     npy: Option<PathBuf>,
 
-    /// Vector dimension when generating synthetic data
+    /// Dataset name (default: VECTORCACHE_DATASET env or glove)
+    #[arg(long, env = "VECTORCACHE_DATASET", conflicts_with_all = ["npy", "synthetic"])]
+    dataset: Option<String>,
+
+    /// Generate synthetic data instead of reading a dataset
+    #[arg(long, conflicts_with_all = ["npy", "dataset"])]
+    synthetic: bool,
+
+    /// Data directory (default: VECTORCACHE_DATA_DIR env or data)
+    #[arg(long, env = "VECTORCACHE_DATA_DIR", default_value = "data")]
+    data_dir: PathBuf,
+
+    /// HDF5 split for GloVe (train or test)
+    #[arg(long, default_value = "train")]
+    split: String,
+
+    /// Cap vectors profiled (default: full dataset)
+    #[arg(long)]
+    limit: Option<usize>,
+
+    /// Vector dimension for --synthetic only
     #[arg(long, default_value_t = 200)]
     dim: usize,
-
-    /// Vectors to profile
-    #[arg(long, default_value_t = 10_000)]
-    limit: usize,
 
     /// SRHT seed
     #[arg(long, default_value_t = 42)]
     seed: u64,
 
-    /// Write synthetic NPY here when --npy is omitted
+    /// Write synthetic NPY here when --synthetic is used
     #[arg(long, default_value = "data/.cache/bench-synthetic.npy")]
     synthetic_path: PathBuf,
+}
+
+enum BenchReader {
+    Npy(NpyReader),
+    #[cfg(feature = "glove")]
+    Open(vectorcache::datasets::reader::OpenDatasetReader),
+}
+
+impl DatasetReader for BenchReader {
+    fn meta(&self) -> DatasetMeta {
+        match self {
+            Self::Npy(r) => r.meta(),
+            #[cfg(feature = "glove")]
+            Self::Open(r) => r.meta(),
+        }
+    }
+
+    fn next_vector_into(&mut self, out: &mut [f32]) -> Result<bool> {
+        match self {
+            Self::Npy(r) => r.next_vector_into(out),
+            #[cfg(feature = "glove")]
+            Self::Open(r) => r.next_vector_into(out),
+        }
+    }
+}
+
+struct LimitedReader<R> {
+    inner: R,
+    remaining: usize,
+}
+
+impl<R: DatasetReader> DatasetReader for LimitedReader<R> {
+    fn meta(&self) -> DatasetMeta {
+        self.inner.meta()
+    }
+
+    fn next_vector_into(&mut self, out: &mut [f32]) -> Result<bool> {
+        if self.remaining == 0 {
+            return Ok(false);
+        }
+        if !self.inner.next_vector_into(out)? {
+            bail!("reader exhausted before reaching ingest limit");
+        }
+        self.remaining -= 1;
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -61,42 +128,91 @@ impl StageTotals {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.limit == 0 {
+    if args.synthetic && args.limit == Some(0) {
         bail!("--limit must be > 0");
     }
 
-    let npy_path = match &args.npy {
-        Some(path) => path.clone(),
-        None => {
-            ensure_synthetic_npy(&args.synthetic_path, args.limit.max(10_000), args.dim)?;
-            args.synthetic_path.clone()
-        }
-    };
-
-    let mut reader = NpyReader::open(&npy_path, "bench")?;
+    let (mut reader, source_label) = open_reader(&args)?;
     let meta = reader.meta();
-    let limit = args.limit.min(meta.count);
+    let limit = args.limit.unwrap_or(meta.count).min(meta.count);
+    if limit == 0 {
+        bail!("dataset has no vectors to profile");
+    }
+
     let padded = padded_dim(meta.dim);
 
     println!(
         "Ingest bench: {} (dim={}, padded={}, vectors={})",
-        meta.label, meta.dim, padded, limit
+        source_label, meta.dim, padded, limit
     );
+    if args.limit.is_some() && args.limit.unwrap() < meta.count {
+        println!("  (capped from {} vectors in dataset)", meta.count);
+    }
     println!();
 
-    let stages = profile_stages(&mut reader, meta.dim, padded, args.seed, limit)?;
+    let stages = profile_stages_inner(&mut reader, meta.dim, padded, args.seed, limit)?;
     print_stage_report("Per-stage (sequential micro-profile)", &stages);
 
-    let mut reader2 = NpyReader::open(&npy_path, "bench")?;
-    let wall_ns = profile_engine(&mut reader2, meta.dim, args.seed, limit)?;
+    let (reader2, _) = open_reader(&args)?;
+    let wall_ns = profile_engine_inner(reader2, meta.dim, args.seed, limit)?;
     print_wall_report(wall_ns, limit, &stages);
 
     Ok(())
 }
 
+fn open_reader(args: &Args) -> Result<(BenchReader, String)> {
+    if let Some(path) = &args.npy {
+        let reader = NpyReader::open(path, "bench")?;
+        let label = format!("{} ({})", path.display(), reader.meta().label);
+        return Ok((BenchReader::Npy(reader), label));
+    }
+
+    if args.synthetic {
+        let count = args.limit.unwrap_or(10_000);
+        if count == 0 {
+            bail!("--limit must be > 0 for --synthetic");
+        }
+        ensure_synthetic_npy(&args.synthetic_path, count, args.dim)?;
+        let reader = NpyReader::open(&args.synthetic_path, "synthetic")?;
+        return Ok((
+            BenchReader::Npy(reader),
+            format!("{} (synthetic)", args.synthetic_path.display()),
+        ));
+    }
+
+    let name = args.dataset.as_deref().unwrap_or("glove");
+    let kind = DatasetKind::parse(name).with_context(|| format!("unknown dataset '{name}'"))?;
+    let split = match args.split.as_str() {
+        "train" => DatasetSplit::Train,
+        "test" => DatasetSplit::Test,
+        other => bail!("unknown split '{other}'; use train or test"),
+    };
+
+    #[cfg(feature = "glove")]
+    {
+        let reader = open_dataset(kind, &args.data_dir, split)?;
+        let label = format!("{name} ({})", args.data_dir.display());
+        Ok((BenchReader::Open(reader), label))
+    }
+
+    #[cfg(not(feature = "glove"))]
+    {
+        let _ = (kind, split);
+        if matches!(kind, DatasetKind::OpenAi1536 | DatasetKind::OpenAi3072) {
+            let path = kind.path(&args.data_dir);
+            let reader = NpyReader::open(&path, kind.label())?;
+            let label = format!("{name} ({})", path.display());
+            return Ok((BenchReader::Npy(reader), label));
+        }
+        bail!(
+            "dataset '{name}' requires --npy, --synthetic, or build with --features glove"
+        );
+    }
+}
+
 fn ensure_synthetic_npy(path: &PathBuf, count: usize, dim: usize) -> Result<()> {
     if path.is_file() {
-        let reader = NpyReader::open(path, "bench")?;
+        let reader = NpyReader::open(path, "synthetic")?;
         if reader.meta().dim == dim && reader.meta().count >= count {
             return Ok(());
         }
@@ -119,8 +235,8 @@ fn ensure_synthetic_npy(path: &PathBuf, count: usize, dim: usize) -> Result<()> 
     Ok(())
 }
 
-fn profile_stages(
-    reader: &mut NpyReader,
+fn profile_stages_inner<R: DatasetReader>(
+    reader: &mut R,
     dim: usize,
     padded: usize,
     seed: u64,
@@ -194,29 +310,12 @@ fn profile_stages(
     Ok(totals)
 }
 
-fn profile_engine(reader: &mut NpyReader, dim: usize, seed: u64, limit: usize) -> Result<u64> {
-    struct LimitedReader<'a> {
-        inner: &'a mut NpyReader,
-        remaining: usize,
-    }
-
-    impl DatasetReader for LimitedReader<'_> {
-        fn meta(&self) -> vectorcache::datasets::reader::DatasetMeta {
-            self.inner.meta()
-        }
-
-        fn next_vector_into(&mut self, out: &mut [f32]) -> Result<bool> {
-            if self.remaining == 0 {
-                return Ok(false);
-            }
-            if !self.inner.next_vector_into(out)? {
-                return Ok(false);
-            }
-            self.remaining -= 1;
-            Ok(true)
-        }
-    }
-
+fn profile_engine_inner<R: DatasetReader>(
+    reader: R,
+    dim: usize,
+    seed: u64,
+    limit: usize,
+) -> Result<u64> {
     let mut limited = LimitedReader {
         inner: reader,
         remaining: limit,
