@@ -11,6 +11,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+CACHE_ROOT="/rsstu/users/d/dslalush/KneeProject/.cache"
+export RUSTUP_HOME="${RUSTUP_HOME:-$CACHE_ROOT/rustup}"
+export CARGO_HOME="${CARGO_HOME:-$CACHE_ROOT/cargo}"
+export TMPDIR="${TMPDIR:-$CACHE_ROOT}"
+mkdir -p "$RUSTUP_HOME" "$CARGO_HOME" "$TMPDIR"
+
 WITH_GLOVE=0
 FETCH_DATASETS=0
 SKIP_BUILD=0
@@ -37,7 +43,10 @@ step() {
 }
 
 source_cargo_env() {
-    if [[ -f "${HOME}/.cargo/env" ]]; then
+    if [[ -f "${CARGO_HOME}/env" ]]; then
+        # shellcheck disable=SC1091
+        source "${CARGO_HOME}/env"
+    elif [[ -f "${HOME}/.cargo/env" ]]; then
         # shellcheck disable=SC1091
         source "${HOME}/.cargo/env"
     fi
@@ -76,7 +85,7 @@ Rust installation did not produce a working cargo.
 
 If rustup is installed, run:
   rustup default stable
-  source "$HOME/.cargo/env"
+  source "$CARGO_HOME/env"
 EOF
         exit 1
     fi
