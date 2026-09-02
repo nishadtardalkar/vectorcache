@@ -32,6 +32,7 @@ class SrhtRotation {
   AlignedVector<float> signs1_f_;
   AlignedVector<float> signs2_f_;
   AlignedVector<float> signs3_f_;
+  mutable AlignedVector<float> fwht_scratch_;
 };
 
 }  // namespace vectorcache::transform

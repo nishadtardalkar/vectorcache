@@ -28,6 +28,64 @@ void butterfly_pairs(__m512 a, __m512 b, __m512 scale_v, bool apply_scale, __m51
   }
 }
 
+void butterfly_block_ping_pong(const float* src, float* dst, std::size_t i, std::size_t h,
+                               float scale) {
+  const bool apply_scale = scale != 1.0f;
+  const __m512 scale_v = _mm512_set1_ps(scale);
+  const bool aligned = is_aligned64(src) && is_aligned64(dst);
+
+  if (h >= simd::kWidth) {
+    for (std::size_t j = i; j < i + h;) {
+      const std::size_t chunk = std::min(simd::kWidth, i + h - j);
+      if (chunk == simd::kWidth && aligned) {
+        const __m512 a = _mm512_load_ps(src + j);
+        const __m512 b = _mm512_load_ps(src + j + h);
+        if (apply_scale) {
+          _mm512_store_ps(dst + j, _mm512_mul_ps(_mm512_add_ps(a, b), scale_v));
+          _mm512_store_ps(dst + j + h, _mm512_mul_ps(_mm512_sub_ps(a, b), scale_v));
+        } else {
+          _mm512_store_ps(dst + j, _mm512_add_ps(a, b));
+          _mm512_store_ps(dst + j + h, _mm512_sub_ps(a, b));
+        }
+      } else if (chunk == simd::kWidth) {
+        const __m512 a = _mm512_loadu_ps(src + j);
+        const __m512 b = _mm512_loadu_ps(src + j + h);
+        if (apply_scale) {
+          _mm512_storeu_ps(dst + j, _mm512_mul_ps(_mm512_add_ps(a, b), scale_v));
+          _mm512_storeu_ps(dst + j + h, _mm512_mul_ps(_mm512_sub_ps(a, b), scale_v));
+        } else {
+          _mm512_storeu_ps(dst + j, _mm512_add_ps(a, b));
+          _mm512_storeu_ps(dst + j + h, _mm512_sub_ps(a, b));
+        }
+      } else {
+        const __mmask16 mask = simd::tail_mask(chunk);
+        const __m512 a = _mm512_maskz_loadu_ps(mask, src + j);
+        const __m512 b = _mm512_maskz_loadu_ps(mask, src + j + h);
+        if (apply_scale) {
+          _mm512_mask_storeu_ps(dst + j, mask, _mm512_mul_ps(_mm512_add_ps(a, b), scale_v));
+          _mm512_mask_storeu_ps(dst + j + h, mask, _mm512_mul_ps(_mm512_sub_ps(a, b), scale_v));
+        } else {
+          _mm512_mask_storeu_ps(dst + j, mask, _mm512_add_ps(a, b));
+          _mm512_mask_storeu_ps(dst + j + h, mask, _mm512_sub_ps(a, b));
+        }
+      }
+      j += chunk;
+    }
+    return;
+  }
+
+  const __mmask16 mask = simd::tail_mask(h);
+  const __m512 a = _mm512_maskz_loadu_ps(mask, src + i);
+  const __m512 b = _mm512_maskz_loadu_ps(mask, src + i + h);
+  if (apply_scale) {
+    _mm512_mask_storeu_ps(dst + i, mask, _mm512_mul_ps(_mm512_add_ps(a, b), scale_v));
+    _mm512_mask_storeu_ps(dst + i + h, mask, _mm512_mul_ps(_mm512_sub_ps(a, b), scale_v));
+  } else {
+    _mm512_mask_storeu_ps(dst + i, mask, _mm512_add_ps(a, b));
+    _mm512_mask_storeu_ps(dst + i + h, mask, _mm512_sub_ps(a, b));
+  }
+}
+
 void fwht_stage(float* buf, std::size_t n, std::size_t h, float scale) {
   const bool apply_scale = scale != 1.0f;
   const __m512 scale_v = _mm512_set1_ps(scale);
@@ -297,8 +355,34 @@ void fwht_orthonormal_in_place(std::span<float> buf, float inv_sqrt_n) {
 
 void fwht_stockham_orthonormal_in_place(std::span<float> buf, std::span<float> scratch,
                                         float inv_sqrt_n) {
-  (void)scratch;
-  fwht_orthonormal_in_place(buf, inv_sqrt_n);
+  const std::size_t n = buf.size();
+  if (scratch.size() != n) {
+    throw Error("FWHT scratch buffer size mismatch");
+  }
+  if (n == 0) {
+    throw Error("FWHT buffer must be non-empty");
+  }
+  if ((n & (n - 1)) != 0) {
+    throw Error("FWHT buffer length must be a power of two, got " + std::to_string(n));
+  }
+
+  float* src = buf.data();
+  float* dst = scratch.data();
+
+  for (std::size_t h = 1; h < n; h *= 2) {
+    const bool is_last = (h * 2 == n);
+    const float stage_scale = is_last ? inv_sqrt_n : 1.0f;
+    for (std::size_t i = 0; i < n; i += 2 * h) {
+      butterfly_block_ping_pong(src, dst, i, h, stage_scale);
+    }
+    float* const tmp = src;
+    src = dst;
+    dst = tmp;
+  }
+
+  if (src != buf.data()) {
+    std::memcpy(buf.data(), src, n * sizeof(float));
+  }
 }
 
 void apply_signs_i8(std::span<float> buf, std::span<const std::int8_t> signs) {

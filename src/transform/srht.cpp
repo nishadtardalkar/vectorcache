@@ -21,6 +21,8 @@ AlignedVector<float> rademacher_f(std::mt19937_64& rng, std::size_t n) {
   return signs;
 }
 
+bool use_stockham(std::size_t n) { return n == 256 || n == 2048 || n == 4096; }
+
 }  // namespace
 
 SrhtRotation::SrhtRotation(std::size_t original_dim, std::uint64_t seed)
@@ -34,17 +36,28 @@ SrhtRotation::SrhtRotation(std::size_t original_dim, std::uint64_t seed)
   signs1_f_ = rademacher_f(rng, padded_dim_);
   signs2_f_ = rademacher_f(rng, padded_dim_);
   signs3_f_ = rademacher_f(rng, padded_dim_);
+  if (use_stockham(padded_dim_)) {
+    fwht_scratch_.assign(padded_dim_, 0.0f);
+  }
 }
 
 void SrhtRotation::apply_rounds(std::span<float> buf) const {
+  const auto fwht = [this](std::span<float> span) {
+    if (use_stockham(padded_dim_)) {
+      fwht_stockham_orthonormal_in_place(span, fwht_scratch_, inv_sqrt_n_);
+    } else {
+      fwht_orthonormal_in_place(span, inv_sqrt_n_);
+    }
+  };
+
   apply_signs_f(buf, signs1_f_);
-  fwht_orthonormal_in_place(buf, inv_sqrt_n_);
+  fwht(buf);
 
   apply_signs_f(buf, signs2_f_);
-  fwht_orthonormal_in_place(buf, inv_sqrt_n_);
+  fwht(buf);
 
   apply_signs_f(buf, signs3_f_);
-  fwht_orthonormal_in_place(buf, inv_sqrt_n_);
+  fwht(buf);
 }
 
 void SrhtRotation::apply(std::span<const float> vector, std::span<float> out) const {
