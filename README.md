@@ -151,11 +151,30 @@ scripts/envs.sh        HPC module setup
 
 ## Missing dependencies on HPC
 
-If Arrow or HDF5 modules are unavailable:
+Apache Arrow is only required when downloading OpenAI datasets (`openai-1536`, `openai-3072`, or `DATASETS=all`). GloVe-only login does not need Arrow:
+
+```bash
+make login DATASETS=glove
+```
+
+For all datasets, Arrow must be installed separately and pointed at via CMake (not bundled in this repo):
+
+```bash
+export CMAKE_PREFIX_PATH=/path/to/arrow/prefix   # contains lib/cmake/Arrow/ArrowConfig.cmake
+make login
+```
+
+Or set `Arrow_DIR` directly:
+
+```bash
+make login CMAKE_OPTS="-DArrow_DIR=/path/to/lib/cmake/Arrow"
+```
+
+If Arrow or HDF5 are unavailable on your cluster:
 
 1. Request them from your cluster admin, or
-2. Install via Spack: `spack install arrow +parquet hdf5 curl`, then
-   `cmake .. -DCMAKE_PREFIX_PATH=$(spack location -i arrow)`
+2. Copy pre-downloaded `data/` from a machine that already has the datasets, or
+3. Use GloVe only: `make login DATASETS=glove` / `make compute DATASET=glove`
 
 To build without dataset fetching (library + tests only):
 

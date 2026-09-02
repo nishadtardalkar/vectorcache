@@ -6,10 +6,13 @@
 #include <fstream>
 #include <sstream>
 
+#include <curl/curl.h>
+
+#ifdef VECTORCACHE_FETCH_OPENAI
 #include <arrow/api.h>
 #include <arrow/io/api.h>
-#include <curl/curl.h>
 #include <parquet/arrow/reader.h>
+#endif
 
 #include "vectorcache/datasets/hdf5.hpp"
 #include "vectorcache/datasets/npy.hpp"
@@ -112,6 +115,7 @@ void print_dataset_status(const std::string& label, const std::filesystem::path&
               detail.c_str(), size_mb);
 }
 
+#ifdef VECTORCACHE_FETCH_OPENAI
 void append_embeddings_from_parquet(const std::filesystem::path& path, const std::string& column_name,
                                     std::size_t dim, std::vector<float>& out) {
   auto maybe_infile = arrow::io::ReadableFile::Open(path.string());
@@ -173,6 +177,7 @@ void fetch_glove(const std::filesystem::path& data_dir, bool force) {
   print_dataset_status("GloVe", dest, "train + test HDF5 datasets", false);
 }
 
+#ifdef VECTORCACHE_FETCH_OPENAI
 void fetch_openai(std::size_t dim, const std::filesystem::path& data_dir, bool force) {
   const auto filename = "openai-" + std::to_string(dim) + ".npy";
   const auto dest = data_dir / filename;
@@ -229,18 +234,26 @@ void fetch_openai(std::size_t dim, const std::filesystem::path& data_dir, bool f
   print_dataset_status("OpenAI-" + std::to_string(dim), dest,
                        "shape (1000000, " + std::to_string(dim) + ")", false);
 }
+#endif  // VECTORCACHE_FETCH_OPENAI
 
 }  // namespace
 
 std::optional<DatasetKind> parse_dataset_kind(const std::string& name) {
   if (name == "glove") return DatasetKind::Glove;
+#ifdef VECTORCACHE_FETCH_OPENAI
   if (name == "openai-1536") return DatasetKind::OpenAi1536;
   if (name == "openai-3072") return DatasetKind::OpenAi3072;
+#endif
   return std::nullopt;
 }
 
 std::vector<DatasetKind> all_dataset_kinds() {
-  return {DatasetKind::Glove, DatasetKind::OpenAi1536, DatasetKind::OpenAi3072};
+  std::vector<DatasetKind> kinds = {DatasetKind::Glove};
+#ifdef VECTORCACHE_FETCH_OPENAI
+  kinds.push_back(DatasetKind::OpenAi1536);
+  kinds.push_back(DatasetKind::OpenAi3072);
+#endif
+  return kinds;
 }
 
 const char* dataset_label(DatasetKind kind) {
@@ -292,10 +305,12 @@ void fetch(DatasetKind kind, const std::filesystem::path& data_dir, bool force) 
       fetch_glove(data_dir, force);
       break;
     case DatasetKind::OpenAi1536:
-      fetch_openai(1536, data_dir, force);
-      break;
     case DatasetKind::OpenAi3072:
-      fetch_openai(3072, data_dir, force);
+#ifdef VECTORCACHE_FETCH_OPENAI
+      fetch_openai(kind == DatasetKind::OpenAi1536 ? 1536 : 3072, data_dir, force);
+#else
+      throw Error("OpenAI dataset fetch requires VECTORCACHE_FETCH_OPENAI (Apache Arrow)");
+#endif
       break;
   }
 }

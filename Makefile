@@ -15,12 +15,22 @@ CMAKE_OPTS    ?=
 ENV_SCRIPT    := scripts/envs.sh
 LOGIN_READY   := $(BUILD_DIR)/.login-ready
 
+# OpenAI datasets are converted from parquet shards with Apache Arrow.
+ifneq (,$(filter all openai-1536 openai-3072,$(DATASETS)))
+LOGIN_FETCH_OPENAI := ON
+else
+LOGIN_FETCH_OPENAI := OFF
+endif
+
 CMAKE_COMMON_FLAGS := \
 	-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
 	-DVECTORCACHE_BUILD_GLOVE=ON \
 	-DVECTORCACHE_BUILD_TOOLS=ON \
 	-DVECTORCACHE_BUILD_TESTS=ON \
 	$(CMAKE_OPTS)
+
+CMAKE_LOGIN_FLAGS := $(CMAKE_COMMON_FLAGS) -DVECTORCACHE_FETCH_OPENAI=$(LOGIN_FETCH_OPENAI)
+CMAKE_COMPUTE_FLAGS := $(CMAKE_COMMON_FLAGS) -DVECTORCACHE_FETCH_OPENAI=OFF
 
 .PHONY: help login compute clean
 
@@ -39,6 +49,7 @@ help:
 	@echo "  BENCH_EXTRA_ARGS=$(BENCH_EXTRA_ARGS)"
 	@echo "  CMAKE_OPTS=$(CMAKE_OPTS)"
 	@echo ""
+	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make compute DATASET=glove"
 
 login: $(LOGIN_READY)
@@ -47,7 +58,7 @@ $(LOGIN_READY):
 	set -euo pipefail
 	source $(ENV_SCRIPT)
 	mkdir -p $(BUILD_DIR)
-	cmake -S . -B $(BUILD_DIR) $(CMAKE_COMMON_FLAGS)
+	cmake -S . -B $(BUILD_DIR) $(CMAKE_LOGIN_FLAGS)
 	cmake --build $(BUILD_DIR) --target fetch-datasets -j$(JOBS)
 	$(BUILD_DIR)/fetch-datasets --data-dir $(DATA_DIR) $(DATASETS)
 	touch $(LOGIN_READY)
@@ -65,7 +76,7 @@ compute:
 	source $(ENV_SCRIPT)
 	cmake -S . -B $(BUILD_DIR) \
 		-DFETCHCONTENT_FULLY_DISCONNECTED=ON \
-		$(CMAKE_COMMON_FLAGS)
+		$(CMAKE_COMPUTE_FLAGS)
 	cmake --build $(BUILD_DIR) -j$(JOBS)
 	cd $(BUILD_DIR) && ctest --output-on-failure
 	$(BUILD_DIR)/ingest-bench --dataset $(DATASET) --data-dir $(DATA_DIR) $(BENCH_EXTRA_ARGS)
