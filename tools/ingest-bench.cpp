@@ -17,6 +17,7 @@
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/ingest/timing.hpp"
 #include "vectorcache/quantize/quantize.hpp"
+#include "vectorcache/transform/fwht.hpp"
 #include "vectorcache/transform/normalize.hpp"
 #include "vectorcache/transform/srht.hpp"
 

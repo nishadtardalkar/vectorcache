@@ -19,6 +19,7 @@
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/ingest/timing.hpp"
+#include "vectorcache/transform/fwht.hpp"
 #include "vectorcache/transform/normalize.hpp"
 #include "vectorcache/transform/srht.hpp"
 
