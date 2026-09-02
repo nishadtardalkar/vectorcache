@@ -25,8 +25,18 @@ namespace {
 constexpr const char* kGloveUrl = "http://ann-benchmarks.com/glove-200-angular.hdf5";
 constexpr const char* kGloveFilename = "glove-200-angular.hdf5";
 constexpr std::uint64_t kGloveMinBytes = 100'000'000;
-constexpr std::size_t kOpenAiShards = 26;
 constexpr const char* kHfDatasetBase = "https://huggingface.co/datasets";
+
+std::size_t openai_parquet_shard_count(std::size_t dim) {
+  switch (dim) {
+    case 1536:
+      return 26;
+    case 3072:
+      return 63;
+    default:
+      throw Error("unsupported OpenAI embedding dimension: " + std::to_string(dim));
+  }
+}
 
 size_t curl_write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
   auto* out = static_cast<std::vector<char>*>(userdata);
@@ -226,7 +236,8 @@ void fetch_openai(std::size_t dim, const std::filesystem::path& data_dir, bool f
   const std::string repo_id = "Qdrant/dbpedia-entities-openai3-text-embedding-3-large-" +
                               std::to_string(dim) + "-1M";
   const std::string column = "text-embedding-3-large-" + std::to_string(dim) + "-embedding";
-  std::printf("Downloading %s (%zu parquet shards) ...\n", repo_id.c_str(), kOpenAiShards);
+  const std::size_t shard_count = openai_parquet_shard_count(dim);
+  std::printf("Downloading %s (%zu parquet shards) ...\n", repo_id.c_str(), shard_count);
 
   const auto cache_dir = data_dir / ".cache" / ("openai-" + std::to_string(dim));
   std::filesystem::create_directories(cache_dir);
@@ -234,11 +245,11 @@ void fetch_openai(std::size_t dim, const std::filesystem::path& data_dir, bool f
   std::vector<float> vectors;
   vectors.reserve(1'000'000 * dim);
 
-  for (std::size_t shard = 0; shard < kOpenAiShards; ++shard) {
+  for (std::size_t shard = 0; shard < shard_count; ++shard) {
     char shard_buf[64];
     std::snprintf(shard_buf, sizeof(shard_buf), "data/train-%05zu-of-%05zu.parquet", shard,
-                  kOpenAiShards);
-    std::printf("  shard %zu/%zu: %s\n", shard + 1, kOpenAiShards, shard_buf);
+                  shard_count);
+    std::printf("  shard %zu/%zu: %s\n", shard + 1, shard_count, shard_buf);
 
     const auto file_name = std::filesystem::path(shard_buf).filename();
     const auto local_path = cache_dir / file_name;
