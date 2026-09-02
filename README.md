@@ -87,10 +87,10 @@ cmake .. -DCMAKE_CXX_FLAGS="-march=native"
 
 ### SRHT round count (compile-time)
 
-Default is 3 rounds (`H·D₃·H·D₂·H·D₁`). To build with a single `H·D` round:
+Default is 1 round (`H·D`). To build with multiple rounds:
 
 ```bash
-cmake .. -DVECTORCACHE_SRHT_ROUNDS=1
+cmake .. -DVECTORCACHE_SRHT_ROUNDS=3
 ```
 
 Allowed values: `1`, `2`, or `3`. Reconfigure and rebuild after changing; there is no runtime flag.

@@ -12,7 +12,7 @@ option(VECTORCACHE_BUILD_TESTS "Build tests" ON)
 option(VECTORCACHE_FETCH_DATASETS "Build fetch-datasets (requires libcurl)" ON)
 option(VECTORCACHE_FETCH_OPENAI "Download/convert OpenAI parquet shards (requires Arrow)" ON)
 
-set(VECTORCACHE_SRHT_ROUNDS 3 CACHE STRING "Compile-time SRHT H·D round count (1, 2, or 3)")
+set(VECTORCACHE_SRHT_ROUNDS 1 CACHE STRING "Compile-time SRHT H·D round count (1, 2, or 3)")
 set_property(CACHE VECTORCACHE_SRHT_ROUNDS PROPERTY STRINGS 1 2 3)
 if(NOT VECTORCACHE_SRHT_ROUNDS MATCHES "^[123]$")
   message(FATAL_ERROR "VECTORCACHE_SRHT_ROUNDS must be 1, 2, or 3 (got '${VECTORCACHE_SRHT_ROUNDS}')")
