@@ -6,10 +6,11 @@
 #include <vector>
 
 #include "vectorcache/aligned.hpp"
+#include "vectorcache/transform/srht_config.hpp"
 
 namespace vectorcache::transform {
 
-/// TurboQuant-style 3-round SRHT: H·D₃·H·D₂·H·D₁ with orthonormal H.
+/// TurboQuant-style SRHT: H·Dₙ·…·H·D₁ with orthonormal H (round count set at compile time).
 class SrhtRotation {
  public:
   SrhtRotation(std::size_t original_dim, std::uint64_t seed);
@@ -29,9 +30,15 @@ class SrhtRotation {
   std::size_t original_dim_;
   std::size_t padded_dim_;
   float inv_sqrt_n_;
+#if VECTORCACHE_SRHT_ROUNDS >= 1
   AlignedVector<float> signs1_f_;
+#endif
+#if VECTORCACHE_SRHT_ROUNDS >= 2
   AlignedVector<float> signs2_f_;
+#endif
+#if VECTORCACHE_SRHT_ROUNDS >= 3
   AlignedVector<float> signs3_f_;
+#endif
   mutable AlignedVector<float> fwht_scratch_;
 };
 

@@ -20,8 +20,17 @@
 #include "vectorcache/transform/fwht.hpp"
 #include "vectorcache/transform/normalize.hpp"
 #include "vectorcache/transform/srht.hpp"
+#include "vectorcache/transform/srht_config.hpp"
 
 namespace {
+
+#if VECTORCACHE_SRHT_ROUNDS == 1
+constexpr const char* kSrhtStageLabel = "SRHT (1x sign + FWHT)";
+#elif VECTORCACHE_SRHT_ROUNDS == 2
+constexpr const char* kSrhtStageLabel = "SRHT (2x sign + FWHT)";
+#else
+constexpr const char* kSrhtStageLabel = "SRHT (3x sign + FWHT)";
+#endif
 
 struct StageTotals {
   std::uint64_t read_ns = 0;
@@ -209,7 +218,7 @@ void print_stage_report(const std::string& label, const StageTotals& stages) {
       {"read (mmap -> buffer)", stages.read_ns},
       {"batch copy (engine-style to_vec)", stages.batch_copy_ns},
       {"L2 normalize", stages.normalize_ns},
-      {"SRHT (3x sign + FWHT)", stages.srht_ns},
+      {kSrhtStageLabel, stages.srht_ns},
       {"L1+L0 quantize", stages.quantize_ns},
       {"store (push_vector)", stages.store_ns},
   };
@@ -303,7 +312,8 @@ int main(int argc, char** argv) {
 
     const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
     std::cout << "Ingest bench: " << source_label << " (dim=" << meta.dim << ", padded=" << padded
-              << ", vectors=" << actual_limit << ")\n";
+              << ", vectors=" << actual_limit
+              << ", srht_rounds=" << vectorcache::transform::srht_rounds() << ")\n";
     if (limit && *limit < meta.count) {
       std::cout << "  (capped from " << meta.count << " vectors in dataset)\n";
     }

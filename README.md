@@ -85,6 +85,16 @@ For maximum single-node performance on homogeneous clusters:
 cmake .. -DCMAKE_CXX_FLAGS="-march=native"
 ```
 
+### SRHT round count (compile-time)
+
+Default is 3 rounds (`H·D₃·H·D₂·H·D₁`). To build with a single `H·D` round:
+
+```bash
+cmake .. -DVECTORCACHE_SRHT_ROUNDS=1
+```
+
+Allowed values: `1`, `2`, or `3`. Reconfigure and rebuild after changing; there is no runtime flag.
+
 ## CLI tools
 
 ### fetch-datasets

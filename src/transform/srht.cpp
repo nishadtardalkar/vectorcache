@@ -33,9 +33,15 @@ SrhtRotation::SrhtRotation(std::size_t original_dim, std::uint64_t seed)
     throw Error("original_dim must be > 0");
   }
   std::mt19937_64 rng(seed);
+#if VECTORCACHE_SRHT_ROUNDS >= 1
   signs1_f_ = rademacher_f(rng, padded_dim_);
+#endif
+#if VECTORCACHE_SRHT_ROUNDS >= 2
   signs2_f_ = rademacher_f(rng, padded_dim_);
+#endif
+#if VECTORCACHE_SRHT_ROUNDS >= 3
   signs3_f_ = rademacher_f(rng, padded_dim_);
+#endif
   if (use_stockham(padded_dim_)) {
     fwht_scratch_.assign(padded_dim_, 0.0f);
   }
@@ -50,14 +56,18 @@ void SrhtRotation::apply_rounds(std::span<float> buf) const {
     }
   };
 
+#if VECTORCACHE_SRHT_ROUNDS >= 1
   apply_signs_f(buf, signs1_f_);
   fwht(buf);
-
+#endif
+#if VECTORCACHE_SRHT_ROUNDS >= 2
   apply_signs_f(buf, signs2_f_);
   fwht(buf);
-
+#endif
+#if VECTORCACHE_SRHT_ROUNDS >= 3
   apply_signs_f(buf, signs3_f_);
   fwht(buf);
+#endif
 }
 
 void SrhtRotation::apply(std::span<const float> vector, std::span<float> out) const {
