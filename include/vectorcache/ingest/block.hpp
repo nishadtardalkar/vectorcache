@@ -51,6 +51,12 @@ struct BlockLayout {
 BlockLayout make_block_layout(std::size_t l1_words_per_vec, std::size_t l0_words_per_vec,
                               std::size_t padded_dim);
 
+/// True when full vectors and L1/L0 bit counts are multiples of 64 (SIMD-friendly).
+bool layout_is_simd_friendly(const BlockLayout& layout);
+
+/// Byte offset of vector_full(i) from block base; for alignment checks.
+std::size_t vector_full_byte_offset(const BlockLayout& layout, std::size_t vec_idx);
+
 /// Single-buffer storage for up to BLOCK_SIZE vectors across L1, L0, and full tiers.
 class LogicalBlock {
  public:
@@ -65,6 +71,9 @@ class LogicalBlock {
 
   void push(std::span<const std::uint64_t> l1, std::span<const std::uint64_t> l0,
             std::span<const float> full);
+  std::span<const std::uint64_t> vector_l1(std::size_t vec_idx) const;
+  std::span<const std::uint64_t> vector_l0(std::size_t vec_idx) const;
+  std::span<const float> vector_full(std::size_t vec_idx) const;
   std::span<const std::uint64_t> l1_slice() const;
   std::span<const std::uint64_t> l0_slice() const;
   std::span<const float> full_slice() const;

@@ -12,14 +12,22 @@ option(VECTORCACHE_BUILD_TESTS "Build tests" ON)
 option(VECTORCACHE_FETCH_DATASETS "Build fetch-datasets (requires libcurl)" ON)
 option(VECTORCACHE_FETCH_OPENAI "Download/convert OpenAI parquet shards (requires Arrow)" ON)
 
+option(VECTORCACHE_QUERY_OPENMP "Enable OpenMP parallel block search" ON)
+
 set(VECTORCACHE_SRHT_ROUNDS 1 CACHE STRING "Compile-time SRHT H·D round count (1, 2, or 3)")
 set_property(CACHE VECTORCACHE_SRHT_ROUNDS PROPERTY STRINGS 1 2 3)
 if(NOT VECTORCACHE_SRHT_ROUNDS MATCHES "^[123]$")
   message(FATAL_ERROR "VECTORCACHE_SRHT_ROUNDS must be 1, 2, or 3 (got '${VECTORCACHE_SRHT_ROUNDS}')")
 endif()
 
+set(VECTORCACHE_QUERY_DEPTH 3 CACHE STRING "Query cascade depth: 1=L1, 2=L1+L0, 3=L1+L0+full")
+set_property(CACHE VECTORCACHE_QUERY_DEPTH PROPERTY STRINGS 1 2 3)
+if(NOT VECTORCACHE_QUERY_DEPTH MATCHES "^[123]$")
+  message(FATAL_ERROR "VECTORCACHE_QUERY_DEPTH must be 1, 2, or 3 (got '${VECTORCACHE_QUERY_DEPTH}')")
+endif()
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  add_compile_options(-mavx512f -mavx512dq -mavx512bw -mfma)
+  add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vpopcntdq -mfma)
 elseif(MSVC)
   add_compile_options(/arch:AVX512)
 endif()
@@ -43,7 +51,10 @@ set(VECTORCACHE_SOURCES
   src/ingest/store.cpp
   src/ingest/timing.cpp
   src/ingest/engine.cpp
+  src/query/distance.cpp
+  src/query/engine.cpp
   src/datasets/npy.cpp
+  src/datasets/sample.cpp
 )
 
 if(VECTORCACHE_BUILD_GLOVE)
@@ -54,6 +65,15 @@ add_library(vectorcache ${VECTORCACHE_SOURCES})
 target_include_directories(vectorcache PUBLIC include)
 target_compile_features(vectorcache PUBLIC cxx_std_20)
 target_compile_definitions(vectorcache PUBLIC VECTORCACHE_SRHT_ROUNDS=${VECTORCACHE_SRHT_ROUNDS})
+target_compile_definitions(vectorcache PUBLIC VECTORCACHE_QUERY_DEPTH=${VECTORCACHE_QUERY_DEPTH})
+
+if(VECTORCACHE_QUERY_OPENMP)
+  find_package(OpenMP)
+  if(OpenMP_CXX_FOUND)
+    target_link_libraries(vectorcache PUBLIC OpenMP::OpenMP_CXX)
+    target_compile_definitions(vectorcache PUBLIC VECTORCACHE_QUERY_OPENMP=1)
+  endif()
+endif()
 
 if(VECTORCACHE_BUILD_GLOVE)
   find_package(HDF5 REQUIRED COMPONENTS C)
@@ -130,6 +150,7 @@ if(VECTORCACHE_BUILD_TOOLS)
 
   add_vectorcache_tool(ingest-sample)
   add_vectorcache_tool(ingest-bench)
+  add_vectorcache_tool(query-bench)
 endif()
 
 if(VECTORCACHE_BUILD_TESTS)
@@ -151,6 +172,8 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_block.cpp
     tests/test_store.cpp
     tests/test_engine.cpp
+    tests/test_query.cpp
+    tests/test_sample.cpp
     tests/test_timing.cpp
     tests/test_npy.cpp
   )

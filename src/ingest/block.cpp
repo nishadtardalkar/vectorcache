@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "vectorcache/error.hpp"
+#include "vectorcache/quantize/quantize.hpp"
 
 namespace vectorcache::ingest {
 
@@ -44,6 +45,20 @@ BlockLayout make_block_layout(std::size_t l1_words_per_vec, std::size_t l0_words
   return layout;
 }
 
+bool layout_is_simd_friendly(const BlockLayout& layout) {
+  const std::size_t full_bytes = layout.padded_dim * sizeof(float);
+  if (full_bytes % 64 != 0) {
+    return false;
+  }
+  const std::size_t l1_bits = quantize::l1_bits_per_vector(layout.padded_dim);
+  const std::size_t l0_bits = quantize::l0_bits_per_vector(layout.padded_dim);
+  return l1_bits % 64 == 0 && l0_bits % 64 == 0;
+}
+
+std::size_t vector_full_byte_offset(const BlockLayout& layout, std::size_t vec_idx) {
+  return layout.vector_full_offset(vec_idx);
+}
+
 LogicalBlock::LogicalBlock(std::size_t l1_words_per_vec, std::size_t l0_words_per_vec,
                            std::size_t padded_dim)
     : layout_(make_block_layout(l1_words_per_vec, l0_words_per_vec, padded_dim)), len_(0) {
@@ -77,6 +92,31 @@ void LogicalBlock::push(std::span<const std::uint64_t> l1, std::span<const std::
   std::memcpy(base + layout_.vector_l0_offset(len_), l0.data(), l0.size_bytes());
   std::memcpy(base + layout_.vector_full_offset(len_), full.data(), full.size_bytes());
   ++len_;
+}
+
+std::span<const std::uint64_t> LogicalBlock::vector_l1(std::size_t vec_idx) const {
+  if (vec_idx >= len_) {
+    throw Error("vector_l1 index out of range");
+  }
+  const auto* base = reinterpret_cast<const std::uint64_t*>(data_.data());
+  const std::size_t offset = vec_idx * layout_.l1_words_per_vec;
+  return {base + offset, layout_.l1_words_per_vec};
+}
+
+std::span<const std::uint64_t> LogicalBlock::vector_l0(std::size_t vec_idx) const {
+  if (vec_idx >= len_) {
+    throw Error("vector_l0 index out of range");
+  }
+  const auto* ptr = reinterpret_cast<const std::uint64_t*>(data_.data() + layout_.vector_l0_offset(vec_idx));
+  return {ptr, layout_.l0_words_per_vec};
+}
+
+std::span<const float> LogicalBlock::vector_full(std::size_t vec_idx) const {
+  if (vec_idx >= len_) {
+    throw Error("vector_full index out of range");
+  }
+  const auto* ptr = reinterpret_cast<const float*>(data_.data() + layout_.vector_full_offset(vec_idx));
+  return {ptr, layout_.padded_dim};
 }
 
 std::span<const std::uint64_t> LogicalBlock::l1_slice() const {

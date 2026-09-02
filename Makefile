@@ -56,9 +56,11 @@ help:
 	@echo "  BENCH_EXTRA_ARGS=$(BENCH_EXTRA_ARGS)"
 	@echo "  CMAKE_OPTS=$(CMAKE_OPTS)"
 	@echo "  VECTORCACHE_SRHT_ROUNDS (cmake cache, default 1): set to 2 or 3 for multi-round SRHT"
+	@echo "  VECTORCACHE_QUERY_DEPTH (cmake cache, default 3): 1=L1, 2=L1+L0, 3=L1+L0+full"
 	@echo ""
 	@echo "For native SIMD on compute nodes: make compute DATASET=glove CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 	@echo "For 3-round SRHT at compile time: make compute DATASET=glove CMAKE_OPTS='-DVECTORCACHE_SRHT_ROUNDS=3'"
+	@echo "For L1-only query depth: make compute DATASET=glove CMAKE_OPTS='-DVECTORCACHE_QUERY_DEPTH=1'"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make compute DATASET=glove"
@@ -97,7 +99,7 @@ compute:
 		echo "Fix: make clean && make login, then make compute without CMAKE_OPTS=-DVECTORCACHE_BUILD_TOOLS=OFF"
 		exit 1
 	fi
-	cmake --build $(BUILD_DIR) --target vectorcache_tests ingest-bench -j$(JOBS)
+	cmake --build $(BUILD_DIR) --target vectorcache_tests ingest-bench query-bench -j$(JOBS)
 	ctest --test-dir $(BUILD_DIR) --output-on-failure
 	INGEST_BENCH=""
 	for candidate in \

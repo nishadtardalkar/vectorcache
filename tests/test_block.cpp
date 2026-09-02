@@ -6,6 +6,20 @@
 using namespace vectorcache::ingest;
 using namespace vectorcache::quantize;
 
+TEST(BlockLayoutTest, SimdFriendlyBenchmarkDims) {
+  for (const std::size_t padded : {256u, 2048u, 4096u}) {
+    const BlockLayout layout =
+        make_block_layout(l1_words_per_vector(padded), l0_words_per_vector(padded), padded);
+    EXPECT_TRUE(layout_is_simd_friendly(layout));
+
+    LogicalBlock block(l1_words_per_vector(padded), l0_words_per_vector(padded), padded);
+    block.push(std::vector<std::uint64_t>(l1_words_per_vector(padded), 0),
+               std::vector<std::uint64_t>(l0_words_per_vector(padded), 0),
+               std::vector<float>(padded, 0.0f));
+    EXPECT_EQ(vector_full_byte_offset(block.layout(), 0) % 64, 0u);
+  }
+}
+
 TEST(BlockLayoutTest, GloveDimensions) {
   const BlockLayout layout = make_block_layout(1, 4, 256);
   EXPECT_EQ(layout.phys_block_bytes, BLOCK_SIZE * 8);
@@ -104,4 +118,23 @@ TEST(BlockTest, AsSliceAlias) {
   const std::vector<float> full(8, 0.0f);
   block.push(l1, l0, full);
   EXPECT_EQ(block.as_slice()[0], 99u);
+}
+
+TEST(BlockTest, PerVectorAccessorsMatchSlices) {
+  LogicalBlock block(1, 1, 8);
+  const std::vector<std::uint64_t> l1_a = {1};
+  const std::vector<std::uint64_t> l1_b = {2};
+  const std::vector<std::uint64_t> l0_a = {0xAA};
+  const std::vector<std::uint64_t> l0_b = {0xBB};
+  const std::vector<float> full_a(8, 1.0f);
+  const std::vector<float> full_b(8, 2.0f);
+  block.push(l1_a, l0_a, full_a);
+  block.push(l1_b, l0_b, full_b);
+
+  EXPECT_EQ(block.vector_l1(0)[0], 1u);
+  EXPECT_EQ(block.vector_l1(1)[0], 2u);
+  EXPECT_EQ(block.vector_l0(0)[0], 0xAAu);
+  EXPECT_EQ(block.vector_l0(1)[0], 0xBBu);
+  EXPECT_FLOAT_EQ(block.vector_full(0)[0], 1.0f);
+  EXPECT_FLOAT_EQ(block.vector_full(1)[0], 2.0f);
 }
