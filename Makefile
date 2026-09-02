@@ -79,9 +79,32 @@ compute:
 	cmake -S . -B $(BUILD_DIR) \
 		-DFETCHCONTENT_FULLY_DISCONNECTED=ON \
 		$(CMAKE_COMPUTE_FLAGS)
-	cmake --build $(BUILD_DIR) -j$(JOBS)
+	if ! cmake -L -B $(BUILD_DIR) 2>/dev/null | grep -q '^VECTORCACHE_BUILD_TOOLS:BOOL=ON'; then
+		echo "VECTORCACHE_BUILD_TOOLS is OFF; ingest-bench will not be built."
+		echo "Reconfigure with -DVECTORCACHE_BUILD_TOOLS=ON (the default for make compute)."
+		exit 1
+	fi
+	cmake --build $(BUILD_DIR) --target vectorcache_tests ingest-bench -j$(JOBS)
 	cd $(BUILD_DIR) && ctest --output-on-failure
-	$(BUILD_DIR)/ingest-bench --dataset $(DATASET) --data-dir $(DATA_DIR) $(BENCH_EXTRA_ARGS)
+	INGEST_BENCH=""
+	for candidate in \
+		"$(BUILD_DIR)/ingest-bench" \
+		"$(BUILD_DIR)/$(BUILD_TYPE)/ingest-bench"; do
+		if [ -x "$$candidate" ]; then
+			INGEST_BENCH="$$candidate"
+			break
+		fi
+	done
+	if [ -z "$$INGEST_BENCH" ]; then
+		INGEST_BENCH="$$(find "$(BUILD_DIR)" -maxdepth 3 \
+			\( -name 'ingest-bench' -o -name 'ingest-bench.exe' \) -type f -print -quit 2>/dev/null || true)"
+	fi
+	if [ -z "$$INGEST_BENCH" ] || [ ! -f "$$INGEST_BENCH" ]; then
+		echo "ingest-bench not found under $(BUILD_DIR)."
+		echo "Inspect the build log above for ingest-bench compile/link errors."
+		exit 1
+	fi
+	"$$INGEST_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(BENCH_EXTRA_ARGS)
 
 clean:
 	rm -rf $(BUILD_DIR)
