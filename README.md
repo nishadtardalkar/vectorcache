@@ -8,7 +8,6 @@ VectorCache implements the ingestion pipeline for approximate nearest neighbor s
 
 - C++20 compiler (GCC 10+, Clang 12+)
 - CMake 3.20+
-- OpenMP
 - For CLI tools (`fetch-datasets`):
   - libcurl
   - Apache Arrow C++ with Parquet
@@ -84,14 +83,6 @@ For maximum single-node performance on homogeneous clusters:
 
 ```bash
 cmake .. -DCMAKE_CXX_FLAGS="-march=native"
-```
-
-### OpenMP
-
-Set thread count at runtime:
-
-```bash
-export OMP_NUM_THREADS=32
 ```
 
 ## CLI tools

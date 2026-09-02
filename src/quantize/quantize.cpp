@@ -105,4 +105,57 @@ std::pair<std::vector<std::uint64_t>, std::size_t> quantize_4d_to_1bit(
   return {std::move(words), num_bits};
 }
 
+std::size_t l0_bits_per_vector(std::size_t dim) { return dim; }
+
+std::size_t l0_words_per_vector(std::size_t dim) { return (dim + 63) / 64; }
+
+std::size_t quantize_1dim_to_1bit_into(std::span<const float> vector,
+                                       std::span<std::uint64_t> out) {
+  const std::size_t dim = vector.size();
+  std::fill(out.begin(), out.end(), 0);
+
+  std::size_t d = 0;
+  while (d + 64 <= dim) {
+    std::uint64_t word = 0;
+    for (std::size_t chunk = 0; chunk < 4; ++chunk) {
+      const __m512 values = load_vector_block(vector.data() + d + chunk * 16);
+      const __mmask16 ge = _mm512_cmp_ps_mask(values, _mm512_setzero_ps(), _CMP_GE_OQ);
+      word |= static_cast<std::uint64_t>(ge) << (chunk * 16);
+    }
+    out[d / 64] = word;
+    d += 64;
+  }
+
+  if (d < dim) {
+    std::uint64_t word = 0;
+    const std::size_t remaining = dim - d;
+    std::size_t bit = 0;
+    while (bit + 16 <= remaining) {
+      const __m512 values = load_vector_block(vector.data() + d + bit);
+      const __mmask16 ge = _mm512_cmp_ps_mask(values, _mm512_setzero_ps(), _CMP_GE_OQ);
+      word |= static_cast<std::uint64_t>(ge) << bit;
+      bit += 16;
+    }
+    if (bit < remaining) {
+      alignas(64) float buf[simd::kWidth] = {};
+      const std::size_t tail = remaining - bit;
+      std::memcpy(buf, vector.data() + d + bit, tail * sizeof(float));
+      const __mmask16 ge = _mm512_cmp_ps_mask(_mm512_load_ps(buf), _mm512_setzero_ps(), _CMP_GE_OQ);
+      const std::uint32_t tail_bits = static_cast<std::uint32_t>(ge) & ((1u << tail) - 1u);
+      word |= static_cast<std::uint64_t>(tail_bits) << bit;
+    }
+    out[d / 64] = word;
+  }
+
+  return dim;
+}
+
+std::pair<std::vector<std::uint64_t>, std::size_t> quantize_1dim_to_1bit(
+    std::span<const float> vector) {
+  const std::size_t num_words = l0_words_per_vector(vector.size());
+  std::vector<std::uint64_t> words(num_words, 0);
+  const std::size_t num_bits = quantize_1dim_to_1bit_into(vector, words);
+  return {std::move(words), num_bits};
+}
+
 }  // namespace vectorcache::quantize

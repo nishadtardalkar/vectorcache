@@ -94,7 +94,10 @@ TEST(EngineTest, IngestWithRotationStoresL1Codes) {
 
   const std::size_t padded = transform::padded_dim(dim);
   const std::size_t words_per_vec = quantize::l1_words_per_vector(padded);
+  const std::size_t l0_words = quantize::l0_words_per_vector(padded);
   EXPECT_EQ(engine.store().l1_words_per_vec(), words_per_vec);
+  EXPECT_EQ(engine.store().l0_words_per_vec(), l0_words);
+  EXPECT_EQ(engine.store().padded_dim(), padded);
 
   const auto report = engine.ingest_with_hook(reader, &hook);
   EXPECT_EQ(report.vectors_ingested, n);
@@ -105,6 +108,26 @@ TEST(EngineTest, IngestWithRotationStoresL1Codes) {
   const std::size_t offset = (n - 1) * words_per_vec;
   for (std::size_t i = 0; i < words_per_vec; ++i) {
     EXPECT_EQ(slice[offset + i], expected_codes[i]);
+  }
+}
+
+TEST(EngineTest, IngestStoresL0AndFullVectors) {
+  const std::size_t dim = 4;
+  MockReader reader({{1.0f, -2.0f, 3.0f, -4.0f}}, dim);
+  auto engine = ingest::IngestionEngine::with_rotation(dim, 42);
+  CapturingHook hook;
+  engine.ingest_with_hook(reader, &hook);
+
+  const auto [expected_l0, _] = quantize::quantize_1dim_to_1bit(hook.last);
+  const auto& block = engine.store().partial_block();
+  const auto l0_slice = block.l0_slice();
+  ASSERT_EQ(l0_slice.size(), expected_l0.size());
+  EXPECT_EQ(l0_slice[0], expected_l0[0]);
+
+  const auto full_slice = block.full_slice();
+  ASSERT_EQ(full_slice.size(), hook.last.size());
+  for (std::size_t i = 0; i < hook.last.size(); ++i) {
+    EXPECT_FLOAT_EQ(full_slice[i], hook.last[i]);
   }
 }
 

@@ -14,7 +14,6 @@
 #include "vectorcache/datasets/npy.hpp"
 #include "vectorcache/error.hpp"
 #include "vectorcache/ingest/engine.hpp"
-#include "vectorcache/openmp.hpp"
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/ingest/timing.hpp"
 #include "vectorcache/quantize/quantize.hpp"
@@ -102,6 +101,7 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
                            std::size_t padded, std::uint64_t seed, std::size_t limit) {
   const vectorcache::transform::SrhtRotation rotation(dim, seed);
   const std::size_t l1_words = vectorcache::quantize::l1_words_per_vector(padded);
+  const std::size_t l0_words = vectorcache::quantize::l0_words_per_vector(padded);
   const std::size_t batch_cap =
       std::min(vectorcache::ingest::INGEST_BATCH_SIZE, std::max(limit, std::size_t{1}));
 
@@ -109,8 +109,10 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
   std::vector<float> batch_inputs(batch_cap * dim);
   std::vector<std::vector<float>> rotated(batch_cap, std::vector<float>(padded));
   std::vector<std::vector<std::uint64_t>> l1(batch_cap, std::vector<std::uint64_t>(l1_words));
+  std::vector<std::vector<std::uint64_t>> l0(batch_cap, std::vector<std::uint64_t>(l0_words));
 
-  auto store = vectorcache::ingest::BlockStore::with_capacity(l1_words, limit);
+  auto store =
+      vectorcache::ingest::BlockStore::with_capacity(l1_words, l0_words, padded, limit);
   StageTotals totals;
   std::size_t processed = 0;
 
@@ -156,13 +158,14 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
 
       const auto t_quant = std::chrono::steady_clock::now();
       vectorcache::quantize::quantize_4d_to_1bit_into(rotated[i], l1[i]);
+      vectorcache::quantize::quantize_1dim_to_1bit_into(rotated[i], l0[i]);
       totals.quantize_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                t_quant)
               .count());
 
       const auto t_store = std::chrono::steady_clock::now();
-      store.push_l1_codes(l1[i]);
+      store.push_vector(l1[i], l0[i], rotated[i]);
       totals.store_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                t_store)
@@ -207,8 +210,8 @@ void print_stage_report(const std::string& label, const StageTotals& stages) {
       {"batch copy (engine-style to_vec)", stages.batch_copy_ns},
       {"L2 normalize", stages.normalize_ns},
       {"SRHT (3x sign + FWHT)", stages.srht_ns},
-      {"L1 quantize", stages.quantize_ns},
-      {"store (push_l1_codes)", stages.store_ns},
+      {"L1+L0 quantize", stages.quantize_ns},
+      {"store (push_vector)", stages.store_ns},
   };
 
   std::cout << "  " << std::left << std::setw(34) << "stage" << std::right << std::setw(12)
@@ -229,7 +232,7 @@ void print_wall_report(std::uint64_t wall_ns, std::size_t vectors, const StageTo
   const double v = std::max(vectors, std::size_t{1});
   const std::uint64_t seq_total = stages.total_ns();
 
-  std::cout << "Engine ingest (parallel batches, release)\n";
+  std::cout << "Engine ingest (release)\n";
   std::cout << "  wall:    " << vectorcache::ingest::TimingSummary::format_duration(wall_ns)
             << " (" << wall_ns << " ns)\n";
   std::cout << "  per-vec: "
@@ -237,16 +240,19 @@ void print_wall_report(std::uint64_t wall_ns, std::size_t vectors, const StageTo
                    static_cast<std::uint64_t>(static_cast<double>(wall_ns) / v))
             << " (" << (static_cast<double>(wall_ns) / v) << " ns)\n\n";
 
-  if (wall_ns > 0) {
-    std::cout << "  parallel speedup vs sequential stages: "
-              << (static_cast<double>(seq_total) / static_cast<double>(wall_ns)) << "x\n";
+  if (seq_total > 0) {
+    const double overhead_pct =
+        (static_cast<double>(wall_ns) - static_cast<double>(seq_total)) /
+        static_cast<double>(seq_total) * 100.0;
+    std::cout << "  engine overhead vs sequential stages: " << std::fixed << std::setprecision(1)
+              << overhead_pct << "%\n";
   }
 
   std::cout << "\nHot paths (by sequential stage share):\n";
   std::vector<std::pair<const char*, std::uint64_t>> ranked = {
       {"SRHT / FWHT", stages.srht_ns},
       {"batch input copy (to_vec per batch)", stages.batch_copy_ns},
-      {"L1 quantize", stages.quantize_ns},
+      {"L1+L0 quantize", stages.quantize_ns},
       {"read I/O", stages.read_ns},
       {"L2 normalize", stages.normalize_ns},
       {"store", stages.store_ns},
@@ -273,7 +279,6 @@ int main(int argc, char** argv) {
   std::string split = "train";
   std::optional<std::size_t> limit;
   std::uint64_t seed = 42;
-  std::optional<int> threads;
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
   app.add_option("--dataset", dataset, "Dataset name")->envname("VECTORCACHE_DATASET");
@@ -281,14 +286,10 @@ int main(int argc, char** argv) {
   app.add_option("--split", split, "HDF5 split for GloVe");
   app.add_option("--limit", limit, "Cap vectors profiled");
   app.add_option("--seed", seed, "SRHT seed");
-  app.add_option("--threads", threads,
-                 "OpenMP worker threads (overrides OMP_NUM_THREADS; default: env or hardware)");
 
   CLI11_PARSE(app, argc, argv);
 
   try {
-    vectorcache::configure_openmp_threads(threads);
-
     if (npy_path.empty() && dataset.empty()) {
       throw vectorcache::Error("pass --dataset or --npy");
     }
@@ -302,8 +303,7 @@ int main(int argc, char** argv) {
 
     const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
     std::cout << "Ingest bench: " << source_label << " (dim=" << meta.dim << ", padded=" << padded
-              << ", vectors=" << actual_limit << ", threads=" << vectorcache::openmp_max_threads()
-              << ")\n";
+              << ", vectors=" << actual_limit << ")\n";
     if (limit && *limit < meta.count) {
       std::cout << "  (capped from " << meta.count << " vectors in dataset)\n";
     }

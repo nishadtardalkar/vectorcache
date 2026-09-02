@@ -56,6 +56,8 @@ help:
 	@echo "  BENCH_EXTRA_ARGS=$(BENCH_EXTRA_ARGS)"
 	@echo "  CMAKE_OPTS=$(CMAKE_OPTS)"
 	@echo ""
+	@echo "For native SIMD on compute nodes: make compute DATASET=glove CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
+	@echo ""
 	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make compute DATASET=glove"
 

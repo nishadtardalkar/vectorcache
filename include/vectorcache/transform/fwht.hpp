@@ -29,4 +29,10 @@ void scale_in_place(std::span<float> buf, float scale);
 /// Element-wise buf[i] *= signs[i] where signs[i] is +1 or -1.
 void apply_signs_i8(std::span<float> buf, std::span<const std::int8_t> signs);
 
+/// Element-wise buf[i] *= signs[i] where signs[i] is +1.0f or -1.0f.
+void apply_signs_f(std::span<float> buf, std::span<const float> signs);
+
+/// Reference orthonormal FWHT without fused butterfly stages (parity testing).
+void fwht_orthonormal_unfused_in_place(std::span<float> buf, float inv_sqrt_n);
+
 }  // namespace vectorcache::transform

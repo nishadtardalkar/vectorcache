@@ -7,48 +7,43 @@
 #include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/transform/normalize.hpp"
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 namespace vectorcache::ingest {
 
 IngestionEngine::IngestionEngine(BlockStore store, std::optional<transform::SrhtRotation> rotation,
                                  bool quantize_only, std::size_t input_dim, std::size_t padded_dim,
-                                 std::size_t l1_words_per_vec)
+                                 std::size_t l1_words_per_vec, std::size_t l0_words_per_vec)
     : store_(std::move(store)),
       rotation_(std::move(rotation)),
       quantize_only_(quantize_only),
       input_dim_(input_dim),
       padded_dim_(padded_dim),
       l1_words_per_vec_(l1_words_per_vec),
+      l0_words_per_vec_(l0_words_per_vec),
       read_buf_(input_dim, 0.0f) {}
 
 IngestionEngine IngestionEngine::from_rotated(std::size_t padded_dim) {
   const std::size_t l1_words = quantize::l1_words_per_vector(padded_dim);
-  return IngestionEngine(BlockStore(l1_words), std::nullopt, true, padded_dim, padded_dim,
-                         l1_words);
+  const std::size_t l0_words = quantize::l0_words_per_vector(padded_dim);
+  return IngestionEngine(BlockStore(l1_words, l0_words, padded_dim), std::nullopt, true,
+                         padded_dim, padded_dim, l1_words, l0_words);
 }
 
 IngestionEngine IngestionEngine::with_rotation(std::size_t original_dim, std::uint64_t seed) {
   transform::SrhtRotation rotation(original_dim, seed);
   const std::size_t padded = rotation.padded_dim();
   const std::size_t l1_words = quantize::l1_words_per_vector(padded);
-  return IngestionEngine(BlockStore(l1_words), std::move(rotation), false, original_dim, padded,
-                         l1_words);
+  const std::size_t l0_words = quantize::l0_words_per_vector(padded);
+  return IngestionEngine(BlockStore(l1_words, l0_words, padded), std::move(rotation), false,
+                         original_dim, padded, l1_words, l0_words);
 }
 
 void IngestionEngine::reserve_vectors(std::size_t count) {
-  store_ = BlockStore::with_capacity(l1_words_per_vec_, count);
+  store_ = BlockStore::with_capacity(l1_words_per_vec_, l0_words_per_vec_, padded_dim_, count);
   ensure_batch_capacity(std::min(INGEST_BATCH_SIZE, std::max(count, std::size_t{1})));
 }
 
 const transform::SrhtRotation* IngestionEngine::rotation() const {
   return rotation_ ? &(*rotation_) : nullptr;
-}
-
-void IngestionEngine::push_l1_codes(std::span<const std::uint64_t> codes) {
-  store_.push_l1_codes(codes);
 }
 
 void IngestionEngine::ensure_batch_capacity(std::size_t batch_cap) {
@@ -57,6 +52,7 @@ void IngestionEngine::ensure_batch_capacity(std::size_t batch_cap) {
     for (auto& work : batch_work_) {
       work.rotated.assign(padded_dim_, 0.0f);
       work.l1.assign(l1_words_per_vec_, 0);
+      work.l0.assign(l0_words_per_vec_, 0);
     }
   }
   const std::size_t input_bytes = batch_cap * input_dim_;
@@ -80,46 +76,31 @@ std::size_t IngestionEngine::read_batch(datasets::DatasetReader& reader) {
   return count;
 }
 
-void IngestionEngine::process_batch_parallel(std::size_t batch_len) {
+void IngestionEngine::process_batch(std::size_t batch_len) {
   const std::size_t input_dim = input_dim_;
   const std::size_t padded_dim = padded_dim_;
   const bool quantize_only = quantize_only_;
   const bool has_rotation = rotation_.has_value();
   const transform::SrhtRotation* rotation = has_rotation ? &(*rotation_) : nullptr;
 
-  bool failed = false;
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-  for (int i = 0; i < static_cast<int>(batch_len); ++i) {
-    if (failed) continue;
-    try {
-      auto& work = batch_work_[static_cast<std::size_t>(i)];
-      const float* input =
-          batch_inputs_.data() + static_cast<std::ptrdiff_t>(i * input_dim);
-      if (has_rotation) {
-        std::memcpy(work.rotated.data(), input, input_dim * sizeof(float));
-        if (padded_dim > input_dim) {
-          std::memset(work.rotated.data() + input_dim, 0,
-                      (padded_dim - input_dim) * sizeof(float));
-        }
-        transform::l2_normalize_in_place(work.rotated);
-        rotation->apply_in_place(work.rotated);
-      } else if (quantize_only) {
-        std::memcpy(work.rotated.data(), input, input_dim * sizeof(float));
-      } else {
-        failed = true;
-        continue;
+  for (std::size_t i = 0; i < batch_len; ++i) {
+    auto& work = batch_work_[i];
+    const float* input = batch_inputs_.data() + static_cast<std::ptrdiff_t>(i * input_dim);
+    if (has_rotation) {
+      std::memcpy(work.rotated.data(), input, input_dim * sizeof(float));
+      if (padded_dim > input_dim) {
+        std::memset(work.rotated.data() + input_dim, 0,
+                    (padded_dim - input_dim) * sizeof(float));
       }
-      quantize::quantize_4d_to_1bit_into(work.rotated, work.l1);
-    } catch (...) {
-      failed = true;
+      transform::l2_normalize_in_place(work.rotated);
+      rotation->apply_in_place(work.rotated);
+    } else if (quantize_only) {
+      std::memcpy(work.rotated.data(), input, input_dim * sizeof(float));
+    } else {
+      throw Error("IngestionEngine requires with_rotation() or from_rotated()");
     }
-  }
-
-  if (failed) {
-    throw Error("IngestionEngine requires with_rotation() or from_rotated()");
+    quantize::quantize_4d_to_1bit_into(work.rotated, work.l1);
+    quantize::quantize_1dim_to_1bit_into(work.rotated, work.l0);
   }
 }
 
@@ -143,14 +124,14 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
       break;
     }
 
-    process_batch_parallel(batch_len);
+    process_batch(batch_len);
 
     for (std::size_t i = 0; i < batch_len; ++i) {
       const auto& work = batch_work_[i];
       if (hook != nullptr) {
         hook->on_vector(global_id, work.rotated);
       }
-      store_.push_l1_codes(work.l1);
+      store_.push_vector(work.l1, work.l0, work.rotated);
       ++global_id;
     }
   }

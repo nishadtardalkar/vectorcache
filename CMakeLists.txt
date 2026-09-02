@@ -12,8 +12,6 @@ option(VECTORCACHE_BUILD_TESTS "Build tests" ON)
 option(VECTORCACHE_FETCH_DATASETS "Build fetch-datasets (requires libcurl)" ON)
 option(VECTORCACHE_FETCH_OPENAI "Download/convert OpenAI parquet shards (requires Arrow)" ON)
 
-find_package(OpenMP REQUIRED)
-
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-mavx512f -mavx512dq -mavx512bw -mfma)
 elseif(MSVC)
@@ -31,7 +29,6 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(CLI11)
 
 set(VECTORCACHE_SOURCES
-  src/openmp.cpp
   src/transform/fwht.cpp
   src/transform/normalize.cpp
   src/transform/srht.cpp
@@ -50,7 +47,6 @@ endif()
 add_library(vectorcache ${VECTORCACHE_SOURCES})
 target_include_directories(vectorcache PUBLIC include)
 target_compile_features(vectorcache PUBLIC cxx_std_20)
-target_link_libraries(vectorcache PUBLIC OpenMP::OpenMP_CXX)
 
 if(VECTORCACHE_BUILD_GLOVE)
   find_package(HDF5 REQUIRED COMPONENTS C)
@@ -148,7 +144,6 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_block.cpp
     tests/test_store.cpp
     tests/test_engine.cpp
-    tests/test_openmp.cpp
     tests/test_timing.cpp
     tests/test_npy.cpp
   )

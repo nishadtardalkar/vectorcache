@@ -1,4 +1,5 @@
 #include <cmath>
+#include <random>
 
 #include <gtest/gtest.h>
 
@@ -48,6 +49,59 @@ TEST(FwhtTest, ApplySignsI8Negates) {
   EXPECT_FLOAT_EQ(buf[1], 2.0f);
   EXPECT_FLOAT_EQ(buf[2], -3.0f);
   EXPECT_FLOAT_EQ(buf[3], 4.0f);
+}
+
+TEST(FwhtTest, ApplySignsFNegates) {
+  const std::vector<float> expected = {-1.0f, 2.0f, -3.0f, 4.0f, -5.0f, 6.0f, -7.0f, 8.0f,
+                                       9.0f, -10.0f, 11.0f, -12.0f, 13.0f, -14.0f, 15.0f, -16.0f};
+  std::vector<float> buf = {1.0f,  2.0f,  3.0f,  4.0f,  5.0f,  6.0f,  7.0f,  8.0f,
+                            9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f, 16.0f};
+  const std::vector<float> signs = {-1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
+                                    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f};
+  apply_signs_f(buf, signs);
+  for (std::size_t i = 0; i < buf.size(); ++i) {
+    EXPECT_FLOAT_EQ(buf[i], expected[i]) << "index " << i;
+  }
+}
+
+TEST(FwhtTest, OrthonormalBenchmarkDims) {
+  for (const std::size_t n : {256u, 2048u, 4096u}) {
+    std::vector<float> buf(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      buf[i] = std::sin(static_cast<float>(i) * 0.01f);
+    }
+    float norm_before = 0.0f;
+    for (float x : buf) norm_before += x * x;
+    norm_before = std::sqrt(norm_before);
+    fwht_orthonormal_in_place(buf);
+    float norm_after = 0.0f;
+    for (float x : buf) norm_after += x * x;
+    norm_after = std::sqrt(norm_after);
+    EXPECT_NEAR(norm_before, norm_after, 1e-3f) << "n=" << n;
+  }
+}
+
+TEST(FwhtTest, FusedMatchesUnfused) {
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+  for (const std::size_t n : {256u, 2048u, 4096u}) {
+    std::vector<float> fused(n);
+    std::vector<float> unfused(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      const float v = dist(rng);
+      fused[i] = v;
+      unfused[i] = v;
+    }
+
+    const float inv_sqrt_n = 1.0f / std::sqrt(static_cast<float>(n));
+    fwht_orthonormal_in_place(fused, inv_sqrt_n);
+    fwht_orthonormal_unfused_in_place(unfused, inv_sqrt_n);
+
+    for (std::size_t i = 0; i < n; ++i) {
+      EXPECT_NEAR(fused[i], unfused[i], 1e-5f) << "n=" << n << " index " << i;
+    }
+  }
 }
 
 TEST(FwhtTest, StockhamMatchesInPlace) {

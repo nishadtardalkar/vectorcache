@@ -5,6 +5,8 @@
 #include <span>
 #include <vector>
 
+#include "vectorcache/aligned.hpp"
+
 namespace vectorcache::transform {
 
 /// TurboQuant-style 3-round SRHT: H·D₃·H·D₂·H·D₁ with orthonormal H.
@@ -27,10 +29,9 @@ class SrhtRotation {
   std::size_t original_dim_;
   std::size_t padded_dim_;
   float inv_sqrt_n_;
-  std::vector<std::int8_t> signs1_;
-  std::vector<std::int8_t> signs2_;
-  std::vector<std::int8_t> signs3_;
-  mutable std::vector<float> fwht_scratch_;
+  AlignedVector<float> signs1_f_;
+  AlignedVector<float> signs2_f_;
+  AlignedVector<float> signs3_f_;
 };
 
 }  // namespace vectorcache::transform

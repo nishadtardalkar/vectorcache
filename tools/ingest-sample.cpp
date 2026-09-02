@@ -18,7 +18,6 @@
 #include "vectorcache/error.hpp"
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/hook.hpp"
-#include "vectorcache/openmp.hpp"
 #include "vectorcache/ingest/timing.hpp"
 #include "vectorcache/transform/fwht.hpp"
 #include "vectorcache/transform/normalize.hpp"
@@ -202,7 +201,6 @@ int main(int argc, char** argv) {
   std::size_t rounds = 1;
   bool variance = false;
   std::optional<std::size_t> show_index;
-  std::optional<int> threads;
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
   app.add_option("--dataset", dataset, "Dataset name")->envname("VECTORCACHE_DATASET");
@@ -213,14 +211,10 @@ int main(int argc, char** argv) {
   app.add_option("--rounds", rounds, "Number of consecutive SRHT rounds");
   app.add_flag("--variance", variance, "Report per-vector dimension variance");
   app.add_option("--show-index", show_index, "Print stored vector at index");
-  app.add_option("--threads", threads,
-                 "OpenMP worker threads (overrides OMP_NUM_THREADS; default: env or hardware)");
 
   CLI11_PARSE(app, argc, argv);
 
   try {
-    vectorcache::configure_openmp_threads(threads);
-
     if (rounds == 0) {
       throw vectorcache::Error("--rounds must be at least 1");
     }
