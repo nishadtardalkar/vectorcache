@@ -19,9 +19,24 @@ On HPC clusters, load modules before building:
 
 ```bash
 source scripts/envs.sh
-# Or manually:
+# Or manually (names vary by site):
 module load gcc cmake
 module load curl arrow hdf5
+```
+
+If you see `Unable to locate a modulefile for 'curl'` or `'arrow'`, those exact names are not on your cluster. Search for the real names:
+
+```bash
+module avail 2>&1 | grep -iE 'curl|arrow|hdf5'
+```
+
+Then either edit `scripts/envs.sh` or export overrides before `make login`:
+
+```bash
+export VECTORCACHE_MODULE_CURL=libcurl/8.5.0      # example
+export VECTORCACHE_MODULE_ARROW=apache-arrow/15.0.0
+export VECTORCACHE_MODULE_HDF5=hdf5/1.14.3
+make login
 ```
 
 ### HPC workflow
