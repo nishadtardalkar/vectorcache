@@ -1,3 +1,5 @@
+#include <cmath>
+
 #include <gtest/gtest.h>
 
 #include "vectorcache/error.hpp"
