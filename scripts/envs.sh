@@ -1,9 +1,11 @@
 #!/bin/bash
+# HPC environment setup for VectorCache (C++).
+# Adjust module names to match your cluster.
 
-export TMPDIR=./.tmp
-export RUSTUP_HOME=./.rustup
-export CARGO_HOME=./.cargo
+module load gcc cmake 2>/dev/null || true
+module load curl 2>/dev/null || true
+module load arrow 2>/dev/null || true
+module load hdf5 2>/dev/null || true
 
-mkdir -p $TMPDIR $RUSTUP_HOME $CARGO_HOME
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+export VECTORCACHE_DATA_DIR="${VECTORCACHE_DATA_DIR:-./data}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc 2>/dev/null || echo 1)}"
