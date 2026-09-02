@@ -31,6 +31,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(CLI11)
 
 set(VECTORCACHE_SOURCES
+  src/openmp.cpp
   src/transform/fwht.cpp
   src/transform/normalize.cpp
   src/transform/srht.cpp
@@ -147,6 +148,7 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_block.cpp
     tests/test_store.cpp
     tests/test_engine.cpp
+    tests/test_openmp.cpp
     tests/test_timing.cpp
     tests/test_npy.cpp
   )
