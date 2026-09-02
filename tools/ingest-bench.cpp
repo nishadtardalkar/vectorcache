@@ -254,7 +254,8 @@ void print_wall_report(std::uint64_t wall_ns, std::size_t vectors, const StageTo
             [](const auto& a, const auto& b) { return a.second > b.second; });
   for (std::size_t i = 0; i < ranked.size(); ++i) {
     const double pct =
-        static_cast<double>(ranked[i].second) / static_cast<double>(std::max(seq_total, 1ULL)) *
+        static_cast<double>(ranked[i].second) /
+        static_cast<double>(std::max(seq_total, std::uint64_t{1})) *
         100.0;
     std::cout << "  " << (i + 1) << ". " << ranked[i].first << " — " << std::fixed
               << std::setprecision(1) << pct << "%\n";
