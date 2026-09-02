@@ -124,17 +124,17 @@ void append_embeddings_from_parquet(const std::filesystem::path& path, const std
   }
   std::shared_ptr<arrow::io::ReadableFile> infile = *maybe_infile;
 
-  std::unique_ptr<parquet::arrow::FileReader> reader;
-  auto status = parquet::arrow::OpenFile(infile, arrow::default_memory_pool(), &reader);
-  if (!status.ok()) {
+  auto maybe_reader = parquet::arrow::OpenFile(infile, arrow::default_memory_pool());
+  if (!maybe_reader.ok()) {
     throw Error("failed to read parquet " + path.string());
   }
+  std::unique_ptr<parquet::arrow::FileReader> reader = std::move(*maybe_reader);
 
-  std::shared_ptr<arrow::Table> table;
-  status = reader->ReadTable(&table);
-  if (!status.ok()) {
+  auto maybe_table = reader->ReadTable();
+  if (!maybe_table.ok()) {
     throw Error("failed to read parquet table " + path.string());
   }
+  std::shared_ptr<arrow::Table> table = *maybe_table;
 
   auto column = table->GetColumnByName(column_name);
   if (!column) {
@@ -157,6 +157,8 @@ void append_embeddings_from_parquet(const std::filesystem::path& path, const std
     out.insert(out.end(), raw, raw + values->length());
   }
 }
+
+#endif  // VECTORCACHE_FETCH_OPENAI
 
 void fetch_glove(const std::filesystem::path& data_dir, bool force) {
   const auto dest = data_dir / kGloveFilename;
