@@ -47,7 +47,7 @@ help:
 	@echo "VectorCache HPC targets:"
 	@echo ""
 	@echo "  make login    Configure CMake, fetch dependencies, download datasets (login node)"
-	@echo "  make compute  Build, test, and benchmark offline (compute node; DATASET required)"
+	@echo "  make compute  Build, test, ingest-bench, and query-bench offline (compute node; DATASET required)"
 	@echo "  make clean    Remove build directory"
 	@echo ""
 	@echo "Variables:"
@@ -92,7 +92,7 @@ compute:
 		$(CMAKE_COMPUTE_FLAGS)
 	TOOLS_STATUS="$$(grep '^VECTORCACHE_BUILD_TOOLS:BOOL=' "$(BUILD_DIR)/CMakeCache.txt" 2>/dev/null | cut -d= -f2 || true)"
 	if [ "$$TOOLS_STATUS" != ON ]; then
-		echo "VECTORCACHE_BUILD_TOOLS is $${TOOLS_STATUS:-unset}; ingest-bench will not be built."
+		echo "VECTORCACHE_BUILD_TOOLS is $${TOOLS_STATUS:-unset}; ingest-bench and query-bench will not be built."
 		if [ -n "$(CMAKE_OPTS)" ]; then
 			echo "CMAKE_OPTS is set to '$(CMAKE_OPTS)' and overrides the Makefile default (-DVECTORCACHE_BUILD_TOOLS=ON)."
 		fi
@@ -120,6 +120,25 @@ compute:
 		exit 1
 	fi
 	"$$INGEST_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(BENCH_EXTRA_ARGS)
+	QUERY_BENCH=""
+	for candidate in \
+		"$(BUILD_DIR_ABS)/query-bench" \
+		"$(BUILD_DIR_ABS)/$(BUILD_TYPE)/query-bench"; do
+		if [ -x "$$candidate" ]; then
+			QUERY_BENCH="$$candidate"
+			break
+		fi
+	done
+	if [ -z "$$QUERY_BENCH" ]; then
+		QUERY_BENCH="$$(find "$(BUILD_DIR_ABS)" -maxdepth 3 \
+			\( -name 'query-bench' -o -name 'query-bench.exe' \) -type f -print -quit 2>/dev/null || true)"
+	fi
+	if [ -z "$$QUERY_BENCH" ] || [ ! -f "$$QUERY_BENCH" ]; then
+		echo "query-bench not found under $(BUILD_DIR_ABS)."
+		echo "Inspect the build log above for query-bench compile/link errors."
+		exit 1
+	fi
+	"$$QUERY_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(BENCH_EXTRA_ARGS)
 
 clean:
 	rm -rf $(BUILD_DIR)

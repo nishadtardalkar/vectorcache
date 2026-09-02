@@ -272,9 +272,9 @@ int main(int argc, char** argv) {
   std::filesystem::path npy_path;
   std::string dataset;
   std::filesystem::path data_dir = "data";
-  std::string index_split = "train";
+  std::string split = "train";
   std::string query_split;
-  std::size_t index_limit = 100000;
+  std::optional<std::size_t> limit;
   std::size_t query_limit = 0;
   std::uint64_t seed = 42;
   std::size_t k = 10;
@@ -284,13 +284,13 @@ int main(int argc, char** argv) {
   std::size_t l0_dot_promote = 0;
   bool calibrate = false;
 
-  app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix for index");
+  app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
   app.add_option("--dataset", dataset, "Dataset name")->envname("VECTORCACHE_DATASET");
   app.add_option("--data-dir", data_dir, "Data directory")->envname("VECTORCACHE_DATA_DIR");
-  app.add_option("--index-split", index_split, "Index HDF5 split (train)");
+  app.add_option("--split", split, "HDF5 split for GloVe");
   app.add_option("--query-split", query_split,
                  "Query split: test (GloVe) or holdout (OpenAI); default by dataset");
-  app.add_option("--index-limit", index_limit, "Index vectors to ingest");
+  app.add_option("--limit", limit, "Cap vectors ingested into index");
   app.add_option("--query-limit", query_limit, "Query count (default: 10000 GloVe, 1000 else)");
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
@@ -315,9 +315,9 @@ int main(int argc, char** argv) {
       query_limit = (dataset == "glove") ? 10000 : 1000;
     }
 
-    auto [index_reader, source_label] = open_reader(npy_path, dataset, data_dir, index_split);
+    auto [index_reader, source_label] = open_reader(npy_path, dataset, data_dir, split);
     const auto meta = index_reader->meta();
-    const std::size_t actual_index = std::min(index_limit, meta.count);
+    const std::size_t actual_index = std::min(limit.value_or(meta.count), meta.count);
     if (actual_index == 0) {
       throw vectorcache::Error("empty index");
     }
@@ -326,11 +326,14 @@ int main(int argc, char** argv) {
     std::cout << "Query bench: index=" << source_label << " dim=" << meta.dim
               << " padded=" << padded << " index_n=" << actual_index
               << " query_n=" << query_limit << " query_split=" << query_split << '\n';
+    if (limit && *limit < meta.count) {
+      std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
+    }
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     IngestResult ingested = ingest_index(index_limited, meta.dim, seed, actual_index);
 
-    auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, index_split);
+    auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);
     const auto queries =
         load_query_vectors(dataset, *train_for_queries, data_dir, meta.dim, actual_index,
                            query_limit, query_split, seed);
