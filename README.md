@@ -149,6 +149,38 @@ scripts/envs.sh        HPC module setup
 | OpenAI-1536 | 1536 | 2048 | NPY |
 | OpenAI-3072 | 3072 | 4096 | NPY |
 
+### Link error: `__cxa_call_terminate@CXXABI_1.3.15`
+
+This means **libparquet was built with a newer GCC/libstdc++ than your linker is using** (common with conda/mamba Arrow in `env/` on clusters that default to GCC 12/13).
+
+Fix options (pick one):
+
+1. **Load GCC 14+** before building (if your cluster has it):
+   ```bash
+   module avail 2>&1 | grep -i gcc
+   module load gcc/14    # example
+   make clean && make login
+   ```
+
+2. **Use a local conda/mamba env** for Arrow and let CMake link its libstdc++ (automatic if `env/` exists and you reconfigure):
+   ```bash
+   micromamba create -p ./env -c conda-forge "arrow>=15" parquet
+   source scripts/envs.sh
+   make clean && make login
+   ```
+
+3. **Use the cluster Arrow module** built with the same GCC you compile with, instead of conda Arrow:
+   ```bash
+   export VECTORCACHE_MODULE_ARROW=apache-arrow/15.0.0   # example
+   unset CMAKE_PREFIX_PATH   # drop ./env if set
+   make clean && make login
+   ```
+
+4. **Skip OpenAI datasets** if you only need GloVe:
+   ```bash
+   make login DATASETS=glove
+   ```
+
 ## Missing dependencies on HPC
 
 Apache Arrow is only required when downloading OpenAI datasets (`openai-1536`, `openai-3072`, or `DATASETS=all`). GloVe-only login does not need Arrow:

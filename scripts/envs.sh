@@ -36,8 +36,18 @@ warn_missing() {
   echo "WARNING: no module named '$tried' ($label). Search with: module avail 2>&1 | grep -i ${tried%%/*}" >&2
 }
 
-load_module gcc || true
+# GCC 14+ libstdc++ provides CXXABI_1.3.15 required by conda-forge / newer Arrow builds.
+load_module gcc/14 || load_module gcc/13 || load_module gcc || true
 load_module cmake || true
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOCAL_ENV="${VECTORCACHE_ENV_PREFIX:-$PROJECT_ROOT/env}"
+
+if [[ -d "$LOCAL_ENV/lib/cmake/Arrow" || -f "$LOCAL_ENV/lib/libparquet.so" ]]; then
+  export CMAKE_PREFIX_PATH="${LOCAL_ENV}${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+  export LD_LIBRARY_PATH="${LOCAL_ENV}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 CURL_MOD="${VECTORCACHE_MODULE_CURL:-curl}"
 ARROW_MOD="${VECTORCACHE_MODULE_ARROW:-arrow}"

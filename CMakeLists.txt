@@ -57,6 +57,32 @@ if(VECTORCACHE_BUILD_GLOVE)
   target_link_libraries(vectorcache PUBLIC ${HDF5_LIBRARIES})
 endif()
 
+# Shared Parquet from conda-forge or GCC 14+ may require libstdc++ with CXXABI_1.3.15
+# (__cxa_call_terminate). Link libstdc++ from the same prefix as libparquet when the
+# compiler's default libstdc++ is too old.
+function(vectorcache_link_parquet_libstdcxx parquet_target)
+  if(NOT TARGET ${parquet_target})
+    return()
+  endif()
+  foreach(_prop IMPORTED_LOCATION IMPORTED_LOCATION_RELEASE IMPORTED_LOCATION_DEBUG)
+    get_target_property(_parquet_loc ${parquet_target} ${_prop})
+    if(_parquet_loc)
+      break()
+    endif()
+  endforeach()
+  if(NOT _parquet_loc)
+    return()
+  endif()
+  get_filename_component(_parquet_libdir "${_parquet_loc}" DIRECTORY)
+  find_library(VECTORCACHE_PARQUET_LIBSTDCXX stdc++ PATHS "${_parquet_libdir}" NO_DEFAULT_PATH)
+  if(VECTORCACHE_PARQUET_LIBSTDCXX)
+    target_link_libraries(vectorcache PUBLIC "${VECTORCACHE_PARQUET_LIBSTDCXX}")
+    target_link_options(vectorcache PUBLIC "LINKER:-rpath,${_parquet_libdir}")
+    message(STATUS "Linking libstdc++ from Parquet prefix for C++ ABI compatibility: "
+                    "${VECTORCACHE_PARQUET_LIBSTDCXX}")
+  endif()
+endfunction()
+
 if(VECTORCACHE_BUILD_TOOLS)
   find_package(CURL REQUIRED)
 
@@ -70,6 +96,7 @@ if(VECTORCACHE_BUILD_TOOLS)
 
     if(TARGET Arrow::arrow_shared)
       target_link_libraries(vectorcache PUBLIC Arrow::arrow_shared Parquet::parquet_shared)
+      vectorcache_link_parquet_libstdcxx(Parquet::parquet_shared)
     elseif(TARGET Arrow::arrow_static)
       target_link_libraries(vectorcache PUBLIC Arrow::arrow_static Parquet::parquet_static)
     elseif(TARGET Arrow::arrow)
