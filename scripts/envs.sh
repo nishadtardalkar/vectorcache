@@ -40,6 +40,10 @@ warn_missing() {
 load_module gcc/14 || load_module gcc/13 || load_module gcc || true
 load_module cmake || true
 
+# Capture GCC before later modules (e.g. HDF5) switch PrgEnv to Intel.
+_VECTORCACHE_GCC="$(type -P gcc 2>/dev/null || true)"
+_VECTORCACHE_GXX="$(type -P g++ 2>/dev/null || true)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOCAL_ENV="${VECTORCACHE_ENV_PREFIX:-$PROJECT_ROOT/env}"
@@ -56,6 +60,14 @@ HDF5_MOD="${VECTORCACHE_MODULE_HDF5:-hdf5}"
 load_module "$CURL_MOD" || warn_missing "libcurl for fetch-datasets" "$CURL_MOD"
 load_module "$ARROW_MOD" || warn_missing "Apache Arrow for Parquet datasets" "$ARROW_MOD"
 load_module "$HDF5_MOD" || warn_missing "HDF5 for GloVe reader" "$HDF5_MOD"
+
+# HDF5 modules often load PrgEnv-intel, but Intel icpx cannot compile libstdc++
+# <variant> (used by Arrow) against GCC headers — pin GCC for the whole build.
+if [[ -n "$_VECTORCACHE_GCC" && -n "$_VECTORCACHE_GXX" ]]; then
+  export CC="${VECTORCACHE_CC:-$_VECTORCACHE_GCC}"
+  export CXX="${VECTORCACHE_CXX:-$_VECTORCACHE_GXX}"
+fi
+unset _VECTORCACHE_GCC _VECTORCACHE_GXX
 
 export VECTORCACHE_DATA_DIR="${VECTORCACHE_DATA_DIR:-./data}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc 2>/dev/null || echo 1)}"

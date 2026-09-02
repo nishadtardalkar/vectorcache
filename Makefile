@@ -22,6 +22,10 @@ else
 LOGIN_FETCH_OPENAI := OFF
 endif
 
+CMAKE_COMPILER_FLAGS := \
+	-DCMAKE_C_COMPILER="$${CC:-gcc}" \
+	-DCMAKE_CXX_COMPILER="$${CXX:-g++}"
+
 CMAKE_COMMON_FLAGS := \
 	-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
 	-DVECTORCACHE_BUILD_GLOVE=ON \
@@ -60,7 +64,7 @@ $(LOGIN_READY):
 	set -euo pipefail
 	source $(ENV_SCRIPT)
 	mkdir -p $(BUILD_DIR)
-	cmake -S . -B $(BUILD_DIR) $(CMAKE_LOGIN_FLAGS)
+	cmake -S . -B $(BUILD_DIR) $(CMAKE_COMPILER_FLAGS) $(CMAKE_LOGIN_FLAGS)
 	cmake --build $(BUILD_DIR) --target fetch-datasets -j$(JOBS)
 	$(BUILD_DIR)/fetch-datasets --data-dir $(DATA_DIR) $(DATASETS)
 	touch $(LOGIN_READY)
@@ -76,7 +80,7 @@ compute:
 	fi
 	set -euo pipefail
 	source $(ENV_SCRIPT)
-	cmake -S . -B $(BUILD_DIR) \
+	cmake -S . -B $(BUILD_DIR) $(CMAKE_COMPILER_FLAGS) \
 		-DFETCHCONTENT_FULLY_DISCONNECTED=ON \
 		$(CMAKE_COMPUTE_FLAGS)
 	if ! cmake -L -B $(BUILD_DIR) 2>/dev/null | grep -q '^VECTORCACHE_BUILD_TOOLS:BOOL=ON'; then
