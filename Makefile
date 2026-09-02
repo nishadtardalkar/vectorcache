@@ -83,9 +83,13 @@ compute:
 	cmake -S . -B $(BUILD_DIR) $(CMAKE_COMPILER_FLAGS) \
 		-DFETCHCONTENT_FULLY_DISCONNECTED=ON \
 		$(CMAKE_COMPUTE_FLAGS)
-	if ! cmake -L -B $(BUILD_DIR) 2>/dev/null | grep -q '^VECTORCACHE_BUILD_TOOLS:BOOL=ON'; then
-		echo "VECTORCACHE_BUILD_TOOLS is OFF; ingest-bench will not be built."
-		echo "Reconfigure with -DVECTORCACHE_BUILD_TOOLS=ON (the default for make compute)."
+	TOOLS_STATUS="$$(grep '^VECTORCACHE_BUILD_TOOLS:BOOL=' "$(BUILD_DIR)/CMakeCache.txt" 2>/dev/null | cut -d= -f2 || true)"
+	if [ "$$TOOLS_STATUS" != ON ]; then
+		echo "VECTORCACHE_BUILD_TOOLS is $${TOOLS_STATUS:-unset}; ingest-bench will not be built."
+		if [ -n "$(CMAKE_OPTS)" ]; then
+			echo "CMAKE_OPTS is set to '$(CMAKE_OPTS)' and overrides the Makefile default (-DVECTORCACHE_BUILD_TOOLS=ON)."
+		fi
+		echo "Fix: make clean && make login, then make compute without CMAKE_OPTS=-DVECTORCACHE_BUILD_TOOLS=OFF"
 		exit 1
 	fi
 	cmake --build $(BUILD_DIR) --target vectorcache_tests ingest-bench -j$(JOBS)
