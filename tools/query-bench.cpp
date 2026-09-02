@@ -18,12 +18,9 @@
 #include "vectorcache/error.hpp"
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/store.hpp"
-#include "vectorcache/query/distance.hpp"
 #include "vectorcache/query/engine.hpp"
 #include "vectorcache/query/query_config.hpp"
 #include "vectorcache/transform/fwht.hpp"
-#include "vectorcache/transform/normalize.hpp"
-#include "vectorcache/transform/srht.hpp"
 
 namespace {
 
@@ -69,60 +66,17 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 #endif
 }
 
-struct IngestResult {
-  vectorcache::ingest::IngestionEngine engine;
-  std::vector<vectorcache::AlignedVector<float>> index_vectors;
-};
-
-IngestResult ingest_index(vectorcache::datasets::DatasetReader& reader, std::size_t dim,
-                          std::uint64_t seed, std::size_t limit) {
-  IngestResult result{vectorcache::ingest::IngestionEngine::with_rotation(dim, seed), {}};
-  result.engine.reserve_vectors(limit);
-  result.index_vectors.reserve(limit);
-
-  std::vector<float> buf(dim);
-  std::size_t ingested = 0;
-  while (ingested < limit && reader.next_vector_into(buf)) {
-    vectorcache::AlignedVector<float> rotated(result.engine.store().padded_dim(), 0.0f);
-    std::copy(buf.begin(), buf.end(), rotated.begin());
-    const std::size_t padded = result.engine.store().padded_dim();
-    if (padded > dim) {
-      std::fill(rotated.begin() + static_cast<std::ptrdiff_t>(dim), rotated.end(), 0.0f);
-    }
-    vectorcache::transform::l2_normalize_in_place(rotated);
-    if (auto* rot = result.engine.rotation()) {
-      rot->apply_in_place(rotated);
-    }
-    result.index_vectors.push_back(std::move(rotated));
-
-    struct OneShotReader : vectorcache::datasets::DatasetReader {
-      std::span<const float> vec;
-      bool done = false;
-      vectorcache::datasets::DatasetMeta meta() const override {
-        return {vec.size(), 1, "one"};
-      }
-      bool next_vector_into(std::span<float> out) override {
-        if (done) {
-          return false;
-        }
-        std::copy(vec.begin(), vec.end(), out.begin());
-        done = true;
-        return true;
-      }
-    };
-
-    OneShotReader one;
-    one.vec = std::span<const float>(buf);
-    one.done = false;
-
-    result.engine.ingest(one);
-    ++ingested;
-  }
-
-  if (ingested != limit) {
+vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
+                                                   std::size_t dim, std::uint64_t seed,
+                                                   std::size_t limit) {
+  vectorcache::datasets::LimitedReader limited(reader, limit);
+  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed);
+  engine.reserve_vectors(limit);
+  const auto report = engine.ingest(limited);
+  if (report.vectors_ingested != limit) {
     throw vectorcache::Error("index ingest count mismatch");
   }
-  return result;
+  return engine;
 }
 
 std::vector<std::vector<float>> load_query_vectors(
@@ -161,55 +115,15 @@ std::vector<std::vector<float>> load_query_vectors(
   return queries;
 }
 
-std::vector<std::size_t> brute_force_topk(
-    const vectorcache::query::PreparedQuery& query,
-    const std::vector<vectorcache::AlignedVector<float>>& index_vectors, std::size_t k) {
-  struct Scored {
-    std::size_t id;
-    float score;
-  };
-  std::vector<Scored> all;
-  all.reserve(index_vectors.size());
-  for (std::size_t i = 0; i < index_vectors.size(); ++i) {
-#if VECTORCACHE_QUERY_DEPTH >= 3
-    const float score = vectorcache::query::dot_f32(query.rotated, index_vectors[i]);
-#else
-    const float score = 0.0f;
-#endif
-    all.push_back({i, score});
+void print_score_stats(double sum_top1, double sum_topk_mean, std::size_t queries,
+                       std::size_t k) {
+  if (queries == 0) {
+    return;
   }
-  if (k > all.size()) {
-    k = all.size();
-  }
-  std::partial_sort(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(k), all.end(),
-                    [](const Scored& a, const Scored& b) { return a.score > b.score; });
-  std::vector<std::size_t> ids;
-  ids.reserve(k);
-  for (std::size_t i = 0; i < k; ++i) {
-    ids.push_back(all[i].id);
-  }
-  return ids;
-}
-
-float recall_at_k(const std::vector<vectorcache::query::QueryHit>& hits,
-                  const std::vector<std::size_t>& ground_truth, std::size_t k_eval) {
-  if (ground_truth.empty()) {
-    return 0.0f;
-  }
-  const std::size_t kk = std::min(k_eval, hits.size());
-  const std::size_t gt_k = std::min(k_eval, ground_truth.size());
-
-  std::size_t found = 0;
-  for (std::size_t i = 0; i < gt_k; ++i) {
-    const std::size_t id = ground_truth[i];
-    for (std::size_t j = 0; j < kk; ++j) {
-      if (hits[j].id == id) {
-        ++found;
-        break;
-      }
-    }
-  }
-  return static_cast<float>(found) / static_cast<float>(gt_k);
+  std::cout << std::fixed << std::setprecision(4);
+  std::cout << "Scores (similarity, k=" << k << "):\n";
+  std::cout << "  avg top-1:      " << (sum_top1 / static_cast<double>(queries)) << '\n';
+  std::cout << "  avg top-k mean: " << (sum_topk_mean / static_cast<double>(queries)) << '\n';
 }
 
 void print_latency_stats(const std::vector<std::uint64_t>& prep_ns,
@@ -268,7 +182,7 @@ void run_calibration(const vectorcache::query::QueryEngine& engine,
 }  // namespace
 
 int main(int argc, char** argv) {
-  CLI::App app{"Query engine benchmark (recall, latency, optional calibration)"};
+  CLI::App app{"Query engine benchmark (scores, latency, optional calibration)"};
   std::filesystem::path npy_path;
   std::string dataset;
   std::filesystem::path data_dir = "data";
@@ -331,14 +245,14 @@ int main(int argc, char** argv) {
     }
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
-    IngestResult ingested = ingest_index(index_limited, meta.dim, seed, actual_index);
+    auto ingest_engine = ingest_index(index_limited, meta.dim, seed, actual_index);
 
     auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);
     const auto queries =
         load_query_vectors(dataset, *train_for_queries, data_dir, meta.dim, actual_index,
                            query_limit, query_split, seed);
 
-    auto query_engine = vectorcache::query::QueryEngine::with_rotation(ingested.engine.store(),
+    auto query_engine = vectorcache::query::QueryEngine::with_rotation(ingest_engine.store(),
                                                                        meta.dim, seed);
 
     vectorcache::query::QueryParams params;
@@ -353,10 +267,9 @@ int main(int argc, char** argv) {
     prep_ns.reserve(queries.size());
     search_ns.reserve(queries.size());
 
-    double recall1 = 0.0;
-    double recall5 = 0.0;
-    double recall10 = 0.0;
-    std::size_t evaluated = 0;
+    double sum_top1 = 0.0;
+    double sum_topk_mean = 0.0;
+    std::size_t scored_queries = 0;
 
     for (const auto& q : queries) {
       const auto t0 = Clock::now();
@@ -370,29 +283,19 @@ int main(int argc, char** argv) {
       search_ns.push_back(static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
 
-#if VECTORCACHE_QUERY_DEPTH >= 3
-      const auto gt =
-          brute_force_topk(prepared, ingested.index_vectors, std::max(k, std::size_t{10}));
-      recall1 += recall_at_k(hits, gt, 1);
-      recall5 += recall_at_k(hits, gt, 5);
-      recall10 += recall_at_k(hits, gt, 10);
-      ++evaluated;
-#endif
+      if (!hits.empty()) {
+        sum_top1 += hits.front().score;
+        double hit_sum = 0.0;
+        for (const auto& hit : hits) {
+          hit_sum += hit.score;
+        }
+        sum_topk_mean += hit_sum / static_cast<double>(hits.size());
+        ++scored_queries;
+      }
     }
 
     print_latency_stats(prep_ns, search_ns);
-
-#if VECTORCACHE_QUERY_DEPTH >= 3
-    if (evaluated > 0) {
-      std::cout << std::fixed << std::setprecision(4);
-      std::cout << "Recall (vs brute-force on " << actual_index << " index vectors):\n";
-      std::cout << "  @1:  " << (recall1 / static_cast<double>(evaluated)) << '\n';
-      std::cout << "  @5:  " << (recall5 / static_cast<double>(evaluated)) << '\n';
-      std::cout << "  @10: " << (recall10 / static_cast<double>(evaluated)) << '\n';
-    }
-#else
-    std::cout << "Recall skipped (VECTORCACHE_QUERY_DEPTH < 3)\n";
-#endif
+    print_score_stats(sum_top1, sum_topk_mean, scored_queries, k);
 
     if (calibrate && !queries.empty()) {
       run_calibration(query_engine, queries, params);
