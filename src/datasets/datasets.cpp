@@ -116,6 +116,45 @@ void print_dataset_status(const std::string& label, const std::filesystem::path&
 }
 
 #ifdef VECTORCACHE_FETCH_OPENAI
+void append_embedding_values_as_f32(const std::shared_ptr<arrow::Array>& values,
+                                    std::vector<float>& out) {
+  if (auto floats = std::dynamic_pointer_cast<arrow::FloatArray>(values)) {
+    const float* raw = floats->raw_values();
+    out.insert(out.end(), raw, raw + floats->length());
+    return;
+  }
+  if (auto doubles = std::dynamic_pointer_cast<arrow::DoubleArray>(values)) {
+    const double* raw = doubles->raw_values();
+    for (int64_t i = 0; i < doubles->length(); ++i) {
+      out.push_back(static_cast<float>(raw[i]));
+    }
+    return;
+  }
+  throw Error("expected float or double values inside embedding list");
+}
+
+void append_embeddings_from_chunk(const std::shared_ptr<arrow::Array>& chunk, std::size_t dim,
+                                  const std::filesystem::path& path, std::vector<float>& out) {
+  if (auto list_array = std::dynamic_pointer_cast<arrow::FixedSizeListArray>(chunk)) {
+    if (static_cast<std::size_t>(list_array->value_length()) != dim) {
+      throw Error("unexpected embedding width in " + path.string());
+    }
+    append_embedding_values_as_f32(list_array->values(), out);
+    return;
+  }
+
+  if (auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(chunk)) {
+    if (list_array->length() > 0 &&
+        static_cast<std::size_t>(list_array->value_length(0)) != dim) {
+      throw Error("unexpected embedding width in " + path.string());
+    }
+    append_embedding_values_as_f32(list_array->values(), out);
+    return;
+  }
+
+  throw Error("expected list column for embeddings in " + path.string());
+}
+
 void append_embeddings_from_parquet(const std::filesystem::path& path, const std::string& column_name,
                                     std::size_t dim, std::vector<float>& out) {
   auto maybe_infile = arrow::io::ReadableFile::Open(path.string());
@@ -142,19 +181,7 @@ void append_embeddings_from_parquet(const std::filesystem::path& path, const std
   }
 
   for (const auto& chunk : column->chunks()) {
-    auto list_array = std::dynamic_pointer_cast<arrow::FixedSizeListArray>(chunk);
-    if (!list_array) {
-      throw Error("expected fixed-size list column in " + path.string());
-    }
-    if (static_cast<std::size_t>(list_array->value_length()) != dim) {
-      throw Error("unexpected embedding width in " + path.string());
-    }
-    auto values = std::dynamic_pointer_cast<arrow::FloatArray>(list_array->values());
-    if (!values) {
-      throw Error("expected float32 values inside embedding list");
-    }
-    const float* raw = values->raw_values();
-    out.insert(out.end(), raw, raw + values->length());
+    append_embeddings_from_chunk(chunk, dim, path, out);
   }
 }
 
