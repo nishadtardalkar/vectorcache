@@ -173,6 +173,33 @@ TEST(QueryEngineTest, L0ThresholdFilters) {
   EXPECT_LT(strict_hits.size(), open_hits.size());
 }
 
+TEST(QueryEngineTest, L0OnlyFindsSelfWithoutL1) {
+  const std::size_t dim = 64;
+  const auto vectors = make_vectors(8, dim);
+  MockReader reader(vectors, dim);
+
+  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42);
+  ingest_engine.ingest(reader);
+
+  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
+  query::QueryParams params;
+  params.k = 3;
+  params.l0_only = true;
+  params.l0_vector_threshold = -1.0f;
+  // L1 gates would otherwise reject everything; L0-only must ignore them.
+  params.l1_block_threshold = 1.1f;
+  params.l1_vector_threshold = 1.1f;
+
+  const auto hits = query_engine.search(vectors[3], params);
+  ASSERT_FALSE(hits.empty());
+  EXPECT_NEAR(hits[0].score, 1.0f, 1e-4f);
+  const bool found_self =
+      std::any_of(hits.begin(), hits.end(), [](const query::QueryHit& h) {
+        return h.id == 3u && h.score > 0.999f;
+      });
+  EXPECT_TRUE(found_self);
+}
+
 TEST(QueryEngineTest, SearchPreparedMatchesSearch) {
   const std::size_t dim = 4;
   const auto vectors = make_vectors(4, dim);

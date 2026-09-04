@@ -199,6 +199,7 @@ int main(int argc, char** argv) {
   float l0_threshold = 0.0f;
   std::size_t top_blocks = 0;
   bool calibrate = false;
+  bool l0_only = false;
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
   app.add_option("--dataset", dataset, "Dataset name")->envname("VECTORCACHE_DATASET");
@@ -214,6 +215,7 @@ int main(int argc, char** argv) {
   app.add_option("--l1-vector-threshold", l1_vector_threshold, "L1 per-vector prefilter threshold");
   app.add_option("--l0-threshold", l0_threshold, "L0 vector filter threshold");
   app.add_option("--top-blocks", top_blocks, "Block routing: search top N blocks by L1 (0=all)");
+  app.add_flag("--l0-only", l0_only, "Score all vectors with L0 only (skip L1 prefilter/routing)");
   app.add_flag("--calibrate", calibrate, "Sweep L1/L0 thresholds on first query");
 
   CLI11_PARSE(app, argc, argv);
@@ -262,6 +264,11 @@ int main(int argc, char** argv) {
     params.l1_vector_threshold = l1_vector_threshold;
     params.l0_vector_threshold = l0_threshold;
     params.top_blocks = top_blocks;
+    params.l0_only = l0_only;
+
+    if (l0_only) {
+      std::cout << "  mode=l0-only (no L1 prefilter/routing)\n";
+    }
 
     std::vector<std::uint64_t> prep_ns;
     std::vector<std::uint64_t> search_ns;

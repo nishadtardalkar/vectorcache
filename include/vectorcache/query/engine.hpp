@@ -24,6 +24,8 @@ struct QueryParams {
   std::size_t k = 10;
   /// When > 0, only search the top N blocks by max L1 score (block routing).
   std::size_t top_blocks = 0;
+  /// When true, score every vector with L0 only (no L1 prefilter / block routing).
+  bool l0_only = false;
 };
 
 struct PreparedQuery {

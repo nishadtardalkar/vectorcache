@@ -82,6 +82,7 @@ struct BlockRef {
   float max_l1 = -1.0f;
 };
 
+template <bool L0Only>
 void search_block(const BlockRef& ref, const PreparedQuery& query, const QueryParams& params,
                   TopKHits& topk) {
   if (ref.block == nullptr || ref.block->is_empty()) {
@@ -89,9 +90,23 @@ void search_block(const BlockRef& ref, const PreparedQuery& query, const QueryPa
   }
 
   const ingest::LogicalBlock& block = *ref.block;
-  const std::size_t l1_bits = quantize::l1_bits_per_vector(block.layout().padded_dim);
   const std::size_t l0_bits = quantize::l0_bits_per_vector(block.layout().padded_dim);
   const std::size_t n = block.len();
+
+  if constexpr (L0Only) {
+    for (std::size_t i = 0; i < n; ++i) {
+      if (i + 2 < n) {
+        prefetch_l0(block, i + 2);
+      }
+      const float l0_score = bit_agreement_score(query.l0, block.vector_l0(i), l0_bits);
+      if (l0_score >= params.l0_vector_threshold) {
+        topk.push(ref.base_id + i, l0_score);
+      }
+    }
+    return;
+  }
+
+  const std::size_t l1_bits = quantize::l1_bits_per_vector(block.layout().padded_dim);
 
   std::vector<float> l1_scores(n);
   bit_agreement_batch(query.l1, l1_bits, block.l1_slice(), block.layout().l1_words_per_vec, n,
@@ -156,16 +171,19 @@ void score_blocks_l1(const PreparedQuery& query, const ingest::BlockStore& store
   }
 }
 
+template <bool L0Only>
 void search_store(const ingest::BlockStore& store, const PreparedQuery& query,
                   const QueryParams& params, TopKHits& topk) {
   std::vector<BlockRef> refs = build_block_refs(store);
 
-  if (params.top_blocks > 0) {
-    score_blocks_l1(query, store, refs);
-    std::sort(refs.begin(), refs.end(),
-              [](const BlockRef& a, const BlockRef& b) { return a.max_l1 > b.max_l1; });
-    if (refs.size() > params.top_blocks) {
-      refs.resize(params.top_blocks);
+  if constexpr (!L0Only) {
+    if (params.top_blocks > 0) {
+      score_blocks_l1(query, store, refs);
+      std::sort(refs.begin(), refs.end(),
+                [](const BlockRef& a, const BlockRef& b) { return a.max_l1 > b.max_l1; });
+      if (refs.size() > params.top_blocks) {
+        refs.resize(params.top_blocks);
+      }
     }
   }
 
@@ -174,15 +192,15 @@ void search_store(const ingest::BlockStore& store, const PreparedQuery& query,
   std::vector<TopKHits> local(static_cast<std::size_t>(nblocks), TopKHits(params.k));
 #pragma omp parallel for schedule(static)
   for (int b = 0; b < nblocks; ++b) {
-    search_block(refs[static_cast<std::size_t>(b)], query, params,
-                 local[static_cast<std::size_t>(b)]);
+    search_block<L0Only>(refs[static_cast<std::size_t>(b)], query, params,
+                         local[static_cast<std::size_t>(b)]);
   }
   for (const auto& part : local) {
     topk.merge_from(part);
   }
 #else
   for (const auto& ref : refs) {
-    search_block(ref, query, params, topk);
+    search_block<L0Only>(ref, query, params, topk);
   }
 #endif
 }
@@ -255,7 +273,11 @@ PreparedQuery QueryEngine::prepare(std::span<const float> query) const {
 std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared,
                                                    const QueryParams& params) const {
   TopKHits topk(params.k);
-  search_store(store_, prepared, params, topk);
+  if (params.l0_only) {
+    search_store<true>(store_, prepared, params, topk);
+  } else {
+    search_store<false>(store_, prepared, params, topk);
+  }
   return topk.finalize();
 }
 
