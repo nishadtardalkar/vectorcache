@@ -8,7 +8,6 @@
 
 #include "vectorcache/aligned.hpp"
 #include "vectorcache/ingest/store.hpp"
-#include "vectorcache/query/query_config.hpp"
 #include "vectorcache/transform/srht.hpp"
 
 namespace vectorcache::query {
@@ -20,20 +19,17 @@ struct QueryHit {
 
 struct QueryParams {
   float l1_block_threshold = 0.0f;
+  float l1_vector_threshold = 0.0f;
   float l0_vector_threshold = 0.0f;
   std::size_t k = 10;
   /// When > 0, only search the top N blocks by max L1 score (block routing).
   std::size_t top_blocks = 0;
-  /// When > 0 at depth 3, run full dot only on top M L0 survivors per query (adaptive cascade).
-  std::size_t l0_dot_promote = 0;
 };
 
 struct PreparedQuery {
   AlignedVector<float> rotated;
   AlignedVector<std::uint64_t> l1;
-#if VECTORCACHE_QUERY_DEPTH >= 2
   AlignedVector<std::uint64_t> l0;
-#endif
 };
 
 class QueryEngine {

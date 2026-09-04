@@ -111,7 +111,7 @@ TEST(EngineTest, IngestWithRotationStoresL1Codes) {
   }
 }
 
-TEST(EngineTest, IngestStoresL0AndFullVectors) {
+TEST(EngineTest, IngestStoresL0Vectors) {
   const std::size_t dim = 4;
   MockReader reader({{1.0f, -2.0f, 3.0f, -4.0f}}, dim);
   auto engine = ingest::IngestionEngine::with_rotation(dim, 42);
@@ -123,12 +123,6 @@ TEST(EngineTest, IngestStoresL0AndFullVectors) {
   const auto l0_slice = block.l0_slice();
   ASSERT_EQ(l0_slice.size(), expected_l0.size());
   EXPECT_EQ(l0_slice[0], expected_l0[0]);
-
-  const auto full_slice = block.full_slice();
-  ASSERT_EQ(full_slice.size(), hook.last.size());
-  for (std::size_t i = 0; i < hook.last.size(); ++i) {
-    EXPECT_FLOAT_EQ(full_slice[i], hook.last[i]);
-  }
 }
 
 TEST(EngineTest, IngestWithRotationNormalizesBeforeSrht) {

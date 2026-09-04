@@ -2,7 +2,7 @@
 
 Block-based multi-level quantized vector retrieval engine (C++20).
 
-VectorCache implements the ingestion pipeline for approximate nearest neighbor search: SRHT rotation, L1 4D-to-1bit quantization, and 1024-vector block storage.
+VectorCache implements the ingestion and query pipeline for approximate nearest neighbor search: SRHT rotation, L1 4D→1bit + L0 1D→1bit quantization into 1024-vector blocks, and L1-prefilter → L0-ranked search (no full-f32 storage).
 
 ## Requirements
 

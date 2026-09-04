@@ -174,7 +174,7 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
               .count());
 
       const auto t_store = std::chrono::steady_clock::now();
-      store.push_vector(l1[i], l0[i], rotated[i]);
+      store.push_vector(l1[i], l0[i]);
       totals.store_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                t_store)

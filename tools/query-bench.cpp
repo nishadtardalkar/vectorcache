@@ -19,7 +19,6 @@
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/query/engine.hpp"
-#include "vectorcache/query/query_config.hpp"
 #include "vectorcache/transform/fwht.hpp"
 
 namespace {
@@ -164,17 +163,20 @@ void run_calibration(const vectorcache::query::QueryEngine& engine,
                      const std::vector<std::vector<float>>& queries,
                      const vectorcache::query::QueryParams& base_params) {
   std::cout << "\nThreshold calibration (first query, k=" << base_params.k << "):\n";
-  std::cout << "  l1_block_threshold  l0_vector_threshold  hits\n";
+  std::cout << "  l1_block  l1_vector  l0_vector  hits\n";
 
   const auto prepared = engine.prepare(queries.front());
-  for (float l1 : {-1.0f, -0.5f, 0.0f, 0.25f, 0.5f, 0.75f}) {
-    for (float l0 : {-1.0f, 0.0f, 0.25f, 0.5f, 0.75f}) {
-      vectorcache::query::QueryParams p = base_params;
-      p.l1_block_threshold = l1;
-      p.l0_vector_threshold = l0;
-      const auto hits = engine.search_prepared(prepared, p);
-      std::cout << "  " << std::setw(18) << l1 << std::setw(21) << l0 << std::setw(6)
-                << hits.size() << '\n';
+  for (float l1_block : {-1.0f, 0.0f, 0.25f, 0.5f}) {
+    for (float l1_vec : {-1.0f, 0.0f, 0.25f, 0.5f}) {
+      for (float l0 : {-1.0f, 0.0f, 0.25f, 0.5f}) {
+        vectorcache::query::QueryParams p = base_params;
+        p.l1_block_threshold = l1_block;
+        p.l1_vector_threshold = l1_vec;
+        p.l0_vector_threshold = l0;
+        const auto hits = engine.search_prepared(prepared, p);
+        std::cout << "  " << std::setw(8) << l1_block << std::setw(11) << l1_vec << std::setw(11)
+                  << l0 << std::setw(6) << hits.size() << '\n';
+      }
     }
   }
 }
@@ -193,9 +195,9 @@ int main(int argc, char** argv) {
   std::uint64_t seed = 42;
   std::size_t k = 10;
   float l1_threshold = 0.0f;
+  float l1_vector_threshold = 0.0f;
   float l0_threshold = 0.0f;
   std::size_t top_blocks = 0;
-  std::size_t l0_dot_promote = 0;
   bool calibrate = false;
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
@@ -209,10 +211,9 @@ int main(int argc, char** argv) {
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
   app.add_option("--l1-threshold", l1_threshold, "L1 block gate threshold");
+  app.add_option("--l1-vector-threshold", l1_vector_threshold, "L1 per-vector prefilter threshold");
   app.add_option("--l0-threshold", l0_threshold, "L0 vector filter threshold");
   app.add_option("--top-blocks", top_blocks, "Block routing: search top N blocks by L1 (0=all)");
-  app.add_option("--l0-dot-promote", l0_dot_promote,
-                 "Adaptive cascade: full dot on top M L0 survivors (0=all)");
   app.add_flag("--calibrate", calibrate, "Sweep L1/L0 thresholds on first query");
 
   CLI11_PARSE(app, argc, argv);
@@ -258,9 +259,9 @@ int main(int argc, char** argv) {
     vectorcache::query::QueryParams params;
     params.k = k;
     params.l1_block_threshold = l1_threshold;
+    params.l1_vector_threshold = l1_vector_threshold;
     params.l0_vector_threshold = l0_threshold;
     params.top_blocks = top_blocks;
-    params.l0_dot_promote = l0_dot_promote;
 
     std::vector<std::uint64_t> prep_ns;
     std::vector<std::uint64_t> search_ns;

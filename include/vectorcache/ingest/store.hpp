@@ -27,8 +27,7 @@ class BlockStore {
   const LogicalBlock& partial_block() const { return partial_; }
   const std::vector<LogicalBlock>& blocks() const { return blocks_; }
 
-  void push_vector(std::span<const std::uint64_t> l1, std::span<const std::uint64_t> l0,
-                   std::span<const float> full);
+  void push_vector(std::span<const std::uint64_t> l1, std::span<const std::uint64_t> l0);
 
  private:
   BlockLayout layout_;

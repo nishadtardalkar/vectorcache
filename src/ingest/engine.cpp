@@ -131,7 +131,7 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
       if (hook != nullptr) {
         hook->on_vector(global_id, work.rotated);
       }
-      store_.push_vector(work.l1, work.l0, work.rotated);
+      store_.push_vector(work.l1, work.l0);
       ++global_id;
     }
   }

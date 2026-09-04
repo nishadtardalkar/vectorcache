@@ -32,9 +32,8 @@ const LogicalBlock* BlockStore::get_block(std::size_t index) const {
   return &blocks_[index];
 }
 
-void BlockStore::push_vector(std::span<const std::uint64_t> l1, std::span<const std::uint64_t> l0,
-                             std::span<const float> full) {
-  partial_.push(l1, l0, full);
+void BlockStore::push_vector(std::span<const std::uint64_t> l1, std::span<const std::uint64_t> l0) {
+  partial_.push(l1, l0);
   if (partial_.is_full()) {
     blocks_.push_back(partial_.take_full());
   }

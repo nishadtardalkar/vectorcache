@@ -32,31 +32,18 @@ BlockLayout make_block_layout(std::size_t l1_words_per_vec, std::size_t l0_words
 
   const std::size_t l1_bytes = l1_words_per_vec * sizeof(std::uint64_t);
   const std::size_t l0_bytes = l0_words_per_vec * sizeof(std::uint64_t);
-  const std::size_t full_bytes = padded_dim * sizeof(float);
 
   layout.phys_block_bytes = BLOCK_SIZE * l1_bytes;
   layout.l0_phys_blocks = checked_div(l0_bytes, l1_bytes, "l0/l1 bytes per vector");
-  layout.full_phys_blocks = checked_div(full_bytes, l1_bytes, "full/l1 bytes per vector");
   layout.l0_vecs_per_sub = checked_div(BLOCK_SIZE, layout.l0_phys_blocks, "vectors per l0 sub-block");
-  layout.full_vecs_per_sub =
-      checked_div(BLOCK_SIZE, layout.full_phys_blocks, "vectors per full sub-block");
-  layout.total_bytes =
-      layout.phys_block_bytes * (1 + layout.l0_phys_blocks + layout.full_phys_blocks);
+  layout.total_bytes = layout.phys_block_bytes * (1 + layout.l0_phys_blocks);
   return layout;
 }
 
 bool layout_is_simd_friendly(const BlockLayout& layout) {
-  const std::size_t full_bytes = layout.padded_dim * sizeof(float);
-  if (full_bytes % 64 != 0) {
-    return false;
-  }
   const std::size_t l1_bits = quantize::l1_bits_per_vector(layout.padded_dim);
   const std::size_t l0_bits = quantize::l0_bits_per_vector(layout.padded_dim);
   return l1_bits % 64 == 0 && l0_bits % 64 == 0;
-}
-
-std::size_t vector_full_byte_offset(const BlockLayout& layout, std::size_t vec_idx) {
-  return layout.vector_full_offset(vec_idx);
 }
 
 LogicalBlock::LogicalBlock(std::size_t l1_words_per_vec, std::size_t l0_words_per_vec,
@@ -69,8 +56,7 @@ LogicalBlock::LogicalBlock(std::size_t l1_words_per_vec, std::size_t l0_words_pe
                            std::size_t padded_dim, std::size_t /*vector_capacity*/)
     : LogicalBlock(l1_words_per_vec, l0_words_per_vec, padded_dim) {}
 
-void LogicalBlock::push(std::span<const std::uint64_t> l1, std::span<const std::uint64_t> l0,
-                        std::span<const float> full) {
+void LogicalBlock::push(std::span<const std::uint64_t> l1, std::span<const std::uint64_t> l0) {
   if (l1.size() != layout_.l1_words_per_vec) {
     throw Error("L1 word count mismatch: expected " + std::to_string(layout_.l1_words_per_vec) +
                 ", got " + std::to_string(l1.size()));
@@ -79,10 +65,6 @@ void LogicalBlock::push(std::span<const std::uint64_t> l1, std::span<const std::
     throw Error("L0 word count mismatch: expected " + std::to_string(layout_.l0_words_per_vec) +
                 ", got " + std::to_string(l0.size()));
   }
-  if (full.size() != layout_.padded_dim) {
-    throw Error("full vector dimension mismatch: expected " + std::to_string(layout_.padded_dim) +
-                ", got " + std::to_string(full.size()));
-  }
   if (is_full()) {
     throw Error("block is already full (" + std::to_string(BLOCK_SIZE) + " vectors)");
   }
@@ -90,7 +72,6 @@ void LogicalBlock::push(std::span<const std::uint64_t> l1, std::span<const std::
   std::byte* base = data_.data();
   std::memcpy(base + layout_.vector_l1_offset(len_), l1.data(), l1.size_bytes());
   std::memcpy(base + layout_.vector_l0_offset(len_), l0.data(), l0.size_bytes());
-  std::memcpy(base + layout_.vector_full_offset(len_), full.data(), full.size_bytes());
   ++len_;
 }
 
@@ -111,14 +92,6 @@ std::span<const std::uint64_t> LogicalBlock::vector_l0(std::size_t vec_idx) cons
   return {ptr, layout_.l0_words_per_vec};
 }
 
-std::span<const float> LogicalBlock::vector_full(std::size_t vec_idx) const {
-  if (vec_idx >= len_) {
-    throw Error("vector_full index out of range");
-  }
-  const auto* ptr = reinterpret_cast<const float*>(data_.data() + layout_.vector_full_offset(vec_idx));
-  return {ptr, layout_.padded_dim};
-}
-
 std::span<const std::uint64_t> LogicalBlock::l1_slice() const {
   if (len_ == 0) {
     return {};
@@ -136,16 +109,6 @@ std::span<const std::uint64_t> LogicalBlock::l0_slice() const {
       reinterpret_cast<const std::uint64_t*>(data_.data() + layout_.l0_region_offset());
   const std::size_t words = len_ * layout_.l0_words_per_vec;
   return {l0_base, words};
-}
-
-std::span<const float> LogicalBlock::full_slice() const {
-  if (len_ == 0) {
-    return {};
-  }
-  const auto* full_base =
-      reinterpret_cast<const float*>(data_.data() + layout_.full_region_offset());
-  const std::size_t floats = len_ * layout_.padded_dim;
-  return {full_base, floats};
 }
 
 std::span<const std::byte> LogicalBlock::bytes() const { return {data_.data(), data_.size()}; }

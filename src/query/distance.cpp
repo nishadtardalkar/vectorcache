@@ -2,9 +2,7 @@
 
 #include <bit>
 #include <cstring>
-
-#include "vectorcache/query/query_config.hpp"
-#include "vectorcache/simd.hpp"
+#include <immintrin.h>
 
 namespace vectorcache::query {
 
@@ -95,46 +93,5 @@ void bit_agreement_batch(std::span<const std::uint64_t> query_words, std::size_t
         query_words, data_words.subspan(offset, data_words_per_vec), num_bits);
   }
 }
-
-#if VECTORCACHE_QUERY_DEPTH >= 3
-
-float dot_f32(std::span<const float> a, std::span<const float> b) {
-  if (a.size() != b.size()) {
-    return 0.0f;
-  }
-
-  __m512 sum = _mm512_setzero_ps();
-  std::size_t i = 0;
-  const std::size_t n = a.size();
-  const bool aligned =
-      (reinterpret_cast<std::uintptr_t>(a.data()) & 0x3F) == 0 &&
-      (reinterpret_cast<std::uintptr_t>(b.data()) & 0x3F) == 0;
-
-  if (aligned) {
-    for (; i + simd::kWidth <= n; i += simd::kWidth) {
-      const __m512 va = _mm512_load_ps(a.data() + i);
-      const __m512 vb = _mm512_load_ps(b.data() + i);
-      sum = _mm512_fmadd_ps(va, vb, sum);
-    }
-  } else {
-    for (; i + simd::kWidth <= n; i += simd::kWidth) {
-      const __m512 va = _mm512_loadu_ps(a.data() + i);
-      const __m512 vb = _mm512_loadu_ps(b.data() + i);
-      sum = _mm512_fmadd_ps(va, vb, sum);
-    }
-  }
-
-  float result = _mm512_reduce_add_ps(sum);
-  if (i < n) {
-    const __mmask16 mask = simd::tail_mask(n - i);
-    const __m512 va = _mm512_maskz_loadu_ps(mask, a.data() + i);
-    const __m512 vb = _mm512_maskz_loadu_ps(mask, b.data() + i);
-    const __m512 partial = _mm512_maskz_fmadd_ps(mask, va, vb, _mm512_setzero_ps());
-    result += _mm512_reduce_add_ps(partial);
-  }
-  return result;
-}
-
-#endif
 
 }  // namespace vectorcache::query

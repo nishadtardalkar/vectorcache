@@ -11,11 +11,10 @@ TEST(StoreTest, TwoFullBlocksAndPartial) {
   BlockStore store(words_per_vec, l0_words, padded);
   const std::size_t total = BLOCK_SIZE * 2 + 3;
   const std::vector<std::uint64_t> l0(4, 0xAB);
-  const std::vector<float> full(padded, 1.0f);
 
   for (std::size_t i = 0; i < total; ++i) {
     const std::vector<std::uint64_t> l1 = {i};
-    store.push_vector(l1, l0, full);
+    store.push_vector(l1, l0);
   }
 
   EXPECT_EQ(store.block_count(), 2u);
@@ -32,9 +31,9 @@ TEST(StoreTest, TwoFullBlocksAndPartial) {
   const std::size_t offset = BLOCK_SIZE - 1;
   EXPECT_EQ(l1_slice[offset], static_cast<std::uint64_t>(BLOCK_SIZE - 1));
 
-  const auto full_slice = block0->full_slice();
-  EXPECT_FLOAT_EQ(full_slice[0], 1.0f);
-  EXPECT_FLOAT_EQ(full_slice[(BLOCK_SIZE - 1) * padded], 1.0f);
+  const auto l0_slice = block0->l0_slice();
+  EXPECT_EQ(l0_slice[0], 0xABu);
+  EXPECT_EQ(l0_slice[(BLOCK_SIZE - 1) * l0_words], 0xABu);
 }
 
 TEST(StoreTest, WithCapacityPreallocatesContainers) {

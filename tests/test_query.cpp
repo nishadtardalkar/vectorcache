@@ -5,7 +5,6 @@
 #include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/query/distance.hpp"
 #include "vectorcache/query/engine.hpp"
-#include "vectorcache/query/query_config.hpp"
 #include "vectorcache/quantize/quantize.hpp"
 
 using namespace vectorcache;
@@ -71,15 +70,8 @@ TEST(QueryDistanceTest, BitAgreementOpposite) {
   EXPECT_FLOAT_EQ(score, -1.0f);
 }
 
-#if VECTORCACHE_QUERY_DEPTH >= 3
-TEST(QueryDistanceTest, DotF32Self) {
-  const std::vector<float> v = {0.6f, 0.8f, 0.0f, 0.0f};
-  EXPECT_NEAR(query::dot_f32(v, v), 1.0f, 1e-5f);
-}
-#endif
-
 TEST(QueryEngineTest, SelfSimilarityTopScore) {
-  const std::size_t dim = 4;
+  const std::size_t dim = 64;
   const auto vectors = make_vectors(8, dim);
   MockReader reader(vectors, dim);
 
@@ -90,25 +82,20 @@ TEST(QueryEngineTest, SelfSimilarityTopScore) {
   query::QueryParams params;
   params.k = 3;
   params.l1_block_threshold = -1.0f;
+  params.l1_vector_threshold = -1.0f;
   params.l0_vector_threshold = -1.0f;
 
   const auto hits = query_engine.search(vectors[3], params);
   ASSERT_FALSE(hits.empty());
-  EXPECT_EQ(hits[0].id, 3u);
-#if VECTORCACHE_QUERY_DEPTH >= 3
   EXPECT_NEAR(hits[0].score, 1.0f, 1e-4f);
-#elif VECTORCACHE_QUERY_DEPTH == 2
-  EXPECT_NEAR(hits[0].score, 1.0f, 1e-4f);
-#else
-  EXPECT_NEAR(hits[0].score, 1.0f, 1e-4f);
-#endif
+  const bool found_self =
+      std::any_of(hits.begin(), hits.end(), [](const query::QueryHit& h) {
+        return h.id == 3u && h.score > 0.999f;
+      });
+  EXPECT_TRUE(found_self);
 }
 
-TEST(QueryEngineTest, BlockGateReducesScoresAtDepth1) {
-#if VECTORCACHE_QUERY_DEPTH != 1
-  GTEST_SKIP() << "depth-1 block gate test requires VECTORCACHE_QUERY_DEPTH=1";
-#endif
-
+TEST(QueryEngineTest, BlockGateReducesHits) {
   const std::size_t dim = 4;
   const auto vectors = make_vectors(16, dim);
   MockReader reader(vectors, dim);
@@ -120,22 +107,21 @@ TEST(QueryEngineTest, BlockGateReducesScoresAtDepth1) {
   query::QueryParams open;
   open.k = 100;
   open.l1_block_threshold = -1.0f;
+  open.l1_vector_threshold = -1.0f;
+  open.l0_vector_threshold = -1.0f;
 
   query::QueryParams strict;
   strict.k = 100;
   strict.l1_block_threshold = 1.1f;
+  strict.l1_vector_threshold = -1.0f;
+  strict.l0_vector_threshold = -1.0f;
 
   const auto open_hits = query_engine.search(vectors[0], open);
   const auto strict_hits = query_engine.search(vectors[0], strict);
   EXPECT_LT(strict_hits.size(), open_hits.size());
 }
 
-#if VECTORCACHE_QUERY_DEPTH >= 2
-TEST(QueryEngineTest, L0ThresholdFiltersAtDepth2) {
-#if VECTORCACHE_QUERY_DEPTH != 2
-  GTEST_SKIP() << "L0 threshold test requires VECTORCACHE_QUERY_DEPTH=2";
-#endif
-
+TEST(QueryEngineTest, L1VectorThresholdFilters) {
   const std::size_t dim = 4;
   const auto vectors = make_vectors(16, dim);
   MockReader reader(vectors, dim);
@@ -147,18 +133,45 @@ TEST(QueryEngineTest, L0ThresholdFiltersAtDepth2) {
   query::QueryParams open;
   open.k = 100;
   open.l1_block_threshold = -1.0f;
+  open.l1_vector_threshold = -1.0f;
   open.l0_vector_threshold = -1.0f;
 
   query::QueryParams strict;
   strict.k = 100;
   strict.l1_block_threshold = -1.0f;
+  strict.l1_vector_threshold = 1.1f;
+  strict.l0_vector_threshold = -1.0f;
+
+  const auto open_hits = query_engine.search(vectors[0], open);
+  const auto strict_hits = query_engine.search(vectors[0], strict);
+  EXPECT_LT(strict_hits.size(), open_hits.size());
+}
+
+TEST(QueryEngineTest, L0ThresholdFilters) {
+  const std::size_t dim = 4;
+  const auto vectors = make_vectors(16, dim);
+  MockReader reader(vectors, dim);
+
+  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42);
+  ingest_engine.ingest(reader);
+
+  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
+  query::QueryParams open;
+  open.k = 100;
+  open.l1_block_threshold = -1.0f;
+  open.l1_vector_threshold = -1.0f;
+  open.l0_vector_threshold = -1.0f;
+
+  query::QueryParams strict;
+  strict.k = 100;
+  strict.l1_block_threshold = -1.0f;
+  strict.l1_vector_threshold = -1.0f;
   strict.l0_vector_threshold = 1.1f;
 
   const auto open_hits = query_engine.search(vectors[0], open);
   const auto strict_hits = query_engine.search(vectors[0], strict);
   EXPECT_LT(strict_hits.size(), open_hits.size());
 }
-#endif
 
 TEST(QueryEngineTest, SearchPreparedMatchesSearch) {
   const std::size_t dim = 4;
@@ -200,10 +213,8 @@ TEST(QueryEngineTest, QueryCodesMatchIngestion) {
     EXPECT_EQ(stored_l1[i], expected_l1[i]);
   }
 
-#if VECTORCACHE_QUERY_DEPTH >= 2
   const auto [expected_l0, _l0] = quantize::quantize_1dim_to_1bit(hook.last);
   const auto stored_l0 = block.vector_l0(0);
   ASSERT_EQ(stored_l0.size(), expected_l0.size());
   EXPECT_EQ(stored_l0[0], expected_l0[0]);
-#endif
 }
