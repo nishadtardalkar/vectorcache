@@ -35,18 +35,6 @@ const char* dataset_label(DatasetKind kind) {
   return "";
 }
 
-std::size_t dataset_expected_dim(DatasetKind kind) {
-  switch (kind) {
-    case DatasetKind::Glove:
-      return 200;
-    case DatasetKind::OpenAi1536:
-      return 1536;
-    case DatasetKind::OpenAi3072:
-      return 3072;
-  }
-  return 0;
-}
-
 std::filesystem::path dataset_path(DatasetKind kind, const std::filesystem::path& data_dir) {
   switch (kind) {
     case DatasetKind::Glove:

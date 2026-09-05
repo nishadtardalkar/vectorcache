@@ -18,42 +18,33 @@ struct QueryHit {
 };
 
 struct QueryParams {
-  float l1_block_threshold = 0.0f;
-  float l1_vector_threshold = 0.0f;
-  float l0_vector_threshold = 0.0f;
   std::size_t k = 10;
-  /// When > 0, only search the top N blocks by max L1 score (block routing).
-  std::size_t top_blocks = 0;
-  /// When true, score every vector with L0 only (no L1 prefilter / block routing).
-  bool l0_only = false;
 };
 
 struct PreparedQuery {
   AlignedVector<float> rotated;
-  AlignedVector<std::uint64_t> l1;
+  std::uint8_t parent_key = 0;
   AlignedVector<std::uint64_t> l0;
 };
 
 class QueryEngine {
  public:
-  static QueryEngine with_rotation(const ingest::BlockStore& store, std::size_t input_dim,
+  static QueryEngine with_rotation(const ingest::ParentStore& store, std::size_t input_dim,
                                    std::uint64_t seed);
-  static QueryEngine from_rotated(const ingest::BlockStore& store);
+  static QueryEngine from_rotated(const ingest::ParentStore& store);
 
   PreparedQuery prepare(std::span<const float> query) const;
+  /// Reuse rotated/L0 buffers in out across calls (resizes only when dimensions change).
+  void prepare_into(PreparedQuery& out, std::span<const float> query) const;
   std::vector<QueryHit> search(std::span<const float> query, const QueryParams& params) const;
   std::vector<QueryHit> search_prepared(const PreparedQuery& prepared,
-                                          const QueryParams& params) const;
-  std::vector<std::vector<QueryHit>> search_batch(std::span<const std::span<const float>> queries,
-                                                  const QueryParams& params) const;
+                                        const QueryParams& params) const;
 
  private:
-  QueryEngine(const ingest::BlockStore& store, std::optional<transform::SrhtRotation> rotation,
+  QueryEngine(const ingest::ParentStore& store, std::optional<transform::SrhtRotation> rotation,
               bool query_is_rotated, std::size_t input_dim);
 
-  PreparedQuery prepare_query_impl(std::span<const float> query) const;
-
-  const ingest::BlockStore& store_;
+  const ingest::ParentStore& store_;
   std::optional<transform::SrhtRotation> rotation_;
   bool query_is_rotated_;
   std::size_t input_dim_;

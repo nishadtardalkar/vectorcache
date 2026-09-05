@@ -322,22 +322,6 @@ void fwht_in_place(std::span<float> buf) {
   fwht_orthonormal_impl(buf.data(), n, 1.0f);
 }
 
-void scale_in_place(std::span<float> buf, float scale) {
-  const __m512 scale_v = _mm512_set1_ps(scale);
-  std::size_t i = 0;
-  const std::size_t n = buf.size();
-  for (; i + simd::kWidth <= n; i += simd::kWidth) {
-    __m512 v = _mm512_loadu_ps(buf.data() + i);
-    v = _mm512_mul_ps(v, scale_v);
-    _mm512_storeu_ps(buf.data() + i, v);
-  }
-  if (i < n) {
-    const __mmask16 mask = simd::tail_mask(n - i);
-    const __m512 v = _mm512_maskz_loadu_ps(mask, buf.data() + i);
-    _mm512_mask_storeu_ps(buf.data() + i, mask, _mm512_mul_ps(v, scale_v));
-  }
-}
-
 void fwht_orthonormal_in_place(std::span<float> buf) {
   fwht_orthonormal_in_place(buf, 1.0f / std::sqrt(static_cast<float>(buf.size())));
 }

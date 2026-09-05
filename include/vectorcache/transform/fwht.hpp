@@ -23,9 +23,6 @@ void fwht_orthonormal_in_place(std::span<float> buf, float inv_sqrt_n);
 void fwht_stockham_orthonormal_in_place(std::span<float> buf, std::span<float> scratch,
                                         float inv_sqrt_n);
 
-/// Multiply all elements by scale using AVX-512.
-void scale_in_place(std::span<float> buf, float scale);
-
 /// Element-wise buf[i] *= signs[i] where signs[i] is +1 or -1.
 void apply_signs_i8(std::span<float> buf, std::span<const std::int8_t> signs);
 

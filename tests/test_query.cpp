@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <gtest/gtest.h>
+
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/query/distance.hpp"
@@ -58,16 +59,50 @@ std::vector<std::vector<float>> make_vectors(std::size_t count, std::size_t dim)
 }  // namespace
 
 TEST(QueryDistanceTest, BitAgreementPerfectMatch) {
-  const std::vector<std::uint64_t> bits = {0b10101010'10101010'10101010'10101010ULL};
-  const float score = query::bit_agreement_score(bits, bits, 32);
+  const std::vector<std::uint64_t> bits = {0xAAAAAAAAAAAAAAAAULL};
+  const float score = query::bit_agreement_score(bits, bits, 64);
   EXPECT_FLOAT_EQ(score, 1.0f);
 }
 
 TEST(QueryDistanceTest, BitAgreementOpposite) {
   const std::vector<std::uint64_t> a = {0};
-  const std::vector<std::uint64_t> b = {0xFF};
-  const float score = query::bit_agreement_score(a, b, 8);
+  const std::vector<std::uint64_t> b = {~0ULL};
+  const float score = query::bit_agreement_score(a, b, 64);
   EXPECT_FLOAT_EQ(score, -1.0f);
+}
+
+TEST(QueryDistanceTest, BitAgreementSimdFullWords) {
+  // 512 bits (8 u64) exercises the AVX-512 VPOPCNT path that previously summed disagree as agree.
+  std::vector<std::uint64_t> a(8, 0);
+  std::vector<std::uint64_t> b(8, ~0ULL);
+  EXPECT_FLOAT_EQ(query::bit_agreement_score(a, a, 512), 1.0f);
+  EXPECT_FLOAT_EQ(query::bit_agreement_score(a, b, 512), -1.0f);
+}
+
+TEST(QueryDistanceTest, BitAgreementBatchMatchesScalar) {
+  constexpr std::size_t words = 4;
+  constexpr std::size_t bits = words * 64;
+  constexpr std::size_t n = 5;
+  std::vector<std::uint64_t> query(words, 0x0f0f0f0f0f0f0f0fULL);
+  std::vector<std::uint64_t> data(n * words);
+  for (std::size_t v = 0; v < n; ++v) {
+    for (std::size_t w = 0; w < words; ++w) {
+      data[v * words + w] = query[w] ^ (static_cast<std::uint64_t>(v) << w);
+    }
+  }
+  std::vector<float> batch(n);
+  query::bit_agreement_batch(query, bits, data, words, n, batch);
+  for (std::size_t v = 0; v < n; ++v) {
+    const float scalar = query::bit_agreement_score(
+        query, std::span<const std::uint64_t>(data.data() + v * words, words), bits);
+    EXPECT_NEAR(batch[v], scalar, 1e-6f);
+  }
+
+  std::vector<std::uint32_t> disagree(n);
+  query::bit_agreement_batch_disagree(query, bits, data, words, n, disagree);
+  for (std::size_t v = 0; v < n; ++v) {
+    EXPECT_NEAR(query::score_from_disagree(disagree[v], bits), batch[v], 1e-6f);
+  }
 }
 
 TEST(QueryEngineTest, SelfSimilarityTopScore) {
@@ -81,9 +116,6 @@ TEST(QueryEngineTest, SelfSimilarityTopScore) {
   auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
   query::QueryParams params;
   params.k = 3;
-  params.l1_block_threshold = -1.0f;
-  params.l1_vector_threshold = -1.0f;
-  params.l0_vector_threshold = -1.0f;
 
   const auto hits = query_engine.search(vectors[3], params);
   ASSERT_FALSE(hits.empty());
@@ -95,113 +127,42 @@ TEST(QueryEngineTest, SelfSimilarityTopScore) {
   EXPECT_TRUE(found_self);
 }
 
-TEST(QueryEngineTest, BlockGateReducesHits) {
-  const std::size_t dim = 4;
-  const auto vectors = make_vectors(16, dim);
-  MockReader reader(vectors, dim);
-
-  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42);
-  ingest_engine.ingest(reader);
-
-  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
-  query::QueryParams open;
-  open.k = 100;
-  open.l1_block_threshold = -1.0f;
-  open.l1_vector_threshold = -1.0f;
-  open.l0_vector_threshold = -1.0f;
-
-  query::QueryParams strict;
-  strict.k = 100;
-  strict.l1_block_threshold = 1.1f;
-  strict.l1_vector_threshold = -1.0f;
-  strict.l0_vector_threshold = -1.0f;
-
-  const auto open_hits = query_engine.search(vectors[0], open);
-  const auto strict_hits = query_engine.search(vectors[0], strict);
-  EXPECT_LT(strict_hits.size(), open_hits.size());
-}
-
-TEST(QueryEngineTest, L1VectorThresholdFilters) {
-  const std::size_t dim = 4;
-  const auto vectors = make_vectors(16, dim);
-  MockReader reader(vectors, dim);
-
-  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42);
-  ingest_engine.ingest(reader);
-
-  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
-  query::QueryParams open;
-  open.k = 100;
-  open.l1_block_threshold = -1.0f;
-  open.l1_vector_threshold = -1.0f;
-  open.l0_vector_threshold = -1.0f;
-
-  query::QueryParams strict;
-  strict.k = 100;
-  strict.l1_block_threshold = -1.0f;
-  strict.l1_vector_threshold = 1.1f;
-  strict.l0_vector_threshold = -1.0f;
-
-  const auto open_hits = query_engine.search(vectors[0], open);
-  const auto strict_hits = query_engine.search(vectors[0], strict);
-  EXPECT_LT(strict_hits.size(), open_hits.size());
-}
-
-TEST(QueryEngineTest, L0ThresholdFilters) {
-  const std::size_t dim = 4;
-  const auto vectors = make_vectors(16, dim);
-  MockReader reader(vectors, dim);
-
-  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42);
-  ingest_engine.ingest(reader);
-
-  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
-  query::QueryParams open;
-  open.k = 100;
-  open.l1_block_threshold = -1.0f;
-  open.l1_vector_threshold = -1.0f;
-  open.l0_vector_threshold = -1.0f;
-
-  query::QueryParams strict;
-  strict.k = 100;
-  strict.l1_block_threshold = -1.0f;
-  strict.l1_vector_threshold = -1.0f;
-  strict.l0_vector_threshold = 1.1f;
-
-  const auto open_hits = query_engine.search(vectors[0], open);
-  const auto strict_hits = query_engine.search(vectors[0], strict);
-  EXPECT_LT(strict_hits.size(), open_hits.size());
-}
-
-TEST(QueryEngineTest, L0OnlyFindsSelfWithoutL1) {
+TEST(QueryEngineTest, Hd1ExploresNeighborParents) {
+  // Build an index where vector 0 lives under parent P and vector 1 under P^(1<<0).
+  // Querying with vector 0 should still be able to see vector 1 via HD1 expansion.
+  // Dim must be a multiple of 64 (full L0 words) for the AVX-512 distance path.
   const std::size_t dim = 64;
-  const auto vectors = make_vectors(8, dim);
-  MockReader reader(vectors, dim);
+  std::vector<float> a(dim, 1.0f);
+  std::vector<float> b = a;
+  // Flip the first chunk's sum sign relative to a after identical layout: make chunk0 strongly
+  // negative while keeping the rest positive so parent keys differ by one bit when from_rotated.
+  for (std::size_t i = 0; i < dim / 8; ++i) {
+    b[i] = -1.0f;
+  }
 
-  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42);
+  MockReader reader({a, b}, dim);
+  auto ingest_engine = ingest::IngestionEngine::from_rotated(dim);
   ingest_engine.ingest(reader);
 
-  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
-  query::QueryParams params;
-  params.k = 3;
-  params.l0_only = true;
-  params.l0_vector_threshold = -1.0f;
-  // L1 gates would otherwise reject everything; L0-only must ignore them.
-  params.l1_block_threshold = 1.1f;
-  params.l1_vector_threshold = 1.1f;
+  const auto keys = ingest_engine.store().unique_keys();
+  ASSERT_GE(keys.size(), 1u);
 
-  const auto hits = query_engine.search(vectors[3], params);
-  ASSERT_FALSE(hits.empty());
-  EXPECT_NEAR(hits[0].score, 1.0f, 1e-4f);
-  const bool found_self =
-      std::any_of(hits.begin(), hits.end(), [](const query::QueryHit& h) {
-        return h.id == 3u && h.score > 0.999f;
-      });
-  EXPECT_TRUE(found_self);
+  auto query_engine = query::QueryEngine::from_rotated(ingest_engine.store());
+  query::QueryParams params;
+  params.k = 2;
+
+  const auto hits = query_engine.search(a, params);
+  ASSERT_EQ(hits.size(), 2u);
+  const bool saw0 = std::any_of(hits.begin(), hits.end(),
+                                [](const query::QueryHit& h) { return h.id == 0u; });
+  const bool saw1 = std::any_of(hits.begin(), hits.end(),
+                                [](const query::QueryHit& h) { return h.id == 1u; });
+  EXPECT_TRUE(saw0);
+  EXPECT_TRUE(saw1);
 }
 
 TEST(QueryEngineTest, SearchPreparedMatchesSearch) {
-  const std::size_t dim = 4;
+  const std::size_t dim = 64;
   const auto vectors = make_vectors(4, dim);
   MockReader reader(vectors, dim);
 
@@ -224,24 +185,46 @@ TEST(QueryEngineTest, SearchPreparedMatchesSearch) {
 }
 
 TEST(QueryEngineTest, QueryCodesMatchIngestion) {
-  const std::size_t dim = 4;
-  const std::vector<float> vector = {1.0f, -2.0f, 3.0f, -4.0f};
+  const std::size_t dim = 64;
+  std::vector<float> vector(dim);
+  for (std::size_t i = 0; i < dim; ++i) {
+    vector[i] = (i % 2 == 0) ? 1.0f : -1.0f;
+  }
   MockReader reader({vector}, dim);
 
   auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42);
   CapturingHook hook;
   ingest_engine.ingest_with_hook(reader, &hook);
 
-  const auto [expected_l1, _l1] = quantize::quantize_4d_to_1bit(hook.last);
-  const auto& block = ingest_engine.store().partial_block();
-  const auto stored_l1 = block.vector_l1(0);
-  ASSERT_EQ(stored_l1.size(), expected_l1.size());
-  for (std::size_t i = 0; i < expected_l1.size(); ++i) {
-    EXPECT_EQ(stored_l1[i], expected_l1[i]);
-  }
-
+  const std::uint8_t expected_parent = quantize::quantize_parent_8bit(hook.last);
   const auto [expected_l0, _l0] = quantize::quantize_1dim_to_1bit(hook.last);
-  const auto stored_l0 = block.vector_l0(0);
-  ASSERT_EQ(stored_l0.size(), expected_l0.size());
-  EXPECT_EQ(stored_l0[0], expected_l0[0]);
+
+  EXPECT_EQ(ingest_engine.store().unique_keys()[0], expected_parent);
+  const auto* group = ingest_engine.store().group_for_key(expected_parent);
+  ASSERT_NE(group, nullptr);
+  EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
+
+  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
+  const auto prepared = query_engine.prepare(vector);
+  EXPECT_EQ(prepared.parent_key, expected_parent);
+  EXPECT_EQ(prepared.l0[0], expected_l0[0]);
+}
+
+TEST(QueryEngineTest, TopKKeepsHighestScores) {
+  const std::size_t dim = 64;
+  const auto vectors = make_vectors(16, dim);
+  MockReader reader(vectors, dim);
+
+  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42);
+  ingest_engine.ingest(reader);
+
+  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
+  query::QueryParams params;
+  params.k = 5;
+
+  const auto hits = query_engine.search(vectors[0], params);
+  ASSERT_LE(hits.size(), params.k);
+  for (std::size_t i = 1; i < hits.size(); ++i) {
+    EXPECT_GE(hits[i - 1].score, hits[i].score);
+  }
 }

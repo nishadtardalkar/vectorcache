@@ -12,11 +12,11 @@ namespace vectorcache::transform {
 
 namespace {
 
-AlignedVector<float> rademacher_f(std::mt19937_64& rng, std::size_t n) {
-  AlignedVector<float> signs(n);
+AlignedVector<std::int8_t> rademacher_i8(std::mt19937_64& rng, std::size_t n) {
+  AlignedVector<std::int8_t> signs(n);
   std::uniform_int_distribution<int> dist(0, 1);
   for (std::size_t i = 0; i < n; ++i) {
-    signs[i] = dist(rng) == 0 ? -1.0f : 1.0f;
+    signs[i] = dist(rng) == 0 ? static_cast<std::int8_t>(-1) : static_cast<std::int8_t>(1);
   }
   return signs;
 }
@@ -34,38 +34,43 @@ SrhtRotation::SrhtRotation(std::size_t original_dim, std::uint64_t seed)
   }
   std::mt19937_64 rng(seed);
 #if VECTORCACHE_SRHT_ROUNDS >= 1
-  signs1_f_ = rademacher_f(rng, padded_dim_);
+  signs1_ = rademacher_i8(rng, padded_dim_);
 #endif
 #if VECTORCACHE_SRHT_ROUNDS >= 2
-  signs2_f_ = rademacher_f(rng, padded_dim_);
+  signs2_ = rademacher_i8(rng, padded_dim_);
 #endif
 #if VECTORCACHE_SRHT_ROUNDS >= 3
-  signs3_f_ = rademacher_f(rng, padded_dim_);
+  signs3_ = rademacher_i8(rng, padded_dim_);
 #endif
-  if (use_stockham(padded_dim_)) {
-    fwht_scratch_.assign(padded_dim_, 0.0f);
+}
+
+AlignedVector<float>& SrhtRotation::fwht_scratch() const {
+  thread_local AlignedVector<float> scratch;
+  if (scratch.size() != padded_dim_) {
+    scratch.assign(padded_dim_, 0.0f);
   }
+  return scratch;
 }
 
 void SrhtRotation::apply_rounds(std::span<float> buf) const {
   const auto fwht = [this](std::span<float> span) {
     if (use_stockham(padded_dim_)) {
-      fwht_stockham_orthonormal_in_place(span, fwht_scratch_, inv_sqrt_n_);
+      fwht_stockham_orthonormal_in_place(span, fwht_scratch(), inv_sqrt_n_);
     } else {
       fwht_orthonormal_in_place(span, inv_sqrt_n_);
     }
   };
 
 #if VECTORCACHE_SRHT_ROUNDS >= 1
-  apply_signs_f(buf, signs1_f_);
+  apply_signs_i8(buf, signs1_);
   fwht(buf);
 #endif
 #if VECTORCACHE_SRHT_ROUNDS >= 2
-  apply_signs_f(buf, signs2_f_);
+  apply_signs_i8(buf, signs2_);
   fwht(buf);
 #endif
 #if VECTORCACHE_SRHT_ROUNDS >= 3
-  apply_signs_f(buf, signs3_f_);
+  apply_signs_i8(buf, signs3_);
   fwht(buf);
 #endif
 }

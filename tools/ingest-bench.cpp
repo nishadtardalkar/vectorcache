@@ -109,7 +109,6 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::size_t dim,
                            std::size_t padded, std::uint64_t seed, std::size_t limit) {
   const vectorcache::transform::SrhtRotation rotation(dim, seed);
-  const std::size_t l1_words = vectorcache::quantize::l1_words_per_vector(padded);
   const std::size_t l0_words = vectorcache::quantize::l0_words_per_vector(padded);
   const std::size_t batch_cap =
       std::min(vectorcache::ingest::INGEST_BATCH_SIZE, std::max(limit, std::size_t{1}));
@@ -117,11 +116,10 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
   std::vector<float> read_buf(dim);
   std::vector<float> batch_inputs(batch_cap * dim);
   std::vector<std::vector<float>> rotated(batch_cap, std::vector<float>(padded));
-  std::vector<std::vector<std::uint64_t>> l1(batch_cap, std::vector<std::uint64_t>(l1_words));
+  std::vector<std::uint8_t> parents(batch_cap, 0);
   std::vector<std::vector<std::uint64_t>> l0(batch_cap, std::vector<std::uint64_t>(l0_words));
 
-  auto store =
-      vectorcache::ingest::BlockStore::with_capacity(l1_words, l0_words, padded, limit);
+  auto store = vectorcache::ingest::ParentStore::with_capacity(l0_words, padded, limit);
   StageTotals totals;
   std::size_t processed = 0;
 
@@ -166,7 +164,7 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
               .count());
 
       const auto t_quant = std::chrono::steady_clock::now();
-      vectorcache::quantize::quantize_4d_to_1bit_into(rotated[i], l1[i]);
+      parents[i] = vectorcache::quantize::quantize_parent_8bit(rotated[i]);
       vectorcache::quantize::quantize_1dim_to_1bit_into(rotated[i], l0[i]);
       totals.quantize_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
@@ -174,7 +172,7 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
               .count());
 
       const auto t_store = std::chrono::steady_clock::now();
-      store.push_vector(l1[i], l0[i]);
+      store.push_vector(parents[i], l0[i], processed + i);
       totals.store_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                t_store)
@@ -219,7 +217,7 @@ void print_stage_report(const std::string& label, const StageTotals& stages) {
       {"batch copy (engine-style to_vec)", stages.batch_copy_ns},
       {"L2 normalize", stages.normalize_ns},
       {kSrhtStageLabel, stages.srht_ns},
-      {"L1+L0 quantize", stages.quantize_ns},
+      {"parent+L0 quantize", stages.quantize_ns},
       {"store (push_vector)", stages.store_ns},
   };
 
@@ -261,7 +259,7 @@ void print_wall_report(std::uint64_t wall_ns, std::size_t vectors, const StageTo
   std::vector<std::pair<const char*, std::uint64_t>> ranked = {
       {"SRHT / FWHT", stages.srht_ns},
       {"batch input copy (to_vec per batch)", stages.batch_copy_ns},
-      {"L1+L0 quantize", stages.quantize_ns},
+      {"parent+L0 quantize", stages.quantize_ns},
       {"read I/O", stages.read_ns},
       {"L2 normalize", stages.normalize_ns},
       {"store", stages.store_ns},

@@ -15,7 +15,6 @@ enum class DatasetKind { Glove, OpenAi1536, OpenAi3072 };
 std::optional<DatasetKind> parse_dataset_kind(const std::string& name);
 std::vector<DatasetKind> all_dataset_kinds();
 const char* dataset_label(DatasetKind kind);
-std::size_t dataset_expected_dim(DatasetKind kind);
 std::filesystem::path dataset_path(DatasetKind kind, const std::filesystem::path& data_dir);
 
 void fetch(DatasetKind kind, const std::filesystem::path& data_dir, bool force);

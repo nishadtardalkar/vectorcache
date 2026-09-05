@@ -1,7 +1,7 @@
 #include "vectorcache/datasets/sample.hpp"
 
 #include <algorithm>
-#include <stdexcept>
+#include <random>
 
 #include "vectorcache/error.hpp"
 

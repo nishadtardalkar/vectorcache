@@ -159,32 +159,21 @@ void print_latency_stats(const std::vector<std::uint64_t>& prep_ns,
   }
 }
 
-void run_calibration(const vectorcache::query::QueryEngine& engine,
+void run_probe_stats(const vectorcache::query::QueryEngine& engine,
                      const std::vector<std::vector<float>>& queries,
                      const vectorcache::query::QueryParams& base_params) {
-  std::cout << "\nThreshold calibration (first query, k=" << base_params.k << "):\n";
-  std::cout << "  l1_block  l1_vector  l0_vector  hits\n";
-
+  std::cout << "\nProbe stats (first query, k=" << base_params.k << "):\n";
   const auto prepared = engine.prepare(queries.front());
-  for (float l1_block : {-1.0f, 0.0f, 0.25f, 0.5f}) {
-    for (float l1_vec : {-1.0f, 0.0f, 0.25f, 0.5f}) {
-      for (float l0 : {-1.0f, 0.0f, 0.25f, 0.5f}) {
-        vectorcache::query::QueryParams p = base_params;
-        p.l1_block_threshold = l1_block;
-        p.l1_vector_threshold = l1_vec;
-        p.l0_vector_threshold = l0;
-        const auto hits = engine.search_prepared(prepared, p);
-        std::cout << "  " << std::setw(8) << l1_block << std::setw(11) << l1_vec << std::setw(11)
-                  << l0 << std::setw(6) << hits.size() << '\n';
-      }
-    }
-  }
+  const auto hits = engine.search_prepared(prepared, base_params);
+  std::cout << "  parent_key=0x" << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<unsigned>(prepared.parent_key) << std::dec
+            << " hits=" << hits.size() << '\n';
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  CLI::App app{"Query engine benchmark (scores, latency, optional calibration)"};
+  CLI::App app{"Query engine benchmark (scores, latency, optional probe stats)"};
   std::filesystem::path npy_path;
   std::string dataset;
   std::filesystem::path data_dir = "data";
@@ -194,12 +183,7 @@ int main(int argc, char** argv) {
   std::size_t query_limit = 0;
   std::uint64_t seed = 42;
   std::size_t k = 10;
-  float l1_threshold = 0.0f;
-  float l1_vector_threshold = 0.0f;
-  float l0_threshold = 0.0f;
-  std::size_t top_blocks = 0;
   bool calibrate = false;
-  bool l0_only = false;
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
   app.add_option("--dataset", dataset, "Dataset name")->envname("VECTORCACHE_DATASET");
@@ -211,12 +195,7 @@ int main(int argc, char** argv) {
   app.add_option("--query-limit", query_limit, "Query count (default: 10000 GloVe, 1000 else)");
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
-  app.add_option("--l1-threshold", l1_threshold, "L1 block gate threshold");
-  app.add_option("--l1-vector-threshold", l1_vector_threshold, "L1 per-vector prefilter threshold");
-  app.add_option("--l0-threshold", l0_threshold, "L0 vector filter threshold");
-  app.add_option("--top-blocks", top_blocks, "Block routing: search top N blocks by L1 (0=all)");
-  app.add_flag("--l0-only", l0_only, "Score all vectors with L0 only (skip L1 prefilter/routing)");
-  app.add_flag("--calibrate", calibrate, "Sweep L1/L0 thresholds on first query");
+  app.add_flag("--calibrate", calibrate, "Print parent-key probe stats for the first query");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -249,6 +228,7 @@ int main(int argc, char** argv) {
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto ingest_engine = ingest_index(index_limited, meta.dim, seed, actual_index);
+    std::cout << "  unique_parents=" << ingest_engine.store().unique_parent_count() << '\n';
 
     auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);
     const auto queries =
@@ -260,15 +240,6 @@ int main(int argc, char** argv) {
 
     vectorcache::query::QueryParams params;
     params.k = k;
-    params.l1_block_threshold = l1_threshold;
-    params.l1_vector_threshold = l1_vector_threshold;
-    params.l0_vector_threshold = l0_threshold;
-    params.top_blocks = top_blocks;
-    params.l0_only = l0_only;
-
-    if (l0_only) {
-      std::cout << "  mode=l0-only (no L1 prefilter/routing)\n";
-    }
 
     std::vector<std::uint64_t> prep_ns;
     std::vector<std::uint64_t> search_ns;
@@ -279,9 +250,16 @@ int main(int argc, char** argv) {
     double sum_topk_mean = 0.0;
     std::size_t scored_queries = 0;
 
+    // Warm up + reuse PreparedQuery buffers so prep latency excludes allocation.
+    vectorcache::query::PreparedQuery prepared;
+    if (!queries.empty()) {
+      query_engine.prepare_into(prepared, queries.front());
+      (void)query_engine.search_prepared(prepared, params);
+    }
+
     for (const auto& q : queries) {
       const auto t0 = Clock::now();
-      const auto prepared = query_engine.prepare(q);
+      query_engine.prepare_into(prepared, q);
       const auto t1 = Clock::now();
       const auto hits = query_engine.search_prepared(prepared, params);
       const auto t2 = Clock::now();
@@ -306,7 +284,7 @@ int main(int argc, char** argv) {
     print_score_stats(sum_top1, sum_topk_mean, scored_queries, k);
 
     if (calibrate && !queries.empty()) {
-      run_calibration(query_engine, queries, params);
+      run_probe_stats(query_engine, queries, params);
     }
 
     return 0;

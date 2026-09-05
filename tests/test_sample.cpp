@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include "vectorcache/datasets/sample.hpp"
 
 using namespace vectorcache::datasets;

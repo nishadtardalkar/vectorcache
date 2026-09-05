@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <vector>
 
 #include "vectorcache/aligned.hpp"
 #include "vectorcache/transform/srht_config.hpp"
@@ -15,7 +14,6 @@ class SrhtRotation {
  public:
   SrhtRotation(std::size_t original_dim, std::uint64_t seed);
 
-  std::size_t original_dim() const { return original_dim_; }
   std::size_t padded_dim() const { return padded_dim_; }
 
   /// Zero-pad vector, apply SRHT, write result into out (length padded_dim).
@@ -26,20 +24,20 @@ class SrhtRotation {
 
  private:
   void apply_rounds(std::span<float> buf) const;
+  AlignedVector<float>& fwht_scratch() const;
 
   std::size_t original_dim_;
   std::size_t padded_dim_;
   float inv_sqrt_n_;
 #if VECTORCACHE_SRHT_ROUNDS >= 1
-  AlignedVector<float> signs1_f_;
+  AlignedVector<std::int8_t> signs1_;
 #endif
 #if VECTORCACHE_SRHT_ROUNDS >= 2
-  AlignedVector<float> signs2_f_;
+  AlignedVector<std::int8_t> signs2_;
 #endif
 #if VECTORCACHE_SRHT_ROUNDS >= 3
-  AlignedVector<float> signs3_f_;
+  AlignedVector<std::int8_t> signs3_;
 #endif
-  mutable AlignedVector<float> fwht_scratch_;
 };
 
 }  // namespace vectorcache::transform

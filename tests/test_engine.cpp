@@ -3,7 +3,6 @@
 #include <gtest/gtest.h>
 
 #include "vectorcache/datasets/reader.hpp"
-#include "vectorcache/ingest/block.hpp"
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/quantize/quantize.hpp"
@@ -52,12 +51,15 @@ class CapturingHook : public ingest::VectorHook {
 }  // namespace
 
 TEST(EngineTest, IngestDefaultHasNoHook) {
-  const std::size_t dim = 4;
-  const std::size_t n = ingest::BLOCK_SIZE * 2 + 5;
+  const std::size_t dim = 8;
+  const std::size_t n = 20;
   std::vector<std::vector<float>> vectors;
   for (std::size_t i = 0; i < n; ++i) {
-    vectors.push_back({static_cast<float>(i), static_cast<float>(i) + 1.0f,
-                       static_cast<float>(i) + 2.0f, static_cast<float>(i) + 3.0f});
+    std::vector<float> v(dim);
+    for (std::size_t j = 0; j < dim; ++j) {
+      v[j] = static_cast<float>(i + j);
+    }
+    vectors.push_back(std::move(v));
   }
 
   MockReader reader(std::move(vectors), dim);
@@ -65,69 +67,43 @@ TEST(EngineTest, IngestDefaultHasNoHook) {
   const auto report = engine.ingest(reader);
 
   EXPECT_EQ(report.vectors_ingested, n);
-  EXPECT_EQ(report.full_blocks, 2u);
-  EXPECT_EQ(report.partial_len, 5u);
+  EXPECT_GT(report.unique_parents, 0u);
   EXPECT_EQ(engine.store().total_vectors(), n);
 }
 
 TEST(EngineTest, IngestWithHookCountsVectors) {
-  MockReader reader({{1.0f, 2.0f, 3.0f, 4.0f}}, 4);
-  auto engine = ingest::IngestionEngine::with_rotation(4, 42);
+  MockReader reader({{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f}}, 8);
+  auto engine = ingest::IngestionEngine::with_rotation(8, 42);
   CountingHook hook;
   const auto report = engine.ingest_with_hook(reader, &hook);
   EXPECT_EQ(hook.count, 1u);
   EXPECT_EQ(report.vectors_ingested, 1u);
 }
 
-TEST(EngineTest, IngestWithRotationStoresL1Codes) {
-  const std::size_t dim = 4;
-  const std::size_t n = 3;
-  std::vector<std::vector<float>> vectors;
-  for (std::size_t i = 0; i < n; ++i) {
-    vectors.push_back({static_cast<float>(i), static_cast<float>(i) + 1.0f,
-                       static_cast<float>(i) + 2.0f, static_cast<float>(i) + 3.0f});
-  }
-
-  MockReader reader(std::move(vectors), dim);
-  auto engine = ingest::IngestionEngine::with_rotation(dim, 42);
-  CapturingHook hook;
-
-  const std::size_t padded = transform::padded_dim(dim);
-  const std::size_t words_per_vec = quantize::l1_words_per_vector(padded);
-  const std::size_t l0_words = quantize::l0_words_per_vector(padded);
-  EXPECT_EQ(engine.store().l1_words_per_vec(), words_per_vec);
-  EXPECT_EQ(engine.store().l0_words_per_vec(), l0_words);
-  EXPECT_EQ(engine.store().padded_dim(), padded);
-
-  const auto report = engine.ingest_with_hook(reader, &hook);
-  EXPECT_EQ(report.vectors_ingested, n);
-  EXPECT_EQ(engine.store().total_vectors(), n);
-
-  const auto [expected_codes, _] = quantize::quantize_4d_to_1bit(hook.last);
-  const auto slice = engine.store().partial_block().as_slice();
-  const std::size_t offset = (n - 1) * words_per_vec;
-  for (std::size_t i = 0; i < words_per_vec; ++i) {
-    EXPECT_EQ(slice[offset + i], expected_codes[i]);
-  }
-}
-
-TEST(EngineTest, IngestStoresL0Vectors) {
-  const std::size_t dim = 4;
-  MockReader reader({{1.0f, -2.0f, 3.0f, -4.0f}}, dim);
+TEST(EngineTest, IngestStoresParentAndL0) {
+  const std::size_t dim = 8;
+  MockReader reader({{1.0f, -2.0f, 3.0f, -4.0f, 0.5f, -0.5f, 1.5f, -1.5f}}, dim);
   auto engine = ingest::IngestionEngine::with_rotation(dim, 42);
   CapturingHook hook;
   engine.ingest_with_hook(reader, &hook);
 
+  const std::uint8_t expected_parent = quantize::quantize_parent_8bit(hook.last);
   const auto [expected_l0, _] = quantize::quantize_1dim_to_1bit(hook.last);
-  const auto& block = engine.store().partial_block();
-  const auto l0_slice = block.l0_slice();
-  ASSERT_EQ(l0_slice.size(), expected_l0.size());
-  EXPECT_EQ(l0_slice[0], expected_l0[0]);
+
+  EXPECT_EQ(engine.store().unique_parent_count(), 1u);
+  EXPECT_EQ(engine.store().unique_keys()[0], expected_parent);
+
+  const auto* group = engine.store().group_for_key(expected_parent);
+  ASSERT_NE(group, nullptr);
+  ASSERT_EQ(group->size(), 1u);
+  EXPECT_EQ(group->id_at(0), 0u);
+  ASSERT_EQ(group->vector_l0(0).size(), expected_l0.size());
+  EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
 }
 
 TEST(EngineTest, IngestWithRotationNormalizesBeforeSrht) {
-  MockReader reader({{3.0f, 4.0f, 0.0f, 0.0f}}, 4);
-  auto engine = ingest::IngestionEngine::with_rotation(4, 42);
+  MockReader reader({{3.0f, 4.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}}, 8);
+  auto engine = ingest::IngestionEngine::with_rotation(8, 42);
   CapturingHook hook;
   engine.ingest_with_hook(reader, &hook);
 
@@ -138,16 +114,16 @@ TEST(EngineTest, IngestWithRotationNormalizesBeforeSrht) {
 }
 
 TEST(EngineTest, FromRotatedQuantizesWithoutSrht) {
-  const std::vector<float> vector = {0.6f, 0.8f, 0.0f, 0.0f};
-  const auto [expected, _] = quantize::quantize_4d_to_1bit(vector);
+  const std::vector<float> vector = {0.6f, 0.8f, -0.1f, 0.2f, 0.3f, -0.4f, 0.5f, -0.6f};
+  const std::uint8_t expected_parent = quantize::quantize_parent_8bit(vector);
+  const auto [expected_l0, _] = quantize::quantize_1dim_to_1bit(vector);
 
-  MockReader reader({vector}, 4);
-  auto engine = ingest::IngestionEngine::from_rotated(4);
+  MockReader reader({vector}, 8);
+  auto engine = ingest::IngestionEngine::from_rotated(8);
   engine.ingest(reader);
 
-  const auto slice = engine.store().partial_block().as_slice();
-  ASSERT_EQ(slice.size(), expected.size());
-  for (std::size_t i = 0; i < expected.size(); ++i) {
-    EXPECT_EQ(slice[i], expected[i]);
-  }
+  EXPECT_EQ(engine.store().unique_keys()[0], expected_parent);
+  const auto* group = engine.store().group_for_key(expected_parent);
+  ASSERT_NE(group, nullptr);
+  EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
 }

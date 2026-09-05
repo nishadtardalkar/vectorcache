@@ -12,7 +12,7 @@ option(VECTORCACHE_BUILD_TESTS "Build tests" ON)
 option(VECTORCACHE_FETCH_DATASETS "Build fetch-datasets (requires libcurl)" ON)
 option(VECTORCACHE_FETCH_OPENAI "Download/convert OpenAI parquet shards (requires Arrow)" ON)
 
-option(VECTORCACHE_QUERY_OPENMP "Enable OpenMP parallel block search" ON)
+option(VECTORCACHE_OPENMP "Enable OpenMP parallel ingest batch" ON)
 
 set(VECTORCACHE_SRHT_ROUNDS 1 CACHE STRING "Compile-time SRHT H·D round count (1, 2, or 3)")
 set_property(CACHE VECTORCACHE_SRHT_ROUNDS PROPERTY STRINGS 1 2 3)
@@ -23,7 +23,9 @@ endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vpopcntdq -mfma)
 elseif(MSVC)
+  # /arch:AVX512 does not define __AVX512VPOPCNTDQ__; force it so _mm512_popcnt_epi64 is used.
   add_compile_options(/arch:AVX512)
+  add_compile_definitions(__AVX512VPOPCNTDQ__=1)
 endif()
 
 include(FetchContent)
@@ -41,7 +43,6 @@ set(VECTORCACHE_SOURCES
   src/transform/normalize.cpp
   src/transform/srht.cpp
   src/quantize/quantize.cpp
-  src/ingest/block.cpp
   src/ingest/store.cpp
   src/ingest/timing.cpp
   src/ingest/engine.cpp
@@ -60,11 +61,11 @@ target_include_directories(vectorcache PUBLIC include)
 target_compile_features(vectorcache PUBLIC cxx_std_20)
 target_compile_definitions(vectorcache PUBLIC VECTORCACHE_SRHT_ROUNDS=${VECTORCACHE_SRHT_ROUNDS})
 
-if(VECTORCACHE_QUERY_OPENMP)
+if(VECTORCACHE_OPENMP)
   find_package(OpenMP)
   if(OpenMP_CXX_FOUND)
     target_link_libraries(vectorcache PUBLIC OpenMP::OpenMP_CXX)
-    target_compile_definitions(vectorcache PUBLIC VECTORCACHE_QUERY_OPENMP=1)
+    target_compile_definitions(vectorcache PUBLIC VECTORCACHE_OPENMP=1)
   endif()
 endif()
 
@@ -162,12 +163,10 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_normalize.cpp
     tests/test_srht.cpp
     tests/test_quantize.cpp
-    tests/test_block.cpp
     tests/test_store.cpp
     tests/test_engine.cpp
     tests/test_query.cpp
     tests/test_sample.cpp
-    tests/test_timing.cpp
     tests/test_npy.cpp
   )
 

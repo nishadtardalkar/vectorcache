@@ -163,29 +163,29 @@ class MultiRoundReader : public vectorcache::datasets::DatasetReader {
   std::vector<float> output_;
 };
 
-void print_stored_l1_codes(std::size_t index, const vectorcache::ingest::IngestionEngine& engine,
-                           std::size_t padded_dim) {
-  const std::size_t words_per_vec = engine.store().l1_words_per_vec();
-  const std::size_t num_bits = (padded_dim + 3) / 4;
-  const std::size_t block_idx = index / vectorcache::ingest::BLOCK_SIZE;
-  const std::size_t vec_in_block = index % vectorcache::ingest::BLOCK_SIZE;
-
-  const vectorcache::ingest::VectorBlock* block = nullptr;
-  if (block_idx < engine.store().block_count()) {
-    block = engine.store().get_block(block_idx);
-  } else {
-    block = &engine.store().partial_block();
+void print_stored_parent(std::size_t index, const vectorcache::ingest::IngestionEngine& engine) {
+  for (const std::uint8_t key : engine.store().unique_keys()) {
+    const auto* group = engine.store().group_for_key(key);
+    if (group == nullptr) {
+      continue;
+    }
+    for (std::size_t i = 0; i < group->size(); ++i) {
+      if (group->id_at(i) != index) {
+        continue;
+      }
+      std::cout << "Stored parent key at index " << index << ": 0x" << std::hex << std::setw(2)
+                << std::setfill('0') << static_cast<unsigned>(key) << std::dec << '\n';
+      const auto l0 = group->vector_l0(i);
+      std::cout << "Stored L0 codes (" << l0.size() << " u64 words):\n  [";
+      for (std::size_t w = 0; w < l0.size(); ++w) {
+        if (w > 0) std::cout << ", ";
+        std::cout << "0x" << std::hex << std::setw(16) << std::setfill('0') << l0[w];
+      }
+      std::cout << std::dec << "]\n";
+      return;
+    }
   }
-
-  const auto slice = block->as_slice();
-  const std::size_t offset = vec_in_block * words_per_vec;
-  std::cout << "Stored L1 codes at index " << index << " (" << num_bits << " bits, "
-            << words_per_vec << " u64 words):\n  [";
-  for (std::size_t i = 0; i < words_per_vec; ++i) {
-    if (i > 0) std::cout << ", ";
-    std::cout << "0x" << std::hex << std::setw(16) << std::setfill('0') << slice[offset + i];
-  }
-  std::cout << std::dec << "]\n";
+  throw vectorcache::Error("vector id not found in parent store");
 }
 
 }  // namespace
@@ -315,15 +315,14 @@ int main(int argc, char** argv) {
                        static_cast<std::uint64_t>(per_vec))
                 << " (" << per_vec << " ns)\n";
     }
-    std::cout << "Blocks: " << report.full_blocks << " full, " << report.partial_len
-              << " in partial block (L1 words/vec: " << engine.store().l1_words_per_vec()
-              << ")\n";
+    std::cout << "Unique parents: " << report.unique_parents
+              << " (L0 words/vec: " << engine.store().l0_words_per_vec() << ")\n";
 
     if (show_index) {
       if (*show_index >= report.vectors_ingested) {
         throw vectorcache::Error("--show-index out of range");
       }
-      print_stored_l1_codes(*show_index, engine, padded);
+      print_stored_parent(*show_index, engine);
       const auto& vectors = variance_hook.vectors();
       if (*show_index < vectors.size()) {
         const auto& vector = vectors[*show_index];

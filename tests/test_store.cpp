@@ -1,45 +1,57 @@
 #include <gtest/gtest.h>
 
+#include "vectorcache/error.hpp"
 #include "vectorcache/ingest/store.hpp"
+#include "vectorcache/quantize/quantize.hpp"
 
 using namespace vectorcache::ingest;
+using namespace vectorcache::quantize;
 
-TEST(StoreTest, TwoFullBlocksAndPartial) {
-  const std::size_t words_per_vec = 1;
-  const std::size_t l0_words = 4;
-  const std::size_t padded = 256;
-  BlockStore store(words_per_vec, l0_words, padded);
-  const std::size_t total = BLOCK_SIZE * 2 + 3;
-  const std::vector<std::uint64_t> l0(4, 0xAB);
+TEST(StoreTest, UniqueParentsAndGroups) {
+  const std::size_t padded = 8;
+  const std::size_t l0_words = l0_words_per_vector(padded);
+  ParentStore store(l0_words, padded);
 
-  for (std::size_t i = 0; i < total; ++i) {
-    const std::vector<std::uint64_t> l1 = {i};
-    store.push_vector(l1, l0);
-  }
+  const std::vector<std::uint64_t> l0_a(l0_words, 0x11);
+  const std::vector<std::uint64_t> l0_b(l0_words, 0x22);
+  const std::vector<std::uint64_t> l0_c(l0_words, 0x33);
 
-  EXPECT_EQ(store.block_count(), 2u);
-  EXPECT_EQ(store.partial_block().len(), 3u);
-  EXPECT_EQ(store.total_vectors(), total);
+  store.push_vector(0b00000001, l0_a, 0);
+  store.push_vector(0b00000001, l0_b, 1);
+  store.push_vector(0b00000010, l0_c, 2);
 
-  const auto* block0 = store.get_block(0);
-  ASSERT_NE(block0, nullptr);
-  EXPECT_EQ(block0->len(), BLOCK_SIZE);
-  EXPECT_EQ(block0->bytes().size(), store.layout().total_bytes);
-  auto l1_slice = block0->l1_slice();
-  EXPECT_EQ(l1_slice[0], 0u);
+  EXPECT_EQ(store.unique_parent_count(), 2u);
+  EXPECT_EQ(store.total_vectors(), 3u);
 
-  const std::size_t offset = BLOCK_SIZE - 1;
-  EXPECT_EQ(l1_slice[offset], static_cast<std::uint64_t>(BLOCK_SIZE - 1));
+  const auto keys = store.unique_keys();
+  ASSERT_EQ(keys.size(), 2u);
+  EXPECT_EQ(keys[0], 0b00000001);
+  EXPECT_EQ(keys[1], 0b00000010);
 
-  const auto l0_slice = block0->l0_slice();
-  EXPECT_EQ(l0_slice[0], 0xABu);
-  EXPECT_EQ(l0_slice[(BLOCK_SIZE - 1) * l0_words], 0xABu);
+  const ParentGroup* g1 = store.group_for_key(0b00000001);
+  ASSERT_NE(g1, nullptr);
+  EXPECT_EQ(g1->size(), 2u);
+  EXPECT_EQ(g1->id_at(0), 0u);
+  EXPECT_EQ(g1->id_at(1), 1u);
+  EXPECT_EQ(g1->vector_l0(0)[0], 0x11u);
+  EXPECT_EQ(g1->vector_l0(1)[0], 0x22u);
+
+  const ParentGroup* g2 = store.group_for_key(0b00000010);
+  ASSERT_NE(g2, nullptr);
+  EXPECT_EQ(g2->size(), 1u);
+  EXPECT_EQ(g2->id_at(0), 2u);
+
+  EXPECT_EQ(store.group_for_key(0b00000100), nullptr);
 }
 
-TEST(StoreTest, WithCapacityPreallocatesContainers) {
-  auto store = BlockStore::with_capacity(1, 4, 256, BLOCK_SIZE + 5);
-  EXPECT_EQ(store.block_count(), 0u);
-  EXPECT_EQ(store.l1_words_per_vec(), 1u);
-  EXPECT_EQ(store.l0_words_per_vec(), 4u);
-  EXPECT_EQ(store.padded_dim(), 256u);
+TEST(StoreTest, WithCapacityConstructs) {
+  auto store = ParentStore::with_capacity(1, 8, 100);
+  EXPECT_EQ(store.unique_parent_count(), 0u);
+  EXPECT_EQ(store.l0_words_per_vec(), 1u);
+  EXPECT_EQ(store.padded_dim(), 8u);
+  EXPECT_EQ(store.total_vectors(), 0u);
+}
+
+TEST(StoreTest, RejectsNonMultipleOfEightDim) {
+  EXPECT_THROW(ParentStore(1, 4), vectorcache::Error);
 }
