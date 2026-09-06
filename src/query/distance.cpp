@@ -62,9 +62,12 @@ void batch_words4_disagree(std::span<const std::uint64_t> query_words,
     out_disagree[v + 1] = hsum_epi64_256(hi);
   }
   if (v < num_vectors) {
-    const std::uint64_t* row = data_words.data() + v * 4;
-    const __m256i d = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row));
-    out_disagree[v] = hsum_epi64_256(_mm256_popcnt_epi64(_mm256_xor_si256(q256, d)));
+    // Remnant: stay on ZMM VPOPCNTDQ (avoids _mm256_popcnt_epi64, which needs AVX512VL).
+    constexpr __mmask8 mask = 0x0f;
+    const __m512i q_lo = _mm512_maskz_loadu_epi64(mask, query_words.data());
+    const __m512i d = _mm512_maskz_loadu_epi64(mask, data_words.data() + v * 4);
+    out_disagree[v] =
+        static_cast<std::uint32_t>(hsum_epi64(_mm512_popcnt_epi64(_mm512_xor_si512(q_lo, d))));
   }
 }
 

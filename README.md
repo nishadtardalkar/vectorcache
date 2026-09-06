@@ -77,7 +77,7 @@ ctest --output-on-failure
 
 ### SIMD
 
-The library requires AVX-512F/DQ/BW. GCC/Clang builds use `-mavx512f -mavx512dq -mavx512bw -mfma`; MSVC uses `/arch:AVX512`. There are no scalar fallbacks.
+The library requires AVX-512F/DQ/BW/VL + VPOPCNTDQ. GCC/Clang builds use `-mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vpopcntdq -mfma`; MSVC uses `/arch:AVX512`. There are no scalar fallbacks.
 
 For maximum single-node performance on homogeneous clusters:
 

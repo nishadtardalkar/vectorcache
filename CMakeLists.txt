@@ -21,7 +21,7 @@ if(NOT VECTORCACHE_SRHT_ROUNDS MATCHES "^[123]$")
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vpopcntdq -mfma)
+  add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vpopcntdq -mfma)
 elseif(MSVC)
   # /arch:AVX512 does not define __AVX512VPOPCNTDQ__; force it so _mm512_popcnt_epi64 is used.
   add_compile_options(/arch:AVX512)
