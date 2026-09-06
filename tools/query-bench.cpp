@@ -8,6 +8,8 @@
 #include <numeric>
 #include <optional>
 #include <string>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <CLI/CLI.hpp>
@@ -20,6 +22,7 @@
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/query/engine.hpp"
 #include "vectorcache/transform/fwht.hpp"
+#include "vectorcache/transform/normalize.hpp"
 
 namespace {
 
@@ -114,6 +117,102 @@ std::vector<std::vector<float>> load_query_vectors(
   return queries;
 }
 
+/// Contiguous row-major corpus at original meta.dim; each row L2-normalized.
+std::vector<float> load_normalized_corpus(vectorcache::datasets::DatasetReader& reader,
+                                          std::size_t dim, std::size_t count) {
+  std::vector<float> corpus(count * dim);
+  vectorcache::datasets::LimitedReader limited(reader, count);
+  std::size_t n = 0;
+  while (n < count) {
+    std::span<float> row(corpus.data() + n * dim, dim);
+    if (!limited.next_vector_into(row)) {
+      break;
+    }
+    vectorcache::transform::l2_normalize_in_place(row);
+    ++n;
+  }
+  if (n != count) {
+    throw vectorcache::Error("corpus load count mismatch");
+  }
+  return corpus;
+}
+
+float dot_product(std::span<const float> a, std::span<const float> b) {
+  float sum = 0.0f;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    sum += a[i] * b[i];
+  }
+  return sum;
+}
+
+/// Exact cosine top-k over L2-normalized corpus rows (original dim only).
+std::vector<std::size_t> exact_topk(std::span<const float> query_norm, const std::vector<float>& corpus,
+                                    std::size_t dim, std::size_t n, std::size_t k) {
+  if (k == 0 || n == 0) {
+    return {};
+  }
+  const std::size_t top_n = std::min(k, n);
+
+  // Min-score at front when full; on equal score prefer smaller id (worse = larger id).
+  struct Hit {
+    float score;
+    std::size_t id;
+  };
+  auto worse = [](const Hit& a, const Hit& b) {
+    if (a.score != b.score) {
+      return a.score > b.score;  // higher score is better → max-heap comparator for min-heap front
+    }
+    return a.id < b.id;  // smaller id is better → larger id is worse
+  };
+
+  std::vector<Hit> heap;
+  heap.reserve(top_n);
+
+  for (std::size_t id = 0; id < n; ++id) {
+    const std::span<const float> row(corpus.data() + id * dim, dim);
+    const float score = dot_product(query_norm, row);
+    if (heap.size() < top_n) {
+      heap.push_back({score, id});
+      if (heap.size() == top_n) {
+        std::make_heap(heap.begin(), heap.end(), worse);
+      }
+      continue;
+    }
+    const Hit& worst = heap.front();
+    if (score > worst.score || (score == worst.score && id < worst.id)) {
+      std::pop_heap(heap.begin(), heap.end(), worse);
+      heap.back() = {score, id};
+      std::push_heap(heap.begin(), heap.end(), worse);
+    }
+  }
+
+  std::sort_heap(heap.begin(), heap.end(), worse);
+  // After sort_heap with worse (max-oriented), ascending by worse means best last; reverse.
+  std::reverse(heap.begin(), heap.end());
+
+  std::vector<std::size_t> ids;
+  ids.reserve(heap.size());
+  for (const auto& h : heap) {
+    ids.push_back(h.id);
+  }
+  return ids;
+}
+
+double recall_at_k(const std::vector<std::size_t>& approx_ids,
+                   const std::vector<std::size_t>& exact_ids, std::size_t k) {
+  if (k == 0) {
+    return 0.0;
+  }
+  std::unordered_set<std::size_t> exact_set(exact_ids.begin(), exact_ids.end());
+  std::size_t hits = 0;
+  for (const std::size_t id : approx_ids) {
+    if (exact_set.contains(id)) {
+      ++hits;
+    }
+  }
+  return static_cast<double>(hits) / static_cast<double>(k);
+}
+
 void print_score_stats(double sum_top1, double sum_topk_mean, std::size_t queries,
                        std::size_t k) {
   if (queries == 0) {
@@ -184,6 +283,7 @@ int main(int argc, char** argv) {
   std::uint64_t seed = 42;
   std::size_t k = 10;
   bool calibrate = false;
+  bool recall = false;
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
   app.add_option("--dataset", dataset, "Dataset name")->envname("VECTORCACHE_DATASET");
@@ -196,6 +296,8 @@ int main(int argc, char** argv) {
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
   app.add_flag("--calibrate", calibrate, "Print parent-key probe stats for the first query");
+  app.add_flag("--recall", recall,
+               "Measure mean recall@k vs exact cosine top-k on original full-dim vectors");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -246,6 +348,11 @@ int main(int argc, char** argv) {
     prep_ns.reserve(queries.size());
     search_ns.reserve(queries.size());
 
+    std::vector<std::vector<std::size_t>> approx_ids_per_query;
+    if (recall) {
+      approx_ids_per_query.reserve(queries.size());
+    }
+
     double sum_top1 = 0.0;
     double sum_topk_mean = 0.0;
     std::size_t scored_queries = 0;
@@ -269,6 +376,15 @@ int main(int argc, char** argv) {
       search_ns.push_back(static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
 
+      if (recall) {
+        std::vector<std::size_t> ids;
+        ids.reserve(hits.size());
+        for (const auto& hit : hits) {
+          ids.push_back(hit.id);
+        }
+        approx_ids_per_query.push_back(std::move(ids));
+      }
+
       if (!hits.empty()) {
         sum_top1 += hits.front().score;
         double hit_sum = 0.0;
@@ -282,6 +398,37 @@ int main(int argc, char** argv) {
 
     print_latency_stats(prep_ns, search_ns);
     print_score_stats(sum_top1, sum_topk_mean, scored_queries, k);
+
+    if (recall) {
+      std::cout << "Computing exact top-" << k
+                << " for recall (original dim; may take several minutes)...\n";
+      auto [corpus_reader, corpus_label] = open_reader(npy_path, dataset, data_dir, split);
+      (void)corpus_label;
+      const std::vector<float> corpus =
+          load_normalized_corpus(*corpus_reader, meta.dim, actual_index);
+
+      double sum_recall = 0.0;
+      std::size_t recall_queries = 0;
+      std::vector<float> q_norm(meta.dim);
+      for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+        const auto& q = queries[qi];
+        if (q.size() != meta.dim) {
+          throw vectorcache::Error("query dimension mismatch for recall");
+        }
+        std::copy(q.begin(), q.end(), q_norm.begin());
+        vectorcache::transform::l2_normalize_in_place(q_norm);
+        const auto exact =
+            exact_topk(q_norm, corpus, meta.dim, actual_index, k);
+        sum_recall += recall_at_k(approx_ids_per_query[qi], exact, k);
+        ++recall_queries;
+      }
+
+      if (recall_queries > 0) {
+        std::cout << std::fixed << std::setprecision(4);
+        std::cout << "Recall@" << k << ": "
+                  << (sum_recall / static_cast<double>(recall_queries)) << '\n';
+      }
+    }
 
     if (calibrate && !queries.empty()) {
       run_probe_stats(query_engine, queries, params);
