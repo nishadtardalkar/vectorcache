@@ -41,12 +41,15 @@ ParentStore::ParentStore(std::size_t l0_words_per_vec, std::size_t padded_dim)
   if (l0_words_per_vec_ == 0 || padded_dim_ == 0) {
     throw Error("ParentStore dimensions must be > 0");
   }
-  if (padded_dim_ % quantize::PARENT_BITS != 0) {
+  if (padded_dim_ % quantize::PARENT_GROUPS != 0) {
     throw Error("ParentStore padded_dim must be divisible by 8");
   }
-  by_key_.fill(kInvalidGroup);
-  keys_.reserve(kMaxParents);
-  groups_.reserve(kMaxParents);
+  if ((padded_dim_ / quantize::PARENT_GROUPS) < 2) {
+    throw Error("ParentStore padded_dim must yield chunk size >= 2 (dim >= 16 with 8 groups)");
+  }
+  by_key_.assign(kMaxParents, kInvalidGroup);
+  keys_.reserve(std::min(kMaxParents, std::size_t{4096}));
+  groups_.reserve(std::min(kMaxParents, std::size_t{4096}));
 }
 
 ParentStore ParentStore::with_capacity(std::size_t l0_words_per_vec, std::size_t padded_dim,
@@ -57,15 +60,15 @@ ParentStore ParentStore::with_capacity(std::size_t l0_words_per_vec, std::size_t
 }
 
 void ParentStore::reserve_vectors(std::size_t vector_count) {
-  // Prefer a larger first-touch hint so push avoids repeated realloc+memcpy.
-  // Occupancy is skewed across parents; /8 is a compromise vs /16.
-  reserve_hint_ = std::max<std::size_t>(1, vector_count / 8);
+  // Dual-fold multipost (~256×): expected postings per key ≈ vector_count / 256.
+  // /64 leaves headroom vs realloc under skew.
+  reserve_hint_ = std::max<std::size_t>(1, vector_count / 64);
   for (auto& group : groups_) {
     group.reserve(reserve_hint_);
   }
 }
 
-const ParentGroup* ParentStore::group_for_key(std::uint8_t key) const {
+const ParentGroup* ParentStore::group_for_key(std::uint16_t key) const {
   const std::size_t idx = by_key_[key];
   if (idx == kInvalidGroup) {
     return nullptr;
@@ -73,8 +76,8 @@ const ParentGroup* ParentStore::group_for_key(std::uint8_t key) const {
   return &groups_[idx];
 }
 
-void ParentStore::push_vector(std::uint8_t parent_key, std::span<const std::uint64_t> l0,
-                              std::size_t id) {
+void ParentStore::push_posting_unchecked(std::uint16_t parent_key,
+                                         std::span<const std::uint64_t> l0, std::size_t id) {
   std::size_t idx = by_key_[parent_key];
   if (idx == kInvalidGroup) {
     idx = groups_.size();
@@ -86,6 +89,19 @@ void ParentStore::push_vector(std::uint8_t parent_key, std::span<const std::uint
     }
   }
   groups_[idx].push(id, l0);
+}
+
+void ParentStore::push_vector(std::uint16_t parent_key, std::span<const std::uint64_t> l0,
+                              std::size_t id) {
+  push_posting_unchecked(parent_key, l0, id);
+  ++total_vectors_;
+}
+
+void ParentStore::push_postings(std::span<const std::uint16_t> keys,
+                                std::span<const std::uint64_t> l0, std::size_t id) {
+  for (const std::uint16_t key : keys) {
+    push_posting_unchecked(key, l0, id);
+  }
   ++total_vectors_;
 }
 

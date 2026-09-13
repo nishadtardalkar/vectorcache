@@ -264,7 +264,7 @@ void run_probe_stats(const vectorcache::query::QueryEngine& engine,
   std::cout << "\nProbe stats (first query, k=" << base_params.k << "):\n";
   const auto prepared = engine.prepare(queries.front());
   const auto hits = engine.search_prepared(prepared, base_params);
-  std::cout << "  parent_key=0x" << std::hex << std::setw(2) << std::setfill('0')
+  std::cout << "  parent_key=0x" << std::hex << std::setw(4) << std::setfill('0')
             << static_cast<unsigned>(prepared.parent_key) << std::dec
             << " hits=" << hits.size() << '\n';
 }

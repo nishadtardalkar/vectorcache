@@ -164,7 +164,7 @@ class MultiRoundReader : public vectorcache::datasets::DatasetReader {
 };
 
 void print_stored_parent(std::size_t index, const vectorcache::ingest::IngestionEngine& engine) {
-  for (const std::uint8_t key : engine.store().unique_keys()) {
+  for (const std::uint16_t key : engine.store().unique_keys()) {
     const auto* group = engine.store().group_for_key(key);
     if (group == nullptr) {
       continue;
@@ -173,8 +173,9 @@ void print_stored_parent(std::size_t index, const vectorcache::ingest::Ingestion
       if (group->id_at(i) != index) {
         continue;
       }
-      std::cout << "Stored parent key at index " << index << ": 0x" << std::hex << std::setw(2)
-                << std::setfill('0') << static_cast<unsigned>(key) << std::dec << '\n';
+      std::cout << "Stored parent key (one of 256 postings) at index " << index << ": 0x"
+                << std::hex << std::setw(4) << std::setfill('0') << static_cast<unsigned>(key)
+                << std::dec << '\n';
       const auto l0 = group->vector_l0(i);
       std::cout << "Stored L0 codes (" << l0.size() << " u64 words):\n  [";
       for (std::size_t w = 0; w < l0.size(); ++w) {

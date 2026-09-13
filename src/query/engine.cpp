@@ -1,8 +1,6 @@
 #include "vectorcache/query/engine.hpp"
 
 #include <algorithm>
-#include <array>
-#include <bit>
 #include <cstring>
 #include <immintrin.h>
 #include <limits>
@@ -20,13 +18,6 @@ namespace {
 
 constexpr std::size_t kHeapTopKThreshold = 32;
 constexpr std::size_t kScoreChunk = 64;
-
-float parent_bit_agreement(std::uint8_t a, std::uint8_t b) {
-  const unsigned disagree = static_cast<unsigned>(std::popcount(static_cast<unsigned>(a ^ b)));
-  const unsigned agree = static_cast<unsigned>(quantize::PARENT_BITS) - disagree;
-  return (2.0f * static_cast<float>(agree) - static_cast<float>(quantize::PARENT_BITS)) /
-         static_cast<float>(quantize::PARENT_BITS);
-}
 
 /// Top-k by integer disagreement (lower is better). Float scores only at finalize.
 class TopKHits {
@@ -160,22 +151,6 @@ class TopKHits {
   std::vector<HeapHit> heap_;
 };
 
-std::uint8_t find_best_parent(std::uint8_t query_key, std::span<const std::uint8_t> keys) {
-  if (keys.empty()) {
-    throw Error("ParentStore has no unique parent keys");
-  }
-  std::uint8_t best = keys[0];
-  float best_score = parent_bit_agreement(query_key, best);
-  for (std::size_t i = 1; i < keys.size(); ++i) {
-    const float score = parent_bit_agreement(query_key, keys[i]);
-    if (score > best_score) {
-      best_score = score;
-      best = keys[i];
-    }
-  }
-  return best;
-}
-
 void search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
                   std::size_t l0_bits, TopKHits& topk) {
   const std::size_t n = group.size();
@@ -206,20 +181,10 @@ void search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
 }
 
 void search_store(const ingest::ParentStore& store, const PreparedQuery& query, TopKHits& topk) {
-  const std::uint8_t best = find_best_parent(query.parent_key, store.unique_keys());
   const std::size_t l0_bits = quantize::l0_bits_per_vector(store.padded_dim());
-
-  std::array<std::uint8_t, quantize::PARENT_BITS + 1> probe_keys{};
-  probe_keys[0] = best;
-  for (std::size_t i = 0; i < quantize::PARENT_BITS; ++i) {
-    probe_keys[i + 1] = static_cast<std::uint8_t>(best ^ static_cast<std::uint8_t>(1u << i));
-  }
-
-  for (const std::uint8_t key : probe_keys) {
-    const ingest::ParentGroup* group = store.group_for_key(key);
-    if (group != nullptr && !group->empty()) {
-      search_group(*group, query, l0_bits, topk);
-    }
+  const ingest::ParentGroup* group = store.group_for_key(query.parent_key);
+  if (group != nullptr && !group->empty()) {
+    search_group(*group, query, l0_bits, topk);
   }
 }
 
@@ -256,7 +221,7 @@ void prepare_query_into(const ingest::ParentStore& store,
     throw Error("QueryEngine requires with_rotation() or from_rotated()");
   }
 
-  prepared.parent_key = quantize::quantize_parent_8bit(prepared.rotated);
+  prepared.parent_key = quantize::quantize_parent_query_key(prepared.rotated);
   quantize::quantize_1dim_to_1bit_into(prepared.rotated, prepared.l0);
 }
 

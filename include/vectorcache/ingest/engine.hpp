@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -10,6 +11,7 @@
 #include "vectorcache/datasets/reader.hpp"
 #include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/ingest/store.hpp"
+#include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/transform/srht.hpp"
 
 namespace vectorcache::ingest {
@@ -34,7 +36,7 @@ class IngestionEngine {
  private:
   struct VectorWork {
     AlignedVector<float> rotated;
-    std::uint8_t parent_key = 0;
+    std::array<std::uint16_t, quantize::PARENT_POSTINGS> posting_keys{};
     AlignedVector<std::uint64_t> l0;
   };
 

@@ -2,7 +2,7 @@
 
 Parent-keyed multi-level quantized vector retrieval engine (C++20).
 
-VectorCache implements approximate nearest neighbor search via SRHT rotation, an **8-bit parent key** (sign-of-sum over 8 equal chunks of the rotated vector), and **1D→1bit (L0)** child codes. Unique parent keys sit in a contiguous byte row for cache-friendly stage-1 scoring; query expands the top parent and its Hamming-distance-1 neighbors, then ranks L0 scores with a turbovec-style flat top-k (no full-f32 storage, no absolute score thresholds).
+VectorCache implements approximate nearest neighbor search via SRHT rotation, a **16-bit dual-fold parent key** (per chunk: high-D→2D projection onto all-ones and `(1,-1,0,…)` axes, then two perpendicular sign folds), and **1D→1bit (L0)** child codes. Each vector is multi-posted under **256** of **65536** parent arrays; query picks the stable fold per chunk for an **exact** parent lookup (no HD-1 expansion), then ranks L0 scores with a turbovec-style flat top-k (no full-f32 storage, no absolute score thresholds).
 
 ## Requirements
 

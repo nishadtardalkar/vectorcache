@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
@@ -116,7 +117,8 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
   std::vector<float> read_buf(dim);
   std::vector<float> batch_inputs(batch_cap * dim);
   std::vector<std::vector<float>> rotated(batch_cap, std::vector<float>(padded));
-  std::vector<std::uint8_t> parents(batch_cap, 0);
+  std::vector<std::array<std::uint16_t, vectorcache::quantize::PARENT_POSTINGS>> parents(
+      batch_cap);
   std::vector<std::vector<std::uint64_t>> l0(batch_cap, std::vector<std::uint64_t>(l0_words));
 
   auto store = vectorcache::ingest::ParentStore::with_capacity(l0_words, padded, limit);
@@ -164,7 +166,7 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
               .count());
 
       const auto t_quant = std::chrono::steady_clock::now();
-      parents[i] = vectorcache::quantize::quantize_parent_8bit(rotated[i]);
+      parents[i] = vectorcache::quantize::parent_posting_keys(rotated[i]);
       vectorcache::quantize::quantize_1dim_to_1bit_into(rotated[i], l0[i]);
       totals.quantize_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
@@ -172,7 +174,7 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
               .count());
 
       const auto t_store = std::chrono::steady_clock::now();
-      store.push_vector(parents[i], l0[i], processed + i);
+      store.push_postings(parents[i], l0[i], processed + i);
       totals.store_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                t_store)

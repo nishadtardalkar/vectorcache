@@ -86,7 +86,7 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       transform::l2_normalize_in_place(work.rotated);
       rotation->apply_in_place(work.rotated);
     }
-    work.parent_key = quantize::quantize_parent_8bit(work.rotated);
+    work.posting_keys = quantize::parent_posting_keys(work.rotated);
     quantize::quantize_1dim_to_1bit_into(work.rotated, work.l0);
   }
 #else
@@ -96,7 +96,7 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       transform::l2_normalize_in_place(work.rotated);
       rotation->apply_in_place(work.rotated);
     }
-    work.parent_key = quantize::quantize_parent_8bit(work.rotated);
+    work.posting_keys = quantize::parent_posting_keys(work.rotated);
     quantize::quantize_1dim_to_1bit_into(work.rotated, work.l0);
   }
 #endif
@@ -129,7 +129,7 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
       if (hook != nullptr) {
         hook->on_vector(global_id, work.rotated);
       }
-      store_.push_vector(work.parent_key, work.l0, static_cast<std::size_t>(global_id));
+      store_.push_postings(work.posting_keys, work.l0, static_cast<std::size_t>(global_id));
       ++global_id;
     }
   }

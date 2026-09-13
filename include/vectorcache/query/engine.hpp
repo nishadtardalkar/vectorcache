@@ -23,7 +23,7 @@ struct QueryParams {
 
 struct PreparedQuery {
   AlignedVector<float> rotated;
-  std::uint8_t parent_key = 0;
+  std::uint16_t parent_key = 0;
   AlignedVector<std::uint64_t> l0;
 };
 

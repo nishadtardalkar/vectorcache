@@ -51,7 +51,7 @@ class CapturingHook : public ingest::VectorHook {
 }  // namespace
 
 TEST(EngineTest, IngestDefaultHasNoHook) {
-  const std::size_t dim = 8;
+  const std::size_t dim = 16;
   const std::size_t n = 20;
   std::vector<std::vector<float>> vectors;
   for (std::size_t i = 0; i < n; ++i) {
@@ -72,8 +72,10 @@ TEST(EngineTest, IngestDefaultHasNoHook) {
 }
 
 TEST(EngineTest, IngestWithHookCountsVectors) {
-  MockReader reader({{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f}}, 8);
-  auto engine = ingest::IngestionEngine::with_rotation(8, 42);
+  std::vector<float> v(16);
+  for (std::size_t i = 0; i < 16; ++i) v[i] = static_cast<float>(i + 1);
+  MockReader reader({v}, 16);
+  auto engine = ingest::IngestionEngine::with_rotation(16, 42);
   CountingHook hook;
   const auto report = engine.ingest_with_hook(reader, &hook);
   EXPECT_EQ(hook.count, 1u);
@@ -81,29 +83,38 @@ TEST(EngineTest, IngestWithHookCountsVectors) {
 }
 
 TEST(EngineTest, IngestStoresParentAndL0) {
-  const std::size_t dim = 8;
-  MockReader reader({{1.0f, -2.0f, 3.0f, -4.0f, 0.5f, -0.5f, 1.5f, -1.5f}}, dim);
+  const std::size_t dim = 16;
+  std::vector<float> v(dim);
+  for (std::size_t i = 0; i < dim; ++i) {
+    v[i] = (i % 2 == 0) ? 1.0f : -1.0f;
+  }
+  MockReader reader({v}, dim);
   auto engine = ingest::IngestionEngine::with_rotation(dim, 42);
   CapturingHook hook;
   engine.ingest_with_hook(reader, &hook);
 
-  const std::uint8_t expected_parent = quantize::quantize_parent_8bit(hook.last);
+  const auto expected_keys = quantize::parent_posting_keys(hook.last);
   const auto [expected_l0, _] = quantize::quantize_1dim_to_1bit(hook.last);
 
-  EXPECT_EQ(engine.store().unique_parent_count(), 1u);
-  EXPECT_EQ(engine.store().unique_keys()[0], expected_parent);
+  EXPECT_EQ(engine.store().total_vectors(), 1u);
+  EXPECT_EQ(engine.store().unique_parent_count(), quantize::PARENT_POSTINGS);
 
-  const auto* group = engine.store().group_for_key(expected_parent);
-  ASSERT_NE(group, nullptr);
-  ASSERT_EQ(group->size(), 1u);
-  EXPECT_EQ(group->id_at(0), 0u);
-  ASSERT_EQ(group->vector_l0(0).size(), expected_l0.size());
-  EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
+  for (const std::uint16_t key : expected_keys) {
+    const auto* group = engine.store().group_for_key(key);
+    ASSERT_NE(group, nullptr);
+    ASSERT_EQ(group->size(), 1u);
+    EXPECT_EQ(group->id_at(0), 0u);
+    ASSERT_EQ(group->vector_l0(0).size(), expected_l0.size());
+    EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
+  }
 }
 
 TEST(EngineTest, IngestWithRotationNormalizesBeforeSrht) {
-  MockReader reader({{3.0f, 4.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}}, 8);
-  auto engine = ingest::IngestionEngine::with_rotation(8, 42);
+  std::vector<float> v(16, 0.0f);
+  v[0] = 3.0f;
+  v[1] = 4.0f;
+  MockReader reader({v}, 16);
+  auto engine = ingest::IngestionEngine::with_rotation(16, 42);
   CapturingHook hook;
   engine.ingest_with_hook(reader, &hook);
 
@@ -114,16 +125,21 @@ TEST(EngineTest, IngestWithRotationNormalizesBeforeSrht) {
 }
 
 TEST(EngineTest, FromRotatedQuantizesWithoutSrht) {
-  const std::vector<float> vector = {0.6f, 0.8f, -0.1f, 0.2f, 0.3f, -0.4f, 0.5f, -0.6f};
-  const std::uint8_t expected_parent = quantize::quantize_parent_8bit(vector);
+  std::vector<float> vector(16);
+  for (std::size_t i = 0; i < 16; ++i) {
+    vector[i] = static_cast<float>(i) * 0.1f - 0.5f;
+  }
+  const auto expected_keys = quantize::parent_posting_keys(vector);
   const auto [expected_l0, _] = quantize::quantize_1dim_to_1bit(vector);
 
-  MockReader reader({vector}, 8);
-  auto engine = ingest::IngestionEngine::from_rotated(8);
+  MockReader reader({vector}, 16);
+  auto engine = ingest::IngestionEngine::from_rotated(16);
   engine.ingest(reader);
 
-  EXPECT_EQ(engine.store().unique_keys()[0], expected_parent);
-  const auto* group = engine.store().group_for_key(expected_parent);
-  ASSERT_NE(group, nullptr);
-  EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
+  EXPECT_EQ(engine.store().unique_parent_count(), quantize::PARENT_POSTINGS);
+  for (const std::uint16_t key : expected_keys) {
+    const auto* group = engine.store().group_for_key(key);
+    ASSERT_NE(group, nullptr);
+    EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
+  }
 }

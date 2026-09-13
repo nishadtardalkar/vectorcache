@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -34,10 +33,10 @@ class ParentGroup {
   std::vector<std::size_t> ids_;
 };
 
-/// Unique 8-bit parent keys in a contiguous byte row; each owns an L0 child group.
+/// Unique 16-bit dual-fold parent keys; each owns an L0 child group.
 class ParentStore {
  public:
-  static constexpr std::size_t kMaxParents = 1u << quantize::PARENT_BITS;
+  static constexpr std::size_t kMaxParents = quantize::PARENT_KEY_SPACE;
   static constexpr std::size_t kInvalidGroup = std::numeric_limits<std::size_t>::max();
 
   ParentStore(std::size_t l0_words_per_vec, std::size_t padded_dim);
@@ -47,21 +46,31 @@ class ParentStore {
   std::size_t l0_words_per_vec() const { return l0_words_per_vec_; }
   std::size_t padded_dim() const { return padded_dim_; }
   std::size_t unique_parent_count() const { return keys_.size(); }
+  /// Logical vectors ingested (not posting multiplicity).
   std::size_t total_vectors() const { return total_vectors_; }
 
-  std::span<const std::uint8_t> unique_keys() const { return keys_; }
-  const ParentGroup* group_for_key(std::uint8_t key) const;
+  std::span<const std::uint16_t> unique_keys() const { return keys_; }
+  const ParentGroup* group_for_key(std::uint16_t key) const;
 
-  void push_vector(std::uint8_t parent_key, std::span<const std::uint64_t> l0, std::size_t id);
+  /// Post one (key, L0, id) and count as one logical vector.
+  void push_vector(std::uint16_t parent_key, std::span<const std::uint64_t> l0, std::size_t id);
+
+  /// Post L0 under many keys; increments total_vectors by one.
+  void push_postings(std::span<const std::uint16_t> keys, std::span<const std::uint64_t> l0,
+                     std::size_t id);
+
   void reserve_vectors(std::size_t vector_count);
 
  private:
+  void push_posting_unchecked(std::uint16_t parent_key, std::span<const std::uint64_t> l0,
+                              std::size_t id);
+
   std::size_t l0_words_per_vec_;
   std::size_t padded_dim_;
   std::size_t total_vectors_ = 0;
   std::size_t reserve_hint_ = 0;
-  AlignedVector<std::uint8_t> keys_;
-  std::array<std::size_t, kMaxParents> by_key_{};
+  AlignedVector<std::uint16_t> keys_;
+  std::vector<std::size_t> by_key_;
   std::vector<ParentGroup> groups_;
 };
 

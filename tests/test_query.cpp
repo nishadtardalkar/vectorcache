@@ -127,38 +127,50 @@ TEST(QueryEngineTest, SelfSimilarityTopScore) {
   EXPECT_TRUE(found_self);
 }
 
-TEST(QueryEngineTest, Hd1ExploresNeighborParents) {
-  // Build an index where vector 0 lives under parent P and vector 1 under P^(1<<0).
-  // Querying with vector 0 should still be able to see vector 1 via HD1 expansion.
-  // Dim must be a multiple of 64 (full L0 words) for the AVX-512 distance path.
+TEST(QueryEngineTest, ExactGroupFindsNeighborAcrossUnstableFold) {
+  // Dim 64, chunk=8. Neighbor crosses F1 (s1) on group 0 but shares F2 (x0-x1).
+  // Query near F1 boundary picks F2 → exact group still contains the neighbor.
   const std::size_t dim = 64;
+  const std::size_t chunk = dim / 8;
+
   std::vector<float> a(dim, 1.0f);
-  std::vector<float> b = a;
-  // Flip the first chunk's sum sign relative to a after identical layout: make chunk0 strongly
-  // negative while keeping the rest positive so parent keys differ by one bit when from_rotated.
-  for (std::size_t i = 0; i < dim / 8; ++i) {
-    b[i] = -1.0f;
+  std::vector<float> b(dim, 1.0f);
+  // Group 0: keep s2 = x0-x1 identical and positive; flip s1 across zero.
+  // a: [0.5, -0.4, -0.05, ...] → s1 small positive, s2=0.9
+  // b: [-0.4, -0.5, -0.05, ...] → s1 negative, s2=0.1 (still > 0)
+  a[0] = 0.5f;
+  a[1] = -0.4f;
+  b[0] = -0.4f;
+  b[1] = -0.5f;
+  for (std::size_t i = 2; i < chunk; ++i) {
+    a[i] = -0.01f;
+    b[i] = -0.01f;
   }
+  // a: s1 = 0.5-0.4-0.01*6 = 0.04; s2 = 0.9
+  //     2*s1²=0.0032, C*s2²=8*0.81=6.48 → pick F2, bit=1
+  // b: s2 = 0.1 > 0 → same F2 bit
 
   MockReader reader({a, b}, dim);
   auto ingest_engine = ingest::IngestionEngine::from_rotated(dim);
   ingest_engine.ingest(reader);
-
-  const auto keys = ingest_engine.store().unique_keys();
-  ASSERT_GE(keys.size(), 1u);
 
   auto query_engine = query::QueryEngine::from_rotated(ingest_engine.store());
   query::QueryParams params;
   params.k = 2;
 
   const auto hits = query_engine.search(a, params);
-  ASSERT_EQ(hits.size(), 2u);
+  ASSERT_FALSE(hits.empty());
   const bool saw0 = std::any_of(hits.begin(), hits.end(),
                                 [](const query::QueryHit& h) { return h.id == 0u; });
   const bool saw1 = std::any_of(hits.begin(), hits.end(),
                                 [](const query::QueryHit& h) { return h.id == 1u; });
   EXPECT_TRUE(saw0);
   EXPECT_TRUE(saw1);
+
+  const std::uint16_t qkey = quantize::quantize_parent_query_key(a);
+  const auto* group = ingest_engine.store().group_for_key(qkey);
+  ASSERT_NE(group, nullptr);
+  EXPECT_GE(group->size(), 2u);
 }
 
 TEST(QueryEngineTest, SearchPreparedMatchesSearch) {
@@ -196,18 +208,21 @@ TEST(QueryEngineTest, QueryCodesMatchIngestion) {
   CapturingHook hook;
   ingest_engine.ingest_with_hook(reader, &hook);
 
-  const std::uint8_t expected_parent = quantize::quantize_parent_8bit(hook.last);
+  const auto expected_keys = quantize::parent_posting_keys(hook.last);
+  const std::uint16_t expected_query_key = quantize::quantize_parent_query_key(hook.last);
   const auto [expected_l0, _l0] = quantize::quantize_1dim_to_1bit(hook.last);
 
-  EXPECT_EQ(ingest_engine.store().unique_keys()[0], expected_parent);
-  const auto* group = ingest_engine.store().group_for_key(expected_parent);
+  EXPECT_EQ(ingest_engine.store().unique_parent_count(), quantize::PARENT_POSTINGS);
+  const auto* group = ingest_engine.store().group_for_key(expected_query_key);
   ASSERT_NE(group, nullptr);
   EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
 
   auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
   const auto prepared = query_engine.prepare(vector);
-  EXPECT_EQ(prepared.parent_key, expected_parent);
+  EXPECT_EQ(prepared.parent_key, expected_query_key);
   EXPECT_EQ(prepared.l0[0], expected_l0[0]);
+  EXPECT_TRUE(std::find(expected_keys.begin(), expected_keys.end(), prepared.parent_key) !=
+              expected_keys.end());
 }
 
 TEST(QueryEngineTest, TopKKeepsHighestScores) {
