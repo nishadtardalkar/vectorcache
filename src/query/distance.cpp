@@ -2,6 +2,8 @@
 
 #include <immintrin.h>
 
+#include <limits>
+
 #include "vectorcache/error.hpp"
 
 namespace vectorcache::query {
@@ -18,6 +20,13 @@ inline std::uint32_t hsum_epi64_256(__m256i v) {
   const __m128i sum = _mm_add_epi64(lo, hi);
   return static_cast<std::uint32_t>(static_cast<std::uint64_t>(_mm_cvtsi128_si64(sum)) +
                                     static_cast<std::uint64_t>(_mm_extract_epi64(sum, 1)));
+}
+
+/// Cheap partial popcount sum for early-reject (avoids full reduce_add on hot path).
+inline std::uint32_t partial_hsum_epi64(__m512i v) {
+  const __m256i lo = _mm512_castsi512_si256(v);
+  const __m256i hi = _mm512_extracti64x4_epi64(v, 1);
+  return hsum_epi64_256(_mm256_add_epi64(lo, hi));
 }
 
 /// Disagree over full 64-bit words (num_bits must be a multiple of 64).
@@ -74,8 +83,8 @@ void batch_words4_disagree(std::span<const std::uint64_t> query_words,
 template <std::size_t WordsPerVec>
 void batch_words_aligned_disagree(std::span<const std::uint64_t> query_words,
                                   std::span<const std::uint64_t> data_words,
-                                  std::size_t num_vectors,
-                                  std::span<std::uint32_t> out_disagree) {
+                                  std::size_t num_vectors, std::span<std::uint32_t> out_disagree,
+                                  std::uint32_t reject_threshold) {
   static_assert(WordsPerVec % 8 == 0);
   constexpr std::size_t kBlocks = WordsPerVec / 8;
   alignas(64) __m512i q_blocks[kBlocks];
@@ -83,36 +92,164 @@ void batch_words_aligned_disagree(std::span<const std::uint64_t> query_words,
     q_blocks[b] = _mm512_load_si512(query_words.data() + b * 8);
   }
 
-  for (std::size_t v = 0; v < num_vectors; ++v) {
+  const bool early_exit = reject_threshold != std::numeric_limits<std::uint32_t>::max();
+  std::size_t v = 0;
+
+  // 2-vector ILP: hide reduce_add latency across a pair of rows.
+  for (; v + 2 <= num_vectors; v += 2) {
+    const std::uint64_t* row0 = data_words.data() + v * WordsPerVec;
+    const std::uint64_t* row1 = row0 + WordsPerVec;
+    if (v + 6 < num_vectors) {
+      _mm_prefetch(reinterpret_cast<const char*>(row0 + 4 * WordsPerVec), _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(row0 + 5 * WordsPerVec), _MM_HINT_T0);
+    }
+
+    __m512i acc0 = _mm512_setzero_si512();
+    __m512i acc1 = _mm512_setzero_si512();
+    bool done0 = false;
+    bool done1 = false;
+    for (std::size_t b = 0; b < kBlocks; ++b) {
+      if (!done0) {
+        const __m512i d0 = _mm512_load_si512(row0 + b * 8);
+        acc0 = _mm512_add_epi64(acc0, _mm512_popcnt_epi64(_mm512_xor_si512(q_blocks[b], d0)));
+        // Check every 2 blocks with a cheap partial sum.
+        if (early_exit && (b & 1u) == 1u && b + 1 < kBlocks) {
+          const auto partial = partial_hsum_epi64(acc0);
+          if (partial > reject_threshold) {
+            out_disagree[v] = partial;
+            done0 = true;
+          }
+        }
+      }
+      if (!done1) {
+        const __m512i d1 = _mm512_load_si512(row1 + b * 8);
+        acc1 = _mm512_add_epi64(acc1, _mm512_popcnt_epi64(_mm512_xor_si512(q_blocks[b], d1)));
+        if (early_exit && (b & 1u) == 1u && b + 1 < kBlocks) {
+          const auto partial = partial_hsum_epi64(acc1);
+          if (partial > reject_threshold) {
+            out_disagree[v + 1] = partial;
+            done1 = true;
+          }
+        }
+      }
+      if (done0 && done1) {
+        break;
+      }
+    }
+    if (!done0) {
+      out_disagree[v] = static_cast<std::uint32_t>(hsum_epi64(acc0));
+    }
+    if (!done1) {
+      out_disagree[v + 1] = static_cast<std::uint32_t>(hsum_epi64(acc1));
+    }
+  }
+
+  for (; v < num_vectors; ++v) {
     const std::uint64_t* row = data_words.data() + v * WordsPerVec;
     if (v + 4 < num_vectors) {
       _mm_prefetch(reinterpret_cast<const char*>(row + 4 * WordsPerVec), _MM_HINT_T0);
     }
     __m512i acc = _mm512_setzero_si512();
+    bool rejected = false;
     for (std::size_t b = 0; b < kBlocks; ++b) {
       const __m512i d = _mm512_load_si512(row + b * 8);
       acc = _mm512_add_epi64(acc, _mm512_popcnt_epi64(_mm512_xor_si512(q_blocks[b], d)));
+      if (early_exit && (b & 1u) == 1u && b + 1 < kBlocks) {
+        const auto partial = partial_hsum_epi64(acc);
+        if (partial > reject_threshold) {
+          out_disagree[v] = partial;
+          rejected = true;
+          break;
+        }
+      }
     }
-    out_disagree[v] = static_cast<std::uint32_t>(hsum_epi64(acc));
+    if (!rejected) {
+      out_disagree[v] = static_cast<std::uint32_t>(hsum_epi64(acc));
+    }
   }
 }
 
 /// Full-word rows where words_per_vec is a multiple of 8 (aligned ZMM blocks only).
 void batch_words_zmm_disagree(std::span<const std::uint64_t> query_words, std::size_t full_words,
                               std::span<const std::uint64_t> data_words, std::size_t num_vectors,
-                              std::span<std::uint32_t> out_disagree) {
-  for (std::size_t v = 0; v < num_vectors; ++v) {
+                              std::span<std::uint32_t> out_disagree,
+                              std::uint32_t reject_threshold) {
+  const bool early_exit = reject_threshold != std::numeric_limits<std::uint32_t>::max();
+  std::size_t v = 0;
+
+  for (; v + 2 <= num_vectors; v += 2) {
+    const std::uint64_t* row0 = data_words.data() + v * full_words;
+    const std::uint64_t* row1 = row0 + full_words;
+    if (v + 6 < num_vectors) {
+      _mm_prefetch(reinterpret_cast<const char*>(row0 + 4 * full_words), _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(row0 + 5 * full_words), _MM_HINT_T0);
+    }
+
+    __m512i acc0 = _mm512_setzero_si512();
+    __m512i acc1 = _mm512_setzero_si512();
+    bool done0 = false;
+    bool done1 = false;
+    std::size_t block = 0;
+    for (std::size_t i = 0; i < full_words; i += 8, ++block) {
+      const __m512i q = _mm512_loadu_si512(query_words.data() + i);
+      if (!done0) {
+        const __m512i d0 = _mm512_load_si512(row0 + i);
+        acc0 = _mm512_add_epi64(acc0, _mm512_popcnt_epi64(_mm512_xor_si512(q, d0)));
+        if (early_exit && (block & 1u) == 1u && i + 8 < full_words) {
+          const auto partial = partial_hsum_epi64(acc0);
+          if (partial > reject_threshold) {
+            out_disagree[v] = partial;
+            done0 = true;
+          }
+        }
+      }
+      if (!done1) {
+        const __m512i d1 = _mm512_load_si512(row1 + i);
+        acc1 = _mm512_add_epi64(acc1, _mm512_popcnt_epi64(_mm512_xor_si512(q, d1)));
+        if (early_exit && (block & 1u) == 1u && i + 8 < full_words) {
+          const auto partial = partial_hsum_epi64(acc1);
+          if (partial > reject_threshold) {
+            out_disagree[v + 1] = partial;
+            done1 = true;
+          }
+        }
+      }
+      if (done0 && done1) {
+        break;
+      }
+    }
+    if (!done0) {
+      out_disagree[v] = static_cast<std::uint32_t>(hsum_epi64(acc0));
+    }
+    if (!done1) {
+      out_disagree[v + 1] = static_cast<std::uint32_t>(hsum_epi64(acc1));
+    }
+  }
+
+  for (; v < num_vectors; ++v) {
     const std::uint64_t* row = data_words.data() + v * full_words;
     if (v + 4 < num_vectors) {
       _mm_prefetch(reinterpret_cast<const char*>(row + 4 * full_words), _MM_HINT_T0);
     }
     __m512i acc = _mm512_setzero_si512();
-    for (std::size_t i = 0; i < full_words; i += 8) {
+    bool rejected = false;
+    std::size_t block = 0;
+    for (std::size_t i = 0; i < full_words; i += 8, ++block) {
       const __m512i q = _mm512_loadu_si512(query_words.data() + i);
       const __m512i d = _mm512_load_si512(row + i);
       acc = _mm512_add_epi64(acc, _mm512_popcnt_epi64(_mm512_xor_si512(q, d)));
+      if (early_exit && (block & 1u) == 1u && i + 8 < full_words) {
+        const auto partial = partial_hsum_epi64(acc);
+        if (partial > reject_threshold) {
+          out_disagree[v] = partial;
+          rejected = true;
+          break;
+        }
+      }
     }
-    out_disagree[v] = static_cast<std::uint32_t>(hsum_epi64(acc));
+    if (!rejected) {
+      out_disagree[v] = static_cast<std::uint32_t>(hsum_epi64(acc));
+    }
   }
 }
 
@@ -139,7 +276,8 @@ float bit_agreement_score(std::span<const std::uint64_t> query_words,
 void bit_agreement_batch_disagree(std::span<const std::uint64_t> query_words,
                                   std::size_t num_bits, std::span<const std::uint64_t> data_words,
                                   std::size_t data_words_per_vec, std::size_t num_vectors,
-                                  std::span<std::uint32_t> out_disagree) {
+                                  std::span<std::uint32_t> out_disagree,
+                                  std::uint32_t reject_threshold) {
   if (out_disagree.size() < num_vectors || num_vectors == 0 || num_bits == 0) {
     return;
   }
@@ -159,15 +297,18 @@ void bit_agreement_batch_disagree(std::span<const std::uint64_t> query_words,
     return;
   }
   if (full_words == 32) {
-    batch_words_aligned_disagree<32>(query_words, data_words, num_vectors, out_disagree);
+    batch_words_aligned_disagree<32>(query_words, data_words, num_vectors, out_disagree,
+                                     reject_threshold);
     return;
   }
   if (full_words == 64) {
-    batch_words_aligned_disagree<64>(query_words, data_words, num_vectors, out_disagree);
+    batch_words_aligned_disagree<64>(query_words, data_words, num_vectors, out_disagree,
+                                     reject_threshold);
     return;
   }
   if ((full_words % 8) == 0) {
-    batch_words_zmm_disagree(query_words, full_words, data_words, num_vectors, out_disagree);
+    batch_words_zmm_disagree(query_words, full_words, data_words, num_vectors, out_disagree,
+                             reject_threshold);
     return;
   }
   // Non-multiple-of-8 word counts (e.g. unit-test dims): masked ZMM path per vector.

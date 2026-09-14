@@ -164,8 +164,8 @@ class MultiRoundReader : public vectorcache::datasets::DatasetReader {
 };
 
 void print_stored_parent(std::size_t index, const vectorcache::ingest::IngestionEngine& engine) {
-  for (const std::uint16_t key : engine.store().unique_keys()) {
-    const auto* group = engine.store().group_for_key(key);
+  for (const auto& key : engine.store().unique_keys()) {
+    const auto* group = engine.store().find(key);
     if (group == nullptr) {
       continue;
     }
@@ -173,9 +173,13 @@ void print_stored_parent(std::size_t index, const vectorcache::ingest::Ingestion
       if (group->id_at(i) != index) {
         continue;
       }
-      std::cout << "Stored parent key (one of 256 postings) at index " << index << ": 0x"
-                << std::hex << std::setw(4) << std::setfill('0') << static_cast<unsigned>(key)
-                << std::dec << '\n';
+      std::cout << "Stored support key at index " << index << ": d=" << static_cast<unsigned>(key.d)
+                << " dims=[";
+      for (std::uint8_t d = 0; d < key.d; ++d) {
+        if (d) std::cout << ',';
+        std::cout << key.dims[d];
+      }
+      std::cout << "]\n";
       const auto l0 = group->vector_l0(i);
       std::cout << "Stored L0 codes (" << l0.size() << " u64 words):\n  [";
       for (std::size_t w = 0; w < l0.size(); ++w) {
@@ -251,7 +255,7 @@ int main(int argc, char** argv) {
     const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
     const bool capture_vectors = show_index.has_value() && variance;
 
-    std::cout << "Dataset: " << meta.label << " (dim=" << meta.dim << ", padded=" << padded
+    std::cout << "Dataset: " << meta.label << " (dim=" << meta.dim << ", srht_dim=" << padded
               << ", available=" << meta.count << ", ingesting=" << ingest_limit
               << ", srht_seed=" << seed << ", rounds=" << rounds << ")\n";
 

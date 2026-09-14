@@ -1,8 +1,12 @@
 #include "vectorcache/quantize/quantize.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <utility>
+#include <vector>
 
 #include "vectorcache/error.hpp"
 #include "vectorcache/simd.hpp"
@@ -18,102 +22,123 @@ __m512 load_vector_block(const float* ptr) {
   return _mm512_loadu_ps(ptr);
 }
 
-void validate_parent_dim(std::size_t dim) {
-  if (dim == 0 || dim % PARENT_GROUPS != 0) {
-    throw Error("parent quantize requires dim > 0 and dim % 8 == 0");
-  }
-  const std::size_t chunk = dim / PARENT_GROUPS;
-  if (chunk < 2) {
-    throw Error("parent quantize requires chunk size >= 2 (dim >= 16 with 8 groups)");
-  }
-}
-
-float sum_range(const float* base, std::size_t n) {
-  float sum = 0.0f;
-  std::size_t d = 0;
-  while (d + simd::kWidth <= n) {
-    sum += _mm512_reduce_add_ps(load_vector_block(base + d));
-    d += simd::kWidth;
-  }
-  while (d < n) {
-    sum += base[d];
-    ++d;
-  }
-  return sum;
-}
-
-/// s1 = sum(chunk) = <x, all-ones>; s2 = x[0]-x[1] = <x, (1,-1,0,...)>.
-void chunk_project_2d(const float* base, std::size_t chunk, float& s1, float& s2) {
-  s1 = sum_range(base, chunk);
-  s2 = base[0] - base[1];
-}
-
 }  // namespace
 
 std::size_t l0_bits_per_vector(std::size_t dim) { return dim; }
 
 std::size_t l0_words_per_vector(std::size_t dim) { return (dim + 63) / 64; }
 
-ParentFoldBits quantize_parent_fold_bits(std::span<const float> vector) {
-  validate_parent_dim(vector.size());
-  const std::size_t chunk = vector.size() / PARENT_GROUPS;
-  ParentFoldBits folds{};
-  for (std::size_t g = 0; g < PARENT_GROUPS; ++g) {
-    float s1 = 0.0f;
-    float s2 = 0.0f;
-    chunk_project_2d(vector.data() + g * chunk, chunk, s1, s2);
-    if (s1 >= 0.0f) {
-      folds.b1 = static_cast<std::uint8_t>(folds.b1 | static_cast<std::uint8_t>(1u << g));
-    }
-    if (s2 >= 0.0f) {
-      folds.b2 = static_cast<std::uint8_t>(folds.b2 | static_cast<std::uint8_t>(1u << g));
+std::uint8_t support_hd(const SupportKey& a, const SupportKey& b) {
+  if (a.d != b.d) {
+    throw Error("support_hd requires equal depth keys");
+  }
+  std::size_t i = 0;
+  std::size_t j = 0;
+  std::size_t inter = 0;
+  while (i < a.d && j < b.d) {
+    if (a.dims[i] == b.dims[j]) {
+      ++inter;
+      ++i;
+      ++j;
+    } else if (a.dims[i] < b.dims[j]) {
+      ++i;
+    } else {
+      ++j;
     }
   }
-  return folds;
+  return static_cast<std::uint8_t>(2u * (static_cast<std::size_t>(a.d) - inter));
 }
 
-std::array<std::uint16_t, PARENT_POSTINGS> parent_posting_keys(ParentFoldBits folds) {
-  std::array<std::uint16_t, PARENT_POSTINGS> keys{};
-  // Per group: two allowed nibbles encode(F1,b1) and encode(F2,b2).
-  std::uint16_t nibble_f1[PARENT_GROUPS];
-  std::uint16_t nibble_f2[PARENT_GROUPS];
-  for (std::size_t g = 0; g < PARENT_GROUPS; ++g) {
-    const std::uint8_t bit1 = static_cast<std::uint8_t>((folds.b1 >> g) & 1u);
-    const std::uint8_t bit2 = static_cast<std::uint8_t>((folds.b2 >> g) & 1u);
-    nibble_f1[g] = parent_nibble(0, bit1);
-    nibble_f2[g] = parent_nibble(1, bit2);
+SupportKey quantize_support_key(std::span<const float> vector, std::size_t d) {
+  if (d == 0 || d > kMaxSupportDepth) {
+    throw Error("support depth must be in 1..kMaxSupportDepth");
+  }
+  if (vector.size() < d) {
+    throw Error("vector shorter than support depth");
+  }
+  if (vector.size() > std::numeric_limits<std::uint16_t>::max() + 1ull) {
+    throw Error("vector dim exceeds uint16 index range");
   }
 
-  for (std::size_t mask = 0; mask < PARENT_POSTINGS; ++mask) {
-    std::uint16_t key = 0;
-    for (std::size_t g = 0; g < PARENT_GROUPS; ++g) {
-      const std::uint16_t nibble = ((mask >> g) & 1u) != 0u ? nibble_f2[g] : nibble_f1[g];
-      key = static_cast<std::uint16_t>(key | parent_pack_nibble(g, nibble));
+  const std::size_t n = vector.size();
+  // Min-heap of size d over the best candidates (root = worst of the best).
+  // Tie-break: higher index wins when |x| equal → worse has smaller idx.
+  struct Cand {
+    float mag;
+    std::uint16_t idx;
+  };
+  Cand best[kMaxSupportDepth];
+  std::size_t filled = 0;
+
+  auto worse = [](const Cand& a, const Cand& b) {
+    return a.mag < b.mag || (a.mag == b.mag && a.idx < b.idx);
+  };
+  auto sift_up = [&](std::size_t i) {
+    while (i > 0) {
+      const std::size_t parent = (i - 1) / 2;
+      if (!worse(best[i], best[parent])) {
+        break;
+      }
+      std::swap(best[i], best[parent]);
+      i = parent;
     }
-    keys[mask] = key;
-  }
-  return keys;
-}
+  };
+  auto sift_down = [&](std::size_t i) {
+    while (true) {
+      const std::size_t left = 2 * i + 1;
+      const std::size_t right = left + 1;
+      std::size_t w = i;
+      if (left < filled && worse(best[left], best[w])) {
+        w = left;
+      }
+      if (right < filled && worse(best[right], best[w])) {
+        w = right;
+      }
+      if (w == i) {
+        break;
+      }
+      std::swap(best[i], best[w]);
+      i = w;
+    }
+  };
 
-std::array<std::uint16_t, PARENT_POSTINGS> parent_posting_keys(std::span<const float> vector) {
-  return parent_posting_keys(quantize_parent_fold_bits(vector));
-}
+  auto consider = [&](float mag, std::uint16_t idx) {
+    const Cand c{mag, idx};
+    if (filled < d) {
+      best[filled] = c;
+      sift_up(filled);
+      ++filled;
+      return;
+    }
+    if (worse(best[0], c)) {
+      // c is better than current worst-of-best.
+      best[0] = c;
+      sift_down(0);
+    }
+  };
 
-std::uint16_t quantize_parent_query_key(std::span<const float> vector) {
-  validate_parent_dim(vector.size());
-  const std::size_t chunk = vector.size() / PARENT_GROUPS;
-  std::uint16_t key = 0;
-  for (std::size_t g = 0; g < PARENT_GROUPS; ++g) {
-    float s1 = 0.0f;
-    float s2 = 0.0f;
-    chunk_project_2d(vector.data() + g * chunk, chunk, s1, s2);
-    // |s1|/√C >= |s2|/√2  iff  2 s1² >= C s2²
-    const bool use_f1 =
-        (2.0f * s1 * s1) >= (static_cast<float>(chunk) * s2 * s2);
-    const std::uint8_t fold = use_f1 ? 0u : 1u;
-    const std::uint8_t bit = use_f1 ? (s1 >= 0.0f ? 1u : 0u) : (s2 >= 0.0f ? 1u : 0u);
-    key = static_cast<std::uint16_t>(key | parent_pack_nibble(g, parent_nibble(fold, bit)));
+  std::size_t i = 0;
+  while (i + simd::kWidth <= n) {
+    const __m512 vals = load_vector_block(vector.data() + i);
+    const __m512 absv = _mm512_abs_ps(vals);
+    alignas(64) float mags[simd::kWidth];
+    _mm512_store_ps(mags, absv);
+    for (std::size_t lane = 0; lane < simd::kWidth; ++lane) {
+      consider(mags[lane], static_cast<std::uint16_t>(i + lane));
+    }
+    i += simd::kWidth;
   }
+  while (i < n) {
+    consider(std::fabs(vector[i]), static_cast<std::uint16_t>(i));
+    ++i;
+  }
+
+  SupportKey key{};
+  key.d = static_cast<std::uint8_t>(d);
+  for (std::size_t k = 0; k < d; ++k) {
+    key.dims[k] = best[k].idx;
+  }
+  std::sort(key.dims, key.dims + d);
   return key;
 }
 

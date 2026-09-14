@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -25,8 +24,11 @@ struct IngestReport {
 
 class IngestionEngine {
  public:
-  static IngestionEngine from_rotated(std::size_t padded_dim);
-  static IngestionEngine with_rotation(std::size_t original_dim, std::uint64_t seed);
+  /// Already-SRHT'd vectors of length srht_dim; support key from full vector (input_dim==srht_dim).
+  static IngestionEngine from_rotated(std::size_t srht_dim,
+                                      std::size_t top_d = quantize::kDefaultSupportDepth);
+  static IngestionEngine with_rotation(std::size_t original_dim, std::uint64_t seed,
+                                       std::size_t top_d = quantize::kDefaultSupportDepth);
 
   void reserve_vectors(std::size_t count);
   IngestReport ingest(datasets::DatasetReader& reader);
@@ -35,14 +37,14 @@ class IngestionEngine {
 
  private:
   struct VectorWork {
-    AlignedVector<float> rotated;
-    std::array<std::uint16_t, quantize::PARENT_POSTINGS> posting_keys{};
+    AlignedVector<float> buf;  // length srht_dim_
+    quantize::SupportKey support_key{};
     AlignedVector<std::uint64_t> l0;
   };
 
   IngestionEngine(ParentStore store, std::optional<transform::SrhtRotation> rotation,
-                  bool quantize_only, std::size_t input_dim, std::size_t padded_dim,
-                  std::size_t l0_words_per_vec);
+                  bool quantize_only, std::size_t input_dim, std::size_t srht_dim,
+                  std::size_t top_d, std::size_t l0_words_per_vec);
 
   void ensure_batch_capacity(std::size_t batch_cap);
   std::size_t read_batch(datasets::DatasetReader& reader);
@@ -52,7 +54,8 @@ class IngestionEngine {
   std::optional<transform::SrhtRotation> rotation_;
   bool quantize_only_;
   std::size_t input_dim_;
-  std::size_t padded_dim_;
+  std::size_t srht_dim_;
+  std::size_t top_d_;
   std::size_t l0_words_per_vec_;
   std::vector<VectorWork> batch_work_;
 };

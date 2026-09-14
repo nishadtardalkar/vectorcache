@@ -43,6 +43,7 @@ set(VECTORCACHE_SOURCES
   src/transform/normalize.cpp
   src/transform/srht.cpp
   src/quantize/quantize.cpp
+  src/quantize/dim_postings.cpp
   src/ingest/store.cpp
   src/ingest/timing.cpp
   src/ingest/engine.cpp

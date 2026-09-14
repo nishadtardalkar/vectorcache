@@ -8,6 +8,7 @@
 
 #include "vectorcache/aligned.hpp"
 #include "vectorcache/ingest/store.hpp"
+#include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/transform/srht.hpp"
 
 namespace vectorcache::query {
@@ -19,11 +20,15 @@ struct QueryHit {
 
 struct QueryParams {
   std::size_t k = 10;
+  /// Max support-key Hamming distance to probe (0, 2, 4, ...). Default HD<=2.
+  std::uint8_t max_hd = 2;
+  /// Stop probing after this many L0 rows have been scored.
+  std::size_t max_l0_candidates = 4096;
 };
 
 struct PreparedQuery {
   AlignedVector<float> rotated;
-  std::uint16_t parent_key = 0;
+  quantize::SupportKey support_key{};
   AlignedVector<std::uint64_t> l0;
 };
 
@@ -34,7 +39,6 @@ class QueryEngine {
   static QueryEngine from_rotated(const ingest::ParentStore& store);
 
   PreparedQuery prepare(std::span<const float> query) const;
-  /// Reuse rotated/L0 buffers in out across calls (resizes only when dimensions change).
   void prepare_into(PreparedQuery& out, std::span<const float> query) const;
   std::vector<QueryHit> search(std::span<const float> query, const QueryParams& params) const;
   std::vector<QueryHit> search_prepared(const PreparedQuery& prepared,

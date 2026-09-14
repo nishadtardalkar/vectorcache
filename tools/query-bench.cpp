@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -19,7 +20,7 @@
 #include "vectorcache/datasets/sample.hpp"
 #include "vectorcache/error.hpp"
 #include "vectorcache/ingest/engine.hpp"
-#include "vectorcache/ingest/store.hpp"
+#include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/query/engine.hpp"
 #include "vectorcache/transform/fwht.hpp"
 #include "vectorcache/transform/normalize.hpp"
@@ -69,10 +70,11 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 }
 
 vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
-                                                   std::size_t dim, std::uint64_t seed,
-                                                   std::size_t limit) {
+                                                  std::size_t dim, std::uint64_t seed,
+                                                  std::size_t limit) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
-  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed);
+  constexpr std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
+  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, top_d);
   engine.reserve_vectors(limit);
   const auto report = engine.ingest(limited);
   if (report.vectors_ingested != limit) {
@@ -264,8 +266,12 @@ void run_probe_stats(const vectorcache::query::QueryEngine& engine,
   std::cout << "\nProbe stats (first query, k=" << base_params.k << "):\n";
   const auto prepared = engine.prepare(queries.front());
   const auto hits = engine.search_prepared(prepared, base_params);
-  std::cout << "  parent_key=0x" << std::hex << std::setw(4) << std::setfill('0')
-            << static_cast<unsigned>(prepared.parent_key) << std::dec
+  std::cout << "  support_key d=" << static_cast<unsigned>(prepared.support_key.d) << " dims=[";
+  for (std::uint8_t i = 0; i < prepared.support_key.d; ++i) {
+    if (i) std::cout << ',';
+    std::cout << prepared.support_key.dims[i];
+  }
+  std::cout << "]"
             << " hits=" << hits.size() << '\n';
 }
 
@@ -282,6 +288,8 @@ int main(int argc, char** argv) {
   std::size_t query_limit = 0;
   std::uint64_t seed = 42;
   std::size_t k = 10;
+  std::uint8_t max_hd = 2;
+  std::size_t max_l0_candidates = 4096;
   bool calibrate = false;
   bool recall = false;
 
@@ -295,6 +303,8 @@ int main(int argc, char** argv) {
   app.add_option("--query-limit", query_limit, "Query count (default: 10000 GloVe, 1000 else)");
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
+  app.add_option("--max-hd", max_hd, "Max support-key Hamming distance to probe (0, 2, or 4)");
+  app.add_option("--max-l0-candidates", max_l0_candidates, "Cap on L0 rows scored per query");
   app.add_flag("--calibrate", calibrate, "Print parent-key probe stats for the first query");
   app.add_flag("--recall", recall,
                "Measure mean recall@k vs exact cosine top-k on original full-dim vectors");
@@ -337,11 +347,13 @@ int main(int argc, char** argv) {
         load_query_vectors(dataset, *train_for_queries, data_dir, meta.dim, actual_index,
                            query_limit, query_split, seed);
 
-    auto query_engine = vectorcache::query::QueryEngine::with_rotation(ingest_engine.store(),
-                                                                       meta.dim, seed);
+    auto query_engine =
+        vectorcache::query::QueryEngine::with_rotation(ingest_engine.store(), meta.dim, seed);
 
     vectorcache::query::QueryParams params;
     params.k = k;
+    params.max_hd = max_hd;
+    params.max_l0_candidates = max_l0_candidates;
 
     std::vector<std::uint64_t> prep_ns;
     std::vector<std::uint64_t> search_ns;

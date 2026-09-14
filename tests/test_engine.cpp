@@ -6,7 +6,6 @@
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/quantize/quantize.hpp"
-#include "vectorcache/transform/fwht.hpp"
 
 using namespace vectorcache;
 
@@ -63,7 +62,7 @@ TEST(EngineTest, IngestDefaultHasNoHook) {
   }
 
   MockReader reader(std::move(vectors), dim);
-  auto engine = ingest::IngestionEngine::with_rotation(dim, 42);
+  auto engine = ingest::IngestionEngine::with_rotation(dim, 42, 2);
   const auto report = engine.ingest(reader);
 
   EXPECT_EQ(report.vectors_ingested, n);
@@ -75,46 +74,45 @@ TEST(EngineTest, IngestWithHookCountsVectors) {
   std::vector<float> v(16);
   for (std::size_t i = 0; i < 16; ++i) v[i] = static_cast<float>(i + 1);
   MockReader reader({v}, 16);
-  auto engine = ingest::IngestionEngine::with_rotation(16, 42);
+  auto engine = ingest::IngestionEngine::with_rotation(16, 42, 2);
   CountingHook hook;
   const auto report = engine.ingest_with_hook(reader, &hook);
   EXPECT_EQ(hook.count, 1u);
   EXPECT_EQ(report.vectors_ingested, 1u);
 }
 
-TEST(EngineTest, IngestStoresParentAndL0) {
+TEST(EngineTest, IngestStoresSupportKeyAndL0) {
   const std::size_t dim = 16;
+  const std::size_t top_d = 2;
   std::vector<float> v(dim);
   for (std::size_t i = 0; i < dim; ++i) {
     v[i] = (i % 2 == 0) ? 1.0f : -1.0f;
   }
   MockReader reader({v}, dim);
-  auto engine = ingest::IngestionEngine::with_rotation(dim, 42);
+  auto engine = ingest::IngestionEngine::with_rotation(dim, 42, top_d);
   CapturingHook hook;
   engine.ingest_with_hook(reader, &hook);
 
-  const auto expected_keys = quantize::parent_posting_keys(hook.last);
+  // Hook sees post-SRHT buffer; L0 must match that.
   const auto [expected_l0, _] = quantize::quantize_1dim_to_1bit(hook.last);
-
   EXPECT_EQ(engine.store().total_vectors(), 1u);
-  EXPECT_EQ(engine.store().unique_parent_count(), quantize::PARENT_POSTINGS);
+  EXPECT_EQ(engine.store().unique_parent_count(), 1u);
 
-  for (const std::uint16_t key : expected_keys) {
-    const auto* group = engine.store().group_for_key(key);
-    ASSERT_NE(group, nullptr);
-    ASSERT_EQ(group->size(), 1u);
-    EXPECT_EQ(group->id_at(0), 0u);
-    ASSERT_EQ(group->vector_l0(0).size(), expected_l0.size());
-    EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
-  }
+  // Reconstruct support key from pre-SRHT norm of original: re-ingest path stores one key.
+  const auto* any = engine.store().find(engine.store().unique_keys()[0]);
+  ASSERT_NE(any, nullptr);
+  ASSERT_EQ(any->size(), 1u);
+  EXPECT_EQ(any->id_at(0), 0u);
+  ASSERT_EQ(any->vector_l0(0).size(), expected_l0.size());
+  EXPECT_EQ(any->vector_l0(0)[0], expected_l0[0]);
 }
 
-TEST(EngineTest, IngestWithRotationNormalizesBeforeSrht) {
+TEST(EngineTest, IngestWithRotationUnitNormAfterSrht) {
   std::vector<float> v(16, 0.0f);
   v[0] = 3.0f;
   v[1] = 4.0f;
   MockReader reader({v}, 16);
-  auto engine = ingest::IngestionEngine::with_rotation(16, 42);
+  auto engine = ingest::IngestionEngine::with_rotation(16, 42, 2);
   CapturingHook hook;
   engine.ingest_with_hook(reader, &hook);
 
@@ -125,21 +123,20 @@ TEST(EngineTest, IngestWithRotationNormalizesBeforeSrht) {
 }
 
 TEST(EngineTest, FromRotatedQuantizesWithoutSrht) {
+  const std::size_t top_d = 2;
   std::vector<float> vector(16);
   for (std::size_t i = 0; i < 16; ++i) {
     vector[i] = static_cast<float>(i) * 0.1f - 0.5f;
   }
-  const auto expected_keys = quantize::parent_posting_keys(vector);
+  const auto expected_key = quantize::quantize_support_key(vector, top_d);
   const auto [expected_l0, _] = quantize::quantize_1dim_to_1bit(vector);
 
   MockReader reader({vector}, 16);
-  auto engine = ingest::IngestionEngine::from_rotated(16);
+  auto engine = ingest::IngestionEngine::from_rotated(16, top_d);
   engine.ingest(reader);
 
-  EXPECT_EQ(engine.store().unique_parent_count(), quantize::PARENT_POSTINGS);
-  for (const std::uint16_t key : expected_keys) {
-    const auto* group = engine.store().group_for_key(key);
-    ASSERT_NE(group, nullptr);
-    EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
-  }
+  EXPECT_EQ(engine.store().unique_parent_count(), 1u);
+  const auto* group = engine.store().find(expected_key);
+  ASSERT_NE(group, nullptr);
+  EXPECT_EQ(group->vector_l0(0)[0], expected_l0[0]);
 }

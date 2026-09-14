@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "vectorcache/error.hpp"
+#include "vectorcache/ingest/store.hpp"
 #include "vectorcache/query/distance.hpp"
 #include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/transform/normalize.hpp"
@@ -19,7 +20,6 @@ namespace {
 constexpr std::size_t kHeapTopKThreshold = 32;
 constexpr std::size_t kScoreChunk = 64;
 
-/// Top-k by integer disagreement (lower is better). Float scores only at finalize.
 class TopKHits {
  public:
   explicit TopKHits(std::size_t k, std::size_t num_bits)
@@ -36,7 +36,6 @@ class TopKHits {
     }
   }
 
-  /// Worst disagree currently in the set; UINT32_MAX until full (accept everything).
   std::uint32_t reject_threshold() const {
     if (k_ == 0) {
       return 0;
@@ -70,7 +69,6 @@ class TopKHits {
       }
       return;
     }
-    // Better = lower disagree; on tie prefer smaller id (replace if id < worst id).
     if (disagree < max_disagree_ || (disagree == max_disagree_ && id < ids_[max_idx_])) {
       disagrees_[max_idx_] = disagree;
       ids_[max_idx_] = id;
@@ -106,7 +104,6 @@ class TopKHits {
     std::size_t id;
   };
 
-  /// Max-heap by disagree (worst at front); on equal disagree, larger id is worse.
   static bool heap_worse(const HeapHit& a, const HeapHit& b) {
     if (a.disagree != b.disagree) {
       return a.disagree < b.disagree;
@@ -151,11 +148,11 @@ class TopKHits {
   std::vector<HeapHit> heap_;
 };
 
-void search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
-                  std::size_t l0_bits, TopKHits& topk) {
-  const std::size_t n = group.size();
+std::size_t search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
+                         std::size_t l0_bits, TopKHits& topk, std::size_t max_rows) {
+  const std::size_t n = std::min(group.size(), max_rows);
   if (n == 0) {
-    return;
+    return 0;
   }
 
   const std::size_t words = query.l0.size();
@@ -163,6 +160,7 @@ void search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
   const auto ids = group.ids();
 
   alignas(64) std::uint32_t disagree_buf[kScoreChunk];
+  std::uint32_t threshold = topk.reject_threshold();
   for (std::size_t base = 0; base < n; base += kScoreChunk) {
     const std::size_t chunk = std::min(kScoreChunk, n - base);
     if (base + chunk + 8 <= n) {
@@ -170,58 +168,106 @@ void search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
                    _MM_HINT_T0);
     }
     bit_agreement_batch_disagree(query.l0, l0_bits, codes.subspan(base * words, chunk * words),
-                                 words, chunk, std::span<std::uint32_t>(disagree_buf, chunk));
+                                 words, chunk, std::span<std::uint32_t>(disagree_buf, chunk),
+                                 threshold);
     for (std::size_t i = 0; i < chunk; ++i) {
-      if (disagree_buf[i] > topk.reject_threshold()) {
+      if (disagree_buf[i] > threshold) {
         continue;
       }
       topk.push(ids[base + i], disagree_buf[i]);
     }
+    // Refresh once per chunk; next chunk sees the tightened reject bound.
+    threshold = topk.reject_threshold();
   }
+  return n;
 }
 
-void search_store(const ingest::ParentStore& store, const PreparedQuery& query, TopKHits& topk) {
-  const std::size_t l0_bits = quantize::l0_bits_per_vector(store.padded_dim());
-  const ingest::ParentGroup* group = store.group_for_key(query.parent_key);
-  if (group != nullptr && !group->empty()) {
-    search_group(*group, query, l0_bits, topk);
+void search_with_probe(const ingest::ParentStore& store, const PreparedQuery& query,
+                       const QueryParams& params, TopKHits& topk) {
+  const std::size_t l0_bits = quantize::l0_bits_per_vector(store.srht_dim());
+  std::size_t scored = 0;
+  const std::size_t budget = params.max_l0_candidates;
+
+  auto scan_group = [&](const ingest::ParentGroup* group) {
+    if (scored >= budget) {
+      return false;
+    }
+    if (group == nullptr || group->empty()) {
+      return true;
+    }
+    _mm_prefetch(reinterpret_cast<const char*>(group->l0_codes().data()), _MM_HINT_T0);
+    scored += search_group(*group, query, l0_bits, topk, budget - scored);
+    return scored < budget;
+  };
+
+  if (!scan_group(store.find(query.support_key))) {
+    return;
   }
+  if (params.max_hd < 2) {
+    return;
+  }
+
+  const auto keys = store.unique_keys();
+  const auto& postings = store.dim_postings();
+
+  postings.for_each_hd2(keys, query.support_key,
+                        [&](const quantize::SupportKey&, std::uint32_t key_idx) {
+                          return scan_group(&store.group_at(key_idx));
+                        });
+
+  if (params.max_hd < 4 || scored >= budget) {
+    return;
+  }
+
+  thread_local std::vector<std::uint8_t> hd4_visited;
+  if (hd4_visited.size() < keys.size()) {
+    hd4_visited.resize(keys.size());
+  }
+
+  postings.for_each_hd4(keys, query.support_key, hd4_visited,
+                        [&](const quantize::SupportKey&, std::uint32_t key_idx) {
+                          return scan_group(&store.group_at(key_idx));
+                        });
 }
 
 void prepare_query_into(const ingest::ParentStore& store,
                         const std::optional<transform::SrhtRotation>& rotation,
                         bool query_is_rotated, std::size_t input_dim,
                         std::span<const float> query, PreparedQuery& prepared) {
-  const std::size_t padded_dim = store.padded_dim();
+  const std::size_t srht_dim = store.srht_dim();
   const std::size_t l0_words = store.l0_words_per_vec();
+  const std::size_t top_d = store.top_d();
 
-  if (prepared.rotated.size() != padded_dim) {
-    prepared.rotated.assign(padded_dim, 0.0f);
+  if (prepared.rotated.size() != srht_dim) {
+    prepared.rotated.assign(srht_dim, 0.0f);
   }
   if (prepared.l0.size() != l0_words) {
     prepared.l0.assign(l0_words, 0);
   }
 
   if (query_is_rotated) {
-    if (query.size() != padded_dim) {
+    if (query.size() != srht_dim) {
       throw Error("rotated query dimension mismatch");
     }
-    std::memcpy(prepared.rotated.data(), query.data(), padded_dim * sizeof(float));
+    std::memcpy(prepared.rotated.data(), query.data(), srht_dim * sizeof(float));
+    prepared.support_key = quantize::quantize_support_key(
+        std::span<const float>(prepared.rotated.data(), store.input_dim()), top_d);
   } else if (rotation.has_value()) {
     if (query.size() != input_dim) {
       throw Error("query dimension mismatch");
     }
     std::memcpy(prepared.rotated.data(), query.data(), input_dim * sizeof(float));
-    if (padded_dim > input_dim) {
-      std::memset(prepared.rotated.data() + input_dim, 0, (padded_dim - input_dim) * sizeof(float));
+    transform::l2_normalize_in_place(std::span<float>(prepared.rotated.data(), input_dim));
+    prepared.support_key = quantize::quantize_support_key(
+        std::span<const float>(prepared.rotated.data(), input_dim), top_d);
+    if (srht_dim > input_dim) {
+      std::memset(prepared.rotated.data() + input_dim, 0, (srht_dim - input_dim) * sizeof(float));
     }
-    transform::l2_normalize_in_place(prepared.rotated);
     rotation->apply_in_place(prepared.rotated);
   } else {
     throw Error("QueryEngine requires with_rotation() or from_rotated()");
   }
 
-  prepared.parent_key = quantize::quantize_parent_query_key(prepared.rotated);
   quantize::quantize_1dim_to_1bit_into(prepared.rotated, prepared.l0);
 }
 
@@ -241,7 +287,7 @@ QueryEngine QueryEngine::with_rotation(const ingest::ParentStore& store, std::si
 }
 
 QueryEngine QueryEngine::from_rotated(const ingest::ParentStore& store) {
-  return QueryEngine(store, std::nullopt, true, store.padded_dim());
+  return QueryEngine(store, std::nullopt, true, store.input_dim());
 }
 
 void QueryEngine::prepare_into(PreparedQuery& out, std::span<const float> query) const {
@@ -256,9 +302,9 @@ PreparedQuery QueryEngine::prepare(std::span<const float> query) const {
 
 std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared,
                                                    const QueryParams& params) const {
-  const std::size_t l0_bits = quantize::l0_bits_per_vector(store_.padded_dim());
+  const std::size_t l0_bits = quantize::l0_bits_per_vector(store_.srht_dim());
   TopKHits topk(params.k, l0_bits);
-  search_store(store_, prepared, topk);
+  search_with_probe(store_, prepared, params, topk);
   return topk.finalize();
 }
 

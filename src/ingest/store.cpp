@@ -7,6 +7,18 @@
 
 namespace vectorcache::ingest {
 
+namespace {
+
+std::size_t next_pow2(std::size_t n) {
+  std::size_t p = 1;
+  while (p < n) {
+    p <<= 1;
+  }
+  return p;
+}
+
+}  // namespace
+
 ParentGroup::ParentGroup(std::size_t l0_words_per_vec) : l0_words_per_vec_(l0_words_per_vec) {
   if (l0_words_per_vec_ == 0) {
     throw Error("ParentGroup requires l0_words_per_vec > 0");
@@ -36,73 +48,154 @@ void ParentGroup::push(std::size_t id, std::span<const std::uint64_t> l0) {
   ids_.push_back(id);
 }
 
-ParentStore::ParentStore(std::size_t l0_words_per_vec, std::size_t padded_dim)
-    : l0_words_per_vec_(l0_words_per_vec), padded_dim_(padded_dim) {
-  if (l0_words_per_vec_ == 0 || padded_dim_ == 0) {
+ParentStore::ParentStore(std::size_t l0_words_per_vec, std::size_t input_dim, std::size_t srht_dim,
+                         std::size_t top_d)
+    : l0_words_per_vec_(l0_words_per_vec),
+      input_dim_(input_dim),
+      srht_dim_(srht_dim),
+      top_d_(top_d) {
+  if (l0_words_per_vec_ == 0 || input_dim_ == 0 || srht_dim_ == 0) {
     throw Error("ParentStore dimensions must be > 0");
   }
-  if (padded_dim_ % quantize::PARENT_GROUPS != 0) {
-    throw Error("ParentStore padded_dim must be divisible by 8");
+  if (top_d_ == 0 || top_d_ > quantize::kMaxSupportDepth) {
+    throw Error("ParentStore top_d out of range");
   }
-  if ((padded_dim_ / quantize::PARENT_GROUPS) < 2) {
-    throw Error("ParentStore padded_dim must yield chunk size >= 2 (dim >= 16 with 8 groups)");
+  if (top_d_ > input_dim_) {
+    throw Error("ParentStore top_d exceeds input_dim");
   }
-  by_key_.assign(kMaxParents, kInvalidGroup);
-  keys_.reserve(std::min(kMaxParents, std::size_t{4096}));
-  groups_.reserve(std::min(kMaxParents, std::size_t{4096}));
+  if (srht_dim_ < input_dim_) {
+    throw Error("ParentStore srht_dim must be >= input_dim");
+  }
+  slots_.assign(16, Slot{});
 }
 
-ParentStore ParentStore::with_capacity(std::size_t l0_words_per_vec, std::size_t padded_dim,
+ParentStore ParentStore::with_capacity(std::size_t l0_words_per_vec, std::size_t input_dim,
+                                       std::size_t srht_dim, std::size_t top_d,
                                        std::size_t vector_count) {
-  ParentStore store(l0_words_per_vec, padded_dim);
+  ParentStore store(l0_words_per_vec, input_dim, srht_dim, top_d);
   store.reserve_vectors(vector_count);
   return store;
 }
 
 void ParentStore::reserve_vectors(std::size_t vector_count) {
-  // Dual-fold multipost (~256×): expected postings per key ≈ vector_count / 256.
-  // /64 leaves headroom vs realloc under skew.
+  // Single posting: expect ~vector_count / few keys under moderate collision.
   reserve_hint_ = std::max<std::size_t>(1, vector_count / 64);
+  const std::size_t want_slots = next_pow2(std::max<std::size_t>(16, vector_count * 2));
+  if (want_slots > slots_.size()) {
+    rehash(want_slots);
+  }
   for (auto& group : groups_) {
     group.reserve(reserve_hint_);
   }
 }
 
-const ParentGroup* ParentStore::group_for_key(std::uint16_t key) const {
-  const std::size_t idx = by_key_[key];
-  if (idx == kInvalidGroup) {
+std::size_t ParentStore::probe_slot(const quantize::SupportKey& key) const {
+  const std::size_t mask = slots_.size() - 1;
+  std::size_t idx = static_cast<std::size_t>(quantize::support_key_hash(key)) & mask;
+  while (slot_occupied(slots_[idx])) {
+    if (slots_[idx].key == key) {
+      return idx;
+    }
+    idx = (idx + 1) & mask;
+  }
+  return idx;
+}
+
+void ParentStore::insert_mapping(const quantize::SupportKey& key, std::size_t group_idx) {
+  if ((map_size_ + 1) * 2 > slots_.size()) {
+    rehash(slots_.size() * 2);
+  }
+  const std::size_t idx = probe_slot(key);
+  if (!slot_occupied(slots_[idx])) {
+    slots_[idx].key = key;
+    slots_[idx].group_idx = group_idx;
+    ++map_size_;
+  } else {
+    slots_[idx].group_idx = group_idx;
+  }
+}
+
+void ParentStore::rehash(std::size_t new_cap) {
+  new_cap = next_pow2(std::max<std::size_t>(16, new_cap));
+  std::vector<Slot> old = std::move(slots_);
+  slots_.assign(new_cap, Slot{});
+  map_size_ = 0;
+  for (const Slot& s : old) {
+    if (!slot_occupied(s)) {
+      continue;
+    }
+    const std::size_t mask = slots_.size() - 1;
+    std::size_t idx = static_cast<std::size_t>(quantize::support_key_hash(s.key)) & mask;
+    while (slot_occupied(slots_[idx])) {
+      idx = (idx + 1) & mask;
+    }
+    slots_[idx] = s;
+    ++map_size_;
+  }
+}
+
+const ParentGroup* ParentStore::find(const quantize::SupportKey& key) const {
+  if (slots_.empty()) {
     return nullptr;
   }
-  return &groups_[idx];
+  const std::size_t mask = slots_.size() - 1;
+  std::size_t idx = static_cast<std::size_t>(quantize::support_key_hash(key)) & mask;
+  while (slot_occupied(slots_[idx])) {
+    if (slots_[idx].key == key) {
+      return &groups_[slots_[idx].group_idx];
+    }
+    idx = (idx + 1) & mask;
+  }
+  return nullptr;
 }
 
-void ParentStore::push_posting_unchecked(std::uint16_t parent_key,
-                                         std::span<const std::uint64_t> l0, std::size_t id) {
-  std::size_t idx = by_key_[parent_key];
-  if (idx == kInvalidGroup) {
-    idx = groups_.size();
-    by_key_[parent_key] = idx;
-    keys_.push_back(parent_key);
+const ParentGroup& ParentStore::group_at(std::size_t key_idx) const {
+  if (key_idx >= groups_.size()) {
+    throw Error("ParentStore::group_at index out of range");
+  }
+  return groups_[key_idx];
+}
+
+void ParentStore::push_vector(const quantize::SupportKey& key, std::span<const std::uint64_t> l0,
+                              std::size_t id) {
+  if (key.d != top_d_) {
+    throw Error("SupportKey depth mismatch with store top_d");
+  }
+  // Grow before probe so a single walk resolves empty-or-hit.
+  if ((map_size_ + 1) * 2 > slots_.size()) {
+    rehash(slots_.size() * 2);
+  }
+  const std::size_t idx = probe_slot(key);
+  std::size_t group_idx;
+  if (!slot_occupied(slots_[idx])) {
+    group_idx = groups_.size();
+    keys_.push_back(key);
     groups_.emplace_back(l0_words_per_vec_);
     if (reserve_hint_ > 0) {
-      groups_[idx].reserve(reserve_hint_);
+      groups_[group_idx].reserve(reserve_hint_);
     }
+    slots_[idx].key = key;
+    slots_[idx].group_idx = group_idx;
+    ++map_size_;
+  } else {
+    group_idx = slots_[idx].group_idx;
   }
-  groups_[idx].push(id, l0);
+  groups_[group_idx].push(id, l0);
+  ++total_vectors_;
+  invalidate_dim_postings();
 }
 
-void ParentStore::push_vector(std::uint16_t parent_key, std::span<const std::uint64_t> l0,
-                              std::size_t id) {
-  push_posting_unchecked(parent_key, l0, id);
-  ++total_vectors_;
+void ParentStore::invalidate_dim_postings() const {
+  dim_postings_.reset();
+  dim_postings_key_count_ = 0;
 }
 
-void ParentStore::push_postings(std::span<const std::uint16_t> keys,
-                                std::span<const std::uint64_t> l0, std::size_t id) {
-  for (const std::uint16_t key : keys) {
-    push_posting_unchecked(key, l0, id);
+const quantize::DimPostingIndex& ParentStore::dim_postings() const {
+  if (!dim_postings_ || dim_postings_key_count_ != keys_.size()) {
+    dim_postings_ = quantize::DimPostingIndex::build(keys_, input_dim_);
+    dim_postings_key_count_ = keys_.size();
   }
-  ++total_vectors_;
+  return *dim_postings_;
 }
 
 }  // namespace vectorcache::ingest

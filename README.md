@@ -1,8 +1,8 @@
 # VectorCache
 
-Parent-keyed multi-level quantized vector retrieval engine (C++20).
+Support-keyed quantized vector retrieval engine (C++20).
 
-VectorCache implements approximate nearest neighbor search via SRHT rotation, a **16-bit dual-fold parent key** (per chunk: high-D→2D projection onto all-ones and `(1,-1,0,…)` axes, then two perpendicular sign folds), and **1D→1bit (L0)** child codes. Each vector is multi-posted under **256** of **65536** parent arrays; query picks the stable fold per chunk for an **exact** parent lookup (no HD-1 expansion), then ranks L0 scores with a turbovec-style flat top-k (no full-f32 storage, no absolute score thresholds).
+VectorCache implements approximate nearest neighbor search via **top-d support keys** (sorted indices of the largest-magnitude coordinates on the true input dim), **SRHT** (zero-pad only for FWHT), and **1D→1bit (L0)** codes for ranking. Each vector is posted under **one** support key; query probes a Hamming ball around its key (HD 0→2→4), then ranks L0 scores with a turbovec-style flat top-k.
 
 ## Requirements
 
@@ -49,11 +49,11 @@ make login
 # On compute node (no internet):
 make compute DATASET=glove
 
-# Optional benchmark caps/extras:
+# Optional debug caps (smaller in-RAM index):
 make compute DATASET=glove BENCH_EXTRA_ARGS="--limit 50000"
 ```
 
-`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` against the required `DATASET` (e.g. `glove`, `openai-1536`, `openai-3072`).
+`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` against the required `DATASET` (e.g. `glove`, `openai-1536`, `openai-3072`). Indexes live entirely in `ParentStore` (RAM); queries probe support-key buckets and score L0 codes in memory.
 
 ## Build
 
@@ -123,7 +123,7 @@ Environment variables:
 
 ### ingest-bench
 
-Profile ingestion stage hot paths:
+Profile ingestion stage hot paths into an in-memory `ParentStore`:
 
 ```bash
 ./ingest-bench --dataset glove
@@ -131,6 +131,17 @@ Profile ingestion stage hot paths:
 ./ingest-bench --npy data/openai-1536.npy --limit 50000
 ```
 
+### query-bench
+
+Ingest into RAM, then search (support-key probe + L0 scoring):
+
+```bash
+./query-bench --dataset glove
+./query-bench --dataset glove --k 10
+```
+
+Environment variables:
+- `VECTORCACHE_DATASET` / `VECTORCACHE_DATA_DIR`
 ## Project layout
 
 ```

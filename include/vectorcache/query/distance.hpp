@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 namespace vectorcache::query {
@@ -17,10 +18,13 @@ void bit_agreement_batch(std::span<const std::uint64_t> query_words, std::size_t
 
 /// Same as bit_agreement_batch but writes XOR popcount (disagreement bit counts).
 /// Lower disagree is better; float score = (2*(num_bits-disagree) - num_bits) / num_bits.
-void bit_agreement_batch_disagree(std::span<const std::uint64_t> query_words,
-                                  std::size_t num_bits, std::span<const std::uint64_t> data_words,
-                                  std::size_t data_words_per_vec, std::size_t num_vectors,
-                                  std::span<std::uint32_t> out_disagree);
+/// If a partial popcount already exceeds reject_threshold, the row may early-exit with a
+/// disagree value > reject_threshold (exact value not required when rejected).
+void bit_agreement_batch_disagree(
+    std::span<const std::uint64_t> query_words, std::size_t num_bits,
+    std::span<const std::uint64_t> data_words, std::size_t data_words_per_vec,
+    std::size_t num_vectors, std::span<std::uint32_t> out_disagree,
+    std::uint32_t reject_threshold = std::numeric_limits<std::uint32_t>::max());
 
 /// Convert disagreement bit count to agreement score in [-1, 1].
 inline float score_from_disagree(std::uint32_t disagree, std::size_t num_bits) {

@@ -3,15 +3,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <vector>
 
 #include "vectorcache/aligned.hpp"
+#include "vectorcache/quantize/dim_postings.hpp"
 #include "vectorcache/quantize/quantize.hpp"
 
 namespace vectorcache::ingest {
 
-/// Contiguous L0 codes + explicit ids for one parent key.
+/// Contiguous L0 codes + explicit ids for one support key.
 class ParentGroup {
  public:
   explicit ParentGroup(std::size_t l0_words_per_vec);
@@ -33,45 +35,61 @@ class ParentGroup {
   std::vector<std::size_t> ids_;
 };
 
-/// Unique 16-bit dual-fold parent keys; each owns an L0 child group.
+/// Open-addressing map SupportKey → ParentGroup (single posting per vector).
 class ParentStore {
  public:
-  static constexpr std::size_t kMaxParents = quantize::PARENT_KEY_SPACE;
   static constexpr std::size_t kInvalidGroup = std::numeric_limits<std::size_t>::max();
 
-  ParentStore(std::size_t l0_words_per_vec, std::size_t padded_dim);
-  static ParentStore with_capacity(std::size_t l0_words_per_vec, std::size_t padded_dim,
+  ParentStore(std::size_t l0_words_per_vec, std::size_t input_dim, std::size_t srht_dim,
+              std::size_t top_d);
+  static ParentStore with_capacity(std::size_t l0_words_per_vec, std::size_t input_dim,
+                                   std::size_t srht_dim, std::size_t top_d,
                                    std::size_t vector_count);
 
   std::size_t l0_words_per_vec() const { return l0_words_per_vec_; }
-  std::size_t padded_dim() const { return padded_dim_; }
-  std::size_t unique_parent_count() const { return keys_.size(); }
-  /// Logical vectors ingested (not posting multiplicity).
+  std::size_t input_dim() const { return input_dim_; }
+  std::size_t srht_dim() const { return srht_dim_; }
+  std::size_t top_d() const { return top_d_; }
+  std::size_t unique_parent_count() const { return groups_.size(); }
   std::size_t total_vectors() const { return total_vectors_; }
 
-  std::span<const std::uint16_t> unique_keys() const { return keys_; }
-  const ParentGroup* group_for_key(std::uint16_t key) const;
+  std::span<const quantize::SupportKey> unique_keys() const { return keys_; }
+  const ParentGroup* find(const quantize::SupportKey& key) const;
+  /// Direct group lookup by key index (parallel to unique_keys()).
+  const ParentGroup& group_at(std::size_t key_idx) const;
+  const quantize::DimPostingIndex& dim_postings() const;
 
-  /// Post one (key, L0, id) and count as one logical vector.
-  void push_vector(std::uint16_t parent_key, std::span<const std::uint64_t> l0, std::size_t id);
-
-  /// Post L0 under many keys; increments total_vectors by one.
-  void push_postings(std::span<const std::uint16_t> keys, std::span<const std::uint64_t> l0,
-                     std::size_t id);
+  /// Post L0 under one support key; increments total_vectors by one.
+  void push_vector(const quantize::SupportKey& key, std::span<const std::uint64_t> l0,
+                   std::size_t id);
 
   void reserve_vectors(std::size_t vector_count);
 
  private:
-  void push_posting_unchecked(std::uint16_t parent_key, std::span<const std::uint64_t> l0,
-                              std::size_t id);
+  struct Slot {
+    quantize::SupportKey key{};
+    /// kInvalidGroup means empty slot (no separate occupied flag).
+    std::size_t group_idx = kInvalidGroup;
+  };
+
+  void rehash(std::size_t new_cap);
+  std::size_t probe_slot(const quantize::SupportKey& key) const;
+  void insert_mapping(const quantize::SupportKey& key, std::size_t group_idx);
+  void invalidate_dim_postings() const;
+  static bool slot_occupied(const Slot& s) { return s.group_idx != kInvalidGroup; }
 
   std::size_t l0_words_per_vec_;
-  std::size_t padded_dim_;
+  std::size_t input_dim_;
+  std::size_t srht_dim_;
+  std::size_t top_d_;
   std::size_t total_vectors_ = 0;
   std::size_t reserve_hint_ = 0;
-  AlignedVector<std::uint16_t> keys_;
-  std::vector<std::size_t> by_key_;
+  std::size_t map_size_ = 0;
+  std::vector<Slot> slots_;
+  std::vector<quantize::SupportKey> keys_;
   std::vector<ParentGroup> groups_;
+  mutable std::optional<quantize::DimPostingIndex> dim_postings_;
+  mutable std::size_t dim_postings_key_count_ = 0;
 };
 
 }  // namespace vectorcache::ingest

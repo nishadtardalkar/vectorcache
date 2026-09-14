@@ -1,11 +1,12 @@
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -52,7 +53,11 @@ class LimitedReader : public vectorcache::datasets::DatasetReader {
   LimitedReader(vectorcache::datasets::DatasetReader& inner, std::size_t remaining)
       : inner_(inner), remaining_(remaining) {}
 
-  vectorcache::datasets::DatasetMeta meta() const override { return inner_.meta(); }
+  vectorcache::datasets::DatasetMeta meta() const override {
+    auto m = inner_.meta();
+    m.count = std::min(m.count, remaining_);
+    return m;
+  }
 
   bool next_vector_into(std::span<float> out) override {
     if (remaining_ == 0) return false;
@@ -108,20 +113,21 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 }
 
 StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::size_t dim,
-                           std::size_t padded, std::uint64_t seed, std::size_t limit) {
+                           std::size_t srht_dim, std::uint64_t seed, std::size_t limit) {
+  constexpr std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
   const vectorcache::transform::SrhtRotation rotation(dim, seed);
-  const std::size_t l0_words = vectorcache::quantize::l0_words_per_vector(padded);
+  const std::size_t l0_words = vectorcache::quantize::l0_words_per_vector(srht_dim);
   const std::size_t batch_cap =
       std::min(vectorcache::ingest::INGEST_BATCH_SIZE, std::max(limit, std::size_t{1}));
 
   std::vector<float> read_buf(dim);
   std::vector<float> batch_inputs(batch_cap * dim);
-  std::vector<std::vector<float>> rotated(batch_cap, std::vector<float>(padded));
-  std::vector<std::array<std::uint16_t, vectorcache::quantize::PARENT_POSTINGS>> parents(
-      batch_cap);
+  std::vector<std::vector<float>> rotated(batch_cap, std::vector<float>(srht_dim));
+  std::vector<vectorcache::quantize::SupportKey> parents(batch_cap);
   std::vector<std::vector<std::uint64_t>> l0(batch_cap, std::vector<std::uint64_t>(l0_words));
 
-  auto store = vectorcache::ingest::ParentStore::with_capacity(l0_words, padded, limit);
+  auto store =
+      vectorcache::ingest::ParentStore::with_capacity(l0_words, dim, srht_dim, top_d, limit);
   StageTotals totals;
   std::size_t processed = 0;
 
@@ -147,15 +153,24 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
           batch_inputs.data() + static_cast<std::ptrdiff_t>(i * dim);
 
       std::memcpy(rotated[i].data(), input, dim * sizeof(float));
-      if (padded > dim) {
-        std::memset(rotated[i].data() + dim, 0, (padded - dim) * sizeof(float));
-      }
 
       const auto t_norm = std::chrono::steady_clock::now();
-      vectorcache::transform::l2_normalize_in_place(rotated[i]);
+      vectorcache::transform::l2_normalize_in_place(
+          std::span<float>(rotated[i].data(), dim));
       totals.normalize_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                t_norm)
+              .count());
+
+      const auto t_quant = std::chrono::steady_clock::now();
+      parents[i] = vectorcache::quantize::quantize_support_key(
+          std::span<const float>(rotated[i].data(), dim), top_d);
+      if (srht_dim > dim) {
+        std::memset(rotated[i].data() + dim, 0, (srht_dim - dim) * sizeof(float));
+      }
+      totals.quantize_ns += static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                               t_quant)
               .count());
 
       const auto t_srht = std::chrono::steady_clock::now();
@@ -165,16 +180,15 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
                                                                t_srht)
               .count());
 
-      const auto t_quant = std::chrono::steady_clock::now();
-      parents[i] = vectorcache::quantize::parent_posting_keys(rotated[i]);
+      const auto t_l0 = std::chrono::steady_clock::now();
       vectorcache::quantize::quantize_1dim_to_1bit_into(rotated[i], l0[i]);
       totals.quantize_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                                               t_quant)
+                                                               t_l0)
               .count());
 
       const auto t_store = std::chrono::steady_clock::now();
-      store.push_postings(parents[i], l0[i], processed + i);
+      store.push_vector(parents[i], l0[i], processed + i);
       totals.store_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                t_store)
@@ -191,7 +205,8 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
 std::uint64_t profile_engine(vectorcache::datasets::DatasetReader& reader, std::size_t dim,
                              std::uint64_t seed, std::size_t limit) {
   LimitedReader limited(reader, limit);
-  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed);
+  constexpr std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
+  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, top_d);
   engine.reserve_vectors(limit);
   const auto start = std::chrono::steady_clock::now();
   const auto report = engine.ingest(limited);
@@ -219,8 +234,8 @@ void print_stage_report(const std::string& label, const StageTotals& stages) {
       {"batch copy (engine-style to_vec)", stages.batch_copy_ns},
       {"L2 normalize", stages.normalize_ns},
       {kSrhtStageLabel, stages.srht_ns},
-      {"parent+L0 quantize", stages.quantize_ns},
-      {"store (push_vector)", stages.store_ns},
+      {"support+L0 quantize", stages.quantize_ns},
+      {"store (ParentStore push_vector)", stages.store_ns},
   };
 
   std::cout << "  " << std::left << std::setw(34) << "stage" << std::right << std::setw(12)
@@ -241,7 +256,7 @@ void print_wall_report(std::uint64_t wall_ns, std::size_t vectors, const StageTo
   const double v = std::max(vectors, std::size_t{1});
   const std::uint64_t seq_total = stages.total_ns();
 
-  std::cout << "Engine ingest (release)\n";
+  std::cout << "Engine ingest (in-memory ParentStore)\n";
   std::cout << "  wall:    " << vectorcache::ingest::TimingSummary::format_duration(wall_ns)
             << " (" << wall_ns << " ns)\n";
   std::cout << "  per-vec: "
@@ -264,7 +279,7 @@ void print_wall_report(std::uint64_t wall_ns, std::size_t vectors, const StageTo
       {"parent+L0 quantize", stages.quantize_ns},
       {"read I/O", stages.read_ns},
       {"L2 normalize", stages.normalize_ns},
-      {"store", stages.store_ns},
+      {"store (ParentStore)", stages.store_ns},
   };
   std::sort(ranked.begin(), ranked.end(),
             [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -311,7 +326,7 @@ int main(int argc, char** argv) {
     }
 
     const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
-    std::cout << "Ingest bench: " << source_label << " (dim=" << meta.dim << ", padded=" << padded
+    std::cout << "Ingest bench: " << source_label << " (dim=" << meta.dim << ", srht_dim=" << padded
               << ", vectors=" << actual_limit
               << ", srht_rounds=" << vectorcache::transform::srht_rounds() << ")\n";
     if (limit && *limit < meta.count) {

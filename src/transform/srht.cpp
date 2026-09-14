@@ -27,34 +27,34 @@ bool use_stockham(std::size_t n) { return n == 256 || n == 2048 || n == 4096; }
 
 SrhtRotation::SrhtRotation(std::size_t original_dim, std::uint64_t seed)
     : original_dim_(original_dim),
-      padded_dim_(vectorcache::transform::padded_dim(original_dim)),
-      inv_sqrt_n_(1.0f / std::sqrt(static_cast<float>(padded_dim_))) {
+      srht_dim_(vectorcache::transform::padded_dim(original_dim)),
+      inv_sqrt_n_(1.0f / std::sqrt(static_cast<float>(srht_dim_))) {
   if (original_dim == 0) {
     throw Error("original_dim must be > 0");
   }
   std::mt19937_64 rng(seed);
 #if VECTORCACHE_SRHT_ROUNDS >= 1
-  signs1_ = rademacher_i8(rng, padded_dim_);
+  signs1_ = rademacher_i8(rng, srht_dim_);
 #endif
 #if VECTORCACHE_SRHT_ROUNDS >= 2
-  signs2_ = rademacher_i8(rng, padded_dim_);
+  signs2_ = rademacher_i8(rng, srht_dim_);
 #endif
 #if VECTORCACHE_SRHT_ROUNDS >= 3
-  signs3_ = rademacher_i8(rng, padded_dim_);
+  signs3_ = rademacher_i8(rng, srht_dim_);
 #endif
 }
 
 AlignedVector<float>& SrhtRotation::fwht_scratch() const {
   thread_local AlignedVector<float> scratch;
-  if (scratch.size() != padded_dim_) {
-    scratch.assign(padded_dim_, 0.0f);
+  if (scratch.size() != srht_dim_) {
+    scratch.assign(srht_dim_, 0.0f);
   }
   return scratch;
 }
 
 void SrhtRotation::apply_rounds(std::span<float> buf) const {
   const auto fwht = [this](std::span<float> span) {
-    if (use_stockham(padded_dim_)) {
+    if (use_stockham(srht_dim_)) {
       fwht_stockham_orthonormal_in_place(span, fwht_scratch(), inv_sqrt_n_);
     } else {
       fwht_orthonormal_in_place(span, inv_sqrt_n_);
@@ -80,22 +80,22 @@ void SrhtRotation::apply(std::span<const float> vector, std::span<float> out) co
     throw Error("vector dimension mismatch: expected " + std::to_string(original_dim_) +
                 ", got " + std::to_string(vector.size()));
   }
-  if (out.size() != padded_dim_) {
-    throw Error("output buffer dimension mismatch: expected " + std::to_string(padded_dim_) +
+  if (out.size() != srht_dim_) {
+    throw Error("output buffer dimension mismatch: expected " + std::to_string(srht_dim_) +
                 ", got " + std::to_string(out.size()));
   }
 
   std::memcpy(out.data(), vector.data(), original_dim_ * sizeof(float));
-  if (padded_dim_ > original_dim_) {
-    std::memset(out.data() + original_dim_, 0, (padded_dim_ - original_dim_) * sizeof(float));
+  if (srht_dim_ > original_dim_) {
+    std::memset(out.data() + original_dim_, 0, (srht_dim_ - original_dim_) * sizeof(float));
   }
 
   apply_rounds(out);
 }
 
 void SrhtRotation::apply_in_place(std::span<float> buf) const {
-  if (buf.size() != padded_dim_) {
-    throw Error("buffer dimension mismatch: expected " + std::to_string(padded_dim_) + ", got " +
+  if (buf.size() != srht_dim_) {
+    throw Error("buffer dimension mismatch: expected " + std::to_string(srht_dim_) + ", got " +
                 std::to_string(buf.size()));
   }
   apply_rounds(buf);

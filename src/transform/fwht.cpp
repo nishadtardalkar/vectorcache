@@ -372,14 +372,24 @@ void fwht_stockham_orthonormal_in_place(std::span<float> buf, std::span<float> s
 void apply_signs_i8(std::span<float> buf, std::span<const std::int8_t> signs) {
   const std::size_t len = buf.size();
   const __m512 zero = _mm512_setzero_ps();
+  const bool aligned = is_aligned64(buf.data()) && is_aligned64(signs.data());
   std::size_t i = 0;
-  while (i + simd::kWidth <= len) {
-    const __m128i sign_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(signs.data() + i));
-    const __m512i sign_i32 = _mm512_cvtepi8_epi32(sign_bytes);
-    const __mmask16 neg = _mm512_cmplt_epi32_mask(sign_i32, _mm512_setzero_si512());
-    const __m512 v = _mm512_loadu_ps(buf.data() + i);
-    _mm512_storeu_ps(buf.data() + i, _mm512_mask_sub_ps(v, neg, zero, v));
-    i += simd::kWidth;
+  if (aligned) {
+    for (; i + simd::kWidth <= len; i += simd::kWidth) {
+      const __m128i sign_bytes = _mm_load_si128(reinterpret_cast<const __m128i*>(signs.data() + i));
+      const __m512i sign_i32 = _mm512_cvtepi8_epi32(sign_bytes);
+      const __mmask16 neg = _mm512_cmplt_epi32_mask(sign_i32, _mm512_setzero_si512());
+      const __m512 v = _mm512_load_ps(buf.data() + i);
+      _mm512_store_ps(buf.data() + i, _mm512_mask_sub_ps(v, neg, zero, v));
+    }
+  } else {
+    for (; i + simd::kWidth <= len; i += simd::kWidth) {
+      const __m128i sign_bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(signs.data() + i));
+      const __m512i sign_i32 = _mm512_cvtepi8_epi32(sign_bytes);
+      const __mmask16 neg = _mm512_cmplt_epi32_mask(sign_i32, _mm512_setzero_si512());
+      const __m512 v = _mm512_loadu_ps(buf.data() + i);
+      _mm512_storeu_ps(buf.data() + i, _mm512_mask_sub_ps(v, neg, zero, v));
+    }
   }
   if (i < len) {
     const __mmask16 mask = simd::tail_mask(len - i);
