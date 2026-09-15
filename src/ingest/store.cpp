@@ -78,14 +78,11 @@ ParentStore ParentStore::with_capacity(std::size_t l0_words_per_vec, std::size_t
 }
 
 void ParentStore::reserve_vectors(std::size_t vector_count) {
-  // Single posting: expect ~vector_count / few keys under moderate collision.
-  reserve_hint_ = std::max<std::size_t>(1, vector_count / 64);
+  // Pre-size only the open-address map. ParentGroup storage grows in push() when
+  // a vector is posted under that key (top-d keys are often near-unique / O(N)).
   const std::size_t want_slots = next_pow2(std::max<std::size_t>(16, vector_count * 2));
   if (want_slots > slots_.size()) {
     rehash(want_slots);
-  }
-  for (auto& group : groups_) {
-    group.reserve(reserve_hint_);
   }
 }
 
@@ -171,9 +168,6 @@ void ParentStore::push_vector(const quantize::SupportKey& key, std::span<const s
     group_idx = groups_.size();
     keys_.push_back(key);
     groups_.emplace_back(l0_words_per_vec_);
-    if (reserve_hint_ > 0) {
-      groups_[group_idx].reserve(reserve_hint_);
-    }
     slots_[idx].key = key;
     slots_[idx].group_idx = group_idx;
     ++map_size_;

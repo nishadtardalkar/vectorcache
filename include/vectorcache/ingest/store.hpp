@@ -83,7 +83,6 @@ class ParentStore {
   std::size_t srht_dim_;
   std::size_t top_d_;
   std::size_t total_vectors_ = 0;
-  std::size_t reserve_hint_ = 0;
   std::size_t map_size_ = 0;
   std::vector<Slot> slots_;
   std::vector<quantize::SupportKey> keys_;
