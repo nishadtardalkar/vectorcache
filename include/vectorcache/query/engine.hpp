@@ -9,6 +9,7 @@
 #include "vectorcache/aligned.hpp"
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/quantize/quantize.hpp"
+#include "vectorcache/query/fastscan.hpp"
 #include "vectorcache/transform/srht.hpp"
 
 namespace vectorcache::query {
@@ -40,15 +41,22 @@ class QueryEngine {
 
   const quantize::LloydMaxCodebook& codebook() const { return codebook_; }
 
+  /// Ensure FastScan blocked cache matches current store size (also done lazily on search).
+  void prepare_index() const;
+
  private:
   QueryEngine(const ingest::VectorStore& store, std::optional<transform::SrhtRotation> rotation,
               bool query_is_rotated, std::size_t input_dim, quantize::LloydMaxCodebook codebook);
+
+  const BlockedCodes& blocked_codes() const;
 
   const ingest::VectorStore& store_;
   std::optional<transform::SrhtRotation> rotation_;
   bool query_is_rotated_;
   std::size_t input_dim_;
   quantize::LloydMaxCodebook codebook_;
+  mutable BlockedCodes blocked_;
+  mutable std::size_t blocked_n_ = 0;
 };
 
 }  // namespace vectorcache::query

@@ -74,10 +74,13 @@ ctest --output-on-failure
 | `VECTORCACHE_BUILD_GLOVE` | ON | Enable GloVe HDF5 reader |
 | `VECTORCACHE_BUILD_TOOLS` | ON | Build CLI tools (requires curl + Arrow) |
 | `VECTORCACHE_BUILD_TESTS` | ON | Build GoogleTest suite |
+| `VECTORCACHE_OPENMP` | ON | Parallel ingest batches and query scan (≥~32K vectors) |
 
 ### SIMD
 
-The library requires AVX-512F/DQ/BW/VL + VPOPCNTDQ. GCC/Clang builds use `-mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vpopcntdq -mfma`; MSVC uses `/arch:AVX512`. There are no scalar fallbacks.
+The library requires AVX-512F/DQ/BW/VL/VBMI/VNNI + VPOPCNTDQ. GCC/Clang builds use `-mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vpopcntdq -mavx512vbmi -mavx512vnni -mfma`; MSVC uses `/arch:AVX512` (with VBMI/VNNI macros forced). There are no scalar fallbacks.
+
+Query scoring uses a FastScan-style `BLOCK=32` code cache (see `ALGORITHM.md`): bits=1 transposed mask-add, bits=4 nibble permute LUTs, and OpenMP over blocks when the corpus is large enough.
 
 For maximum single-node performance on homogeneous clusters:
 

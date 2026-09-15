@@ -34,7 +34,16 @@ Asymmetric inner product in rotated space with length renormalization:
 
 Higher is better. Same path for all `n`.
 
-For byte-aligned widths (`n ∈ {1,2,4,8}`), search builds exact float query LUTs (one 256-entry table per packed byte-group). For `n = 1`, scoring uses an AVX-512 mask-add kernel over per-dim deltas (`score = base + Σ_{bit i set} Δ_i`) with 4-way row interleave. Other byte-aligned widths use vector-major LUT lookup. Odd widths fall back to scalar unpack + MAC. The math is unchanged; `α` is applied after the LUT/scalar score.
+For byte-aligned widths (`n ∈ {1,2,4,8}`), search builds exact float query LUTs (one 256-entry table per packed byte-group) and scores from a **FAISS FastScan-style blocked cache** (`BLOCK=32`: for each byte-group, 32 vectors’ bytes are contiguous). Canonical ingest storage remains vector-major packed codes; the blocked view is rebuilt lazily on search (or via `QueryEngine::prepare_index()`).
+
+| bits | Hot path |
+|------|----------|
+| 1 | Transposed u64 columns + AVX-512 mask-add (`score = base + Σ_{bit i set} Δ_i`), 4-way interleave within each block |
+| 4 | Nibble-split float LUTs + `_mm512_permutexvar_ps` (exact) |
+| 2 / 8 | Blocked float LUT lookup across 32 lanes |
+| odd | Scalar unpack + MAC (no blocked cache) |
+
+With `VECTORCACHE_OPENMP`, the block loop parallelizes when `n_blocks ≥ 1024` (~32K vectors) **and** `omp_get_max_threads() > 1`: per-thread top-k then merge. Single-thread / smaller corpora use the existing vector-major LUT/mask-add kernels (blocked layout is still built for bits=1 mask-add when `dim % 64 == 0`). The math is unchanged; `α` is applied after the block score.
 
 ## Query knobs (`QueryParams`)
 
@@ -51,4 +60,4 @@ Runtime bits-per-dim is set at ingest (`IngestionEngine` / `--bits` / `BITS`) an
 | Quantize | `include/vectorcache/quantize/quantize.hpp`, `src/quantize/quantize.cpp` |
 | Rotation | `include/vectorcache/transform/srht.hpp`, `src/transform/srht.cpp` |
 | Store | `include/vectorcache/ingest/store.hpp`, `src/ingest/store.cpp` |
-| Query | `src/query/engine.cpp`, `src/query/distance.cpp` |
+| Query | `src/query/engine.cpp`, `src/query/distance.cpp`, `src/query/fastscan.cpp` |

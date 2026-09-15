@@ -12,7 +12,7 @@ option(VECTORCACHE_BUILD_TESTS "Build tests" ON)
 option(VECTORCACHE_FETCH_DATASETS "Build fetch-datasets (requires libcurl)" ON)
 option(VECTORCACHE_FETCH_OPENAI "Download/convert OpenAI parquet shards (requires Arrow)" ON)
 
-option(VECTORCACHE_OPENMP "Enable OpenMP parallel ingest batch" ON)
+option(VECTORCACHE_OPENMP "Enable OpenMP parallel ingest + query scan" ON)
 
 set(VECTORCACHE_SRHT_ROUNDS 2 CACHE STRING "Compile-time SRHT round count (1, 2, or 3); TurboVec uses 2")
 set_property(CACHE VECTORCACHE_SRHT_ROUNDS PROPERTY STRINGS 1 2 3)
@@ -21,11 +21,13 @@ if(NOT VECTORCACHE_SRHT_ROUNDS MATCHES "^[123]$")
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vpopcntdq -mfma)
+  add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vpopcntdq
+                      -mavx512vbmi -mavx512vnni -mfma)
 elseif(MSVC)
   # /arch:AVX512 does not define __AVX512VPOPCNTDQ__; force it so _mm512_popcnt_epi64 is used.
+  # VBMI/VNNI macros are not always set by MSVC; define them for FastScan kernels.
   add_compile_options(/arch:AVX512)
-  add_compile_definitions(__AVX512VPOPCNTDQ__=1)
+  add_compile_definitions(__AVX512VPOPCNTDQ__=1 __AVX512VBMI__=1 __AVX512VNNI__=1)
 endif()
 
 include(FetchContent)
@@ -47,6 +49,7 @@ set(VECTORCACHE_SOURCES
   src/ingest/timing.cpp
   src/ingest/engine.cpp
   src/query/distance.cpp
+  src/query/fastscan.cpp
   src/query/engine.cpp
   src/datasets/npy.cpp
   src/datasets/sample.cpp
@@ -166,6 +169,7 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_store.cpp
     tests/test_engine.cpp
     tests/test_query.cpp
+    tests/test_fastscan.cpp
     tests/test_sample.cpp
     tests/test_npy.cpp
   )

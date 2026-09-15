@@ -1,9 +1,11 @@
 #include "vectorcache/query/distance.hpp"
 
+#include <cstring>
 #include <utility>
 
 #include "vectorcache/error.hpp"
 #include "vectorcache/quantize/quantize.hpp"
+#include "vectorcache/query/fastscan.hpp"
 #include "vectorcache/simd.hpp"
 
 namespace vectorcache::query {
@@ -317,6 +319,214 @@ void asymmetric_ip_batch_lut(const QueryLut& lut, std::span<const std::uint64_t>
   const auto* bytes = reinterpret_cast<const std::uint8_t*>(data_words.data());
   const std::size_t bytes_per_vec = data_words_per_vec * sizeof(std::uint64_t);
   score_lut_batch(lut, bytes, bytes_per_vec, num_vectors, out_scores);
+}
+
+namespace {
+
+/// Score one block via transposed bits=1 mask-add (shared delta loads).
+/// Accumulates across all words in SIMD registers before one reduce (matches vector-major).
+void score_blocked_bit1(const QueryLut& lut, const BlockedCodes& blocked, std::size_t block,
+                        std::span<float> out_scores) {
+  const std::size_t count = blocked.block_count(block);
+  const float* delta = lut.bit1_delta();
+  const float base = lut.bit1_base();
+  const std::size_t dim = lut.dim();
+  const std::size_t words = blocked.words_per_vec();
+
+  std::size_t vin = 0;
+  for (; vin + 4 <= count; vin += 4) {
+    __m512 a0 = _mm512_setzero_ps();
+    __m512 a1 = _mm512_setzero_ps();
+    __m512 b0 = _mm512_setzero_ps();
+    __m512 b1 = _mm512_setzero_ps();
+    __m512 c0 = _mm512_setzero_ps();
+    __m512 c1 = _mm512_setzero_ps();
+    __m512 d0 = _mm512_setzero_ps();
+    __m512 d1 = _mm512_setzero_ps();
+
+    std::size_t off = 0;
+    for (std::size_t word_i = 0; word_i < words && off + 64 <= dim; ++word_i, off += 64) {
+      const std::uint64_t* col = blocked.bit1_word_column(block, word_i);
+      const std::uint64_t w0 = col[vin + 0];
+      const std::uint64_t w1 = col[vin + 1];
+      const std::uint64_t w2 = col[vin + 2];
+      const std::uint64_t w3 = col[vin + 3];
+      const __m512 v0 = _mm512_loadu_ps(delta + off);
+      const __m512 v1 = _mm512_loadu_ps(delta + off + 16);
+      const __m512 v2 = _mm512_loadu_ps(delta + off + 32);
+      const __m512 v3 = _mm512_loadu_ps(delta + off + 48);
+
+      a0 = _mm512_mask_add_ps(a0, static_cast<__mmask16>(w0 & 0xFFFFu), a0, v0);
+      b0 = _mm512_mask_add_ps(b0, static_cast<__mmask16>(w1 & 0xFFFFu), b0, v0);
+      c0 = _mm512_mask_add_ps(c0, static_cast<__mmask16>(w2 & 0xFFFFu), c0, v0);
+      d0 = _mm512_mask_add_ps(d0, static_cast<__mmask16>(w3 & 0xFFFFu), d0, v0);
+
+      a1 = _mm512_mask_add_ps(a1, static_cast<__mmask16>((w0 >> 16) & 0xFFFFu), a1, v1);
+      b1 = _mm512_mask_add_ps(b1, static_cast<__mmask16>((w1 >> 16) & 0xFFFFu), b1, v1);
+      c1 = _mm512_mask_add_ps(c1, static_cast<__mmask16>((w2 >> 16) & 0xFFFFu), c1, v1);
+      d1 = _mm512_mask_add_ps(d1, static_cast<__mmask16>((w3 >> 16) & 0xFFFFu), d1, v1);
+
+      a0 = _mm512_mask_add_ps(a0, static_cast<__mmask16>((w0 >> 32) & 0xFFFFu), a0, v2);
+      b0 = _mm512_mask_add_ps(b0, static_cast<__mmask16>((w1 >> 32) & 0xFFFFu), b0, v2);
+      c0 = _mm512_mask_add_ps(c0, static_cast<__mmask16>((w2 >> 32) & 0xFFFFu), c0, v2);
+      d0 = _mm512_mask_add_ps(d0, static_cast<__mmask16>((w3 >> 32) & 0xFFFFu), d0, v2);
+
+      a1 = _mm512_mask_add_ps(a1, static_cast<__mmask16>((w0 >> 48) & 0xFFFFu), a1, v3);
+      b1 = _mm512_mask_add_ps(b1, static_cast<__mmask16>((w1 >> 48) & 0xFFFFu), b1, v3);
+      c1 = _mm512_mask_add_ps(c1, static_cast<__mmask16>((w2 >> 48) & 0xFFFFu), c1, v3);
+      d1 = _mm512_mask_add_ps(d1, static_cast<__mmask16>((w3 >> 48) & 0xFFFFu), d1, v3);
+    }
+
+    out_scores[vin + 0] = base + _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
+    out_scores[vin + 1] = base + _mm512_reduce_add_ps(_mm512_add_ps(b0, b1));
+    out_scores[vin + 2] = base + _mm512_reduce_add_ps(_mm512_add_ps(c0, c1));
+    out_scores[vin + 3] = base + _mm512_reduce_add_ps(_mm512_add_ps(d0, d1));
+  }
+  for (; vin < count; ++vin) {
+    __m512 a0 = _mm512_setzero_ps();
+    __m512 a1 = _mm512_setzero_ps();
+    std::size_t off = 0;
+    for (std::size_t word_i = 0; word_i < words && off + 64 <= dim; ++word_i, off += 64) {
+      const std::uint64_t w = blocked.bit1_word_column(block, word_i)[vin];
+      const __m512 v0 = _mm512_loadu_ps(delta + off);
+      const __m512 v1 = _mm512_loadu_ps(delta + off + 16);
+      const __m512 v2 = _mm512_loadu_ps(delta + off + 32);
+      const __m512 v3 = _mm512_loadu_ps(delta + off + 48);
+      a0 = _mm512_mask_add_ps(a0, static_cast<__mmask16>(w & 0xFFFFu), a0, v0);
+      a1 = _mm512_mask_add_ps(a1, static_cast<__mmask16>((w >> 16) & 0xFFFFu), a1, v1);
+      a0 = _mm512_mask_add_ps(a0, static_cast<__mmask16>((w >> 32) & 0xFFFFu), a0, v2);
+      a1 = _mm512_mask_add_ps(a1, static_cast<__mmask16>((w >> 48) & 0xFFFFu), a1, v3);
+    }
+    out_scores[vin] = base + _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
+  }
+}
+
+/// Blocked float LUT: for each byte-group, accumulate lut[g][byte_v] across kBlock lanes.
+void score_blocked_float_lut(const QueryLut& lut, const BlockedCodes& blocked, std::size_t block,
+                             std::span<float> out_scores) {
+  const std::size_t count = blocked.block_count(block);
+  const std::size_t groups = lut.num_groups();
+  alignas(64) float acc[BlockedCodes::kBlock] = {};
+
+  for (std::size_t g = 0; g < groups; ++g) {
+    const std::uint8_t* codes = blocked.group_bytes(block, g);
+    const float* table = lut.table(g);
+#if defined(_MSC_VER)
+    if (g + 1 < groups) {
+      _mm_prefetch(reinterpret_cast<const char*>(blocked.group_bytes(block, g + 1)), _MM_HINT_T0);
+    }
+#else
+    if (g + 1 < groups) {
+      __builtin_prefetch(blocked.group_bytes(block, g + 1), 0, 3);
+    }
+#endif
+    std::size_t v = 0;
+    for (; v + 4 <= count; v += 4) {
+      acc[v + 0] += table[codes[v + 0]];
+      acc[v + 1] += table[codes[v + 1]];
+      acc[v + 2] += table[codes[v + 2]];
+      acc[v + 3] += table[codes[v + 3]];
+    }
+    for (; v < count; ++v) {
+      acc[v] += table[codes[v]];
+    }
+  }
+  std::memcpy(out_scores.data(), acc, count * sizeof(float));
+}
+
+/// Peel additive 4-bit pair tables: L(n)+H(m) = table[(m<<4)|n] (exact).
+void peel_nibble4_tables(const float* table, float* lo, float* hi) {
+  const float t0 = table[0];
+  lo[0] = 0.0f;
+  hi[0] = t0;
+  for (std::size_t n = 1; n < 16; ++n) {
+    lo[n] = table[n] - t0;
+    hi[n] = table[n << 4];
+  }
+}
+
+/// bits=4 FastScan: nibble-split float LUTs + AVX-512 permute (exact).
+void score_blocked_nibble4(const QueryLut& lut, const BlockedCodes& blocked, std::size_t block,
+                           std::span<float> out_scores) {
+  const std::size_t count = blocked.block_count(block);
+  const std::size_t groups = lut.num_groups();
+  alignas(64) float acc[BlockedCodes::kBlock] = {};
+  alignas(64) float lo[16];
+  alignas(64) float hi[16];
+
+  for (std::size_t g = 0; g < groups; ++g) {
+    peel_nibble4_tables(lut.table(g), lo, hi);
+    const std::uint8_t* codes = blocked.group_bytes(block, g);
+    const __m512 lut_lo = _mm512_load_ps(lo);
+    const __m512 lut_hi = _mm512_load_ps(hi);
+
+    std::size_t v = 0;
+    for (; v + 16 <= count; v += 16) {
+      alignas(64) std::uint32_t idx_lo[16];
+      alignas(64) std::uint32_t idx_hi[16];
+      for (std::size_t i = 0; i < 16; ++i) {
+        const std::uint8_t b = codes[v + i];
+        idx_lo[i] = b & 0x0Fu;
+        idx_hi[i] = b >> 4;
+      }
+      const __m512i ilo = _mm512_load_si512(idx_lo);
+      const __m512i ihi = _mm512_load_si512(idx_hi);
+      const __m512 vlo = _mm512_permutexvar_ps(ilo, lut_lo);
+      const __m512 vhi = _mm512_permutexvar_ps(ihi, lut_hi);
+      __m512 vacc = _mm512_loadu_ps(acc + v);
+      vacc = _mm512_add_ps(vacc, _mm512_add_ps(vlo, vhi));
+      _mm512_storeu_ps(acc + v, vacc);
+    }
+    for (; v < count; ++v) {
+      const std::uint8_t b = codes[v];
+      acc[v] += lo[b & 0x0F] + hi[b >> 4];
+    }
+  }
+  std::memcpy(out_scores.data(), acc, count * sizeof(float));
+}
+
+/// bits=2/8: blocked float LUT (exact).
+void score_blocked_nibble2(const QueryLut& lut, const BlockedCodes& blocked, std::size_t block,
+                           std::span<float> out_scores) {
+  score_blocked_float_lut(lut, blocked, block, out_scores);
+}
+
+}  // namespace
+
+void score_blocked_batch(const QueryLut& lut, const BlockedCodes& blocked, std::size_t block,
+                         std::span<float> out_scores) {
+  if (lut.empty() || blocked.empty()) {
+    throw Error("score_blocked_batch: empty lut or blocked codes");
+  }
+  if (block >= blocked.n_blocks()) {
+    throw Error("score_blocked_batch: block out of range");
+  }
+  const std::size_t count = blocked.block_count(block);
+  if (out_scores.size() < count) {
+    throw Error("score_blocked_batch: out_scores too small");
+  }
+
+  if (lut.has_bit1_deltas() && blocked.has_bit1_words() && lut.bits() == 1) {
+    score_blocked_bit1(lut, blocked, block, out_scores);
+    return;
+  }
+
+  if (lut.bits() == 4 && blocked.bits() == 4 && lut.num_groups() == blocked.num_groups()) {
+    score_blocked_nibble4(lut, blocked, block, out_scores);
+    return;
+  }
+
+  if (lut.bits() == 2 && blocked.bits() == 2 && lut.num_groups() == blocked.num_groups()) {
+    score_blocked_nibble2(lut, blocked, block, out_scores);
+    return;
+  }
+
+  if (lut.bits() == blocked.bits() && lut.num_groups() == blocked.num_groups()) {
+    score_blocked_float_lut(lut, blocked, block, out_scores);
+    return;
+  }
+
+  throw Error("score_blocked_batch: unsupported lut/blocked combination");
 }
 
 }  // namespace vectorcache::query

@@ -8,15 +8,21 @@
 #include "vectorcache/error.hpp"
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/query/distance.hpp"
+#include "vectorcache/query/fastscan.hpp"
 #include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/transform/normalize.hpp"
+
+#if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
+#include <omp.h>
+#endif
 
 namespace vectorcache::query {
 
 namespace {
 
 constexpr std::size_t kHeapTopKThreshold = 32;
-constexpr std::size_t kScoreChunk = 512;
+/// Parallelize when corpus has at least this many FastScan blocks (~32K vectors).
+constexpr std::size_t kParallelMinBlocks = 1024;
 
 class TopKHits {
  public:
@@ -73,6 +79,18 @@ class TopKHits {
     }
   }
 
+  void merge_from(const TopKHits& other) {
+    if (other.use_heap_) {
+      for (const auto& hit : other.heap_) {
+        push(hit.id, hit.score);
+      }
+      return;
+    }
+    for (std::size_t i = 0; i < other.size_; ++i) {
+      push(other.ids_[i], other.scores_[i]);
+    }
+  }
+
   std::vector<QueryHit> finalize() const {
     std::vector<QueryHit> out;
     if (use_heap_) {
@@ -101,12 +119,11 @@ class TopKHits {
     std::size_t id;
   };
 
-  /// Max-heap of the worst (lowest) scores among the current top-k.
   static bool heap_worse(const HeapHit& a, const HeapHit& b) {
     if (a.score != b.score) {
-      return a.score > b.score;  // better (higher) score is "less"
+      return a.score > b.score;
     }
-    return a.id < b.id;  // smaller id is better when scores tie
+    return a.id < b.id;
   }
 
   void push_heap(std::size_t id, float score) {
@@ -144,13 +161,33 @@ class TopKHits {
   std::vector<HeapHit> heap_;
 };
 
-void search_flat(const ingest::VectorStore& store, const PreparedQuery& query,
-                 const quantize::LloydMaxCodebook& codebook, TopKHits& topk) {
-  const std::size_t n = store.size();
-  if (n == 0) {
+void score_block_into_topk(const BlockedCodes& blocked, const QueryLut& lut,
+                           const ingest::VectorStore& store, std::size_t block, TopKHits& topk) {
+  const std::size_t count = blocked.block_count(block);
+  if (count == 0) {
     return;
   }
+  alignas(64) float score_buf[BlockedCodes::kBlock];
+  score_blocked_batch(lut, blocked, block, std::span<float>(score_buf, count));
 
+  const auto ids = store.ids();
+  const auto scales = store.scales();
+  const std::size_t base = block * BlockedCodes::kBlock;
+  float threshold = topk.reject_threshold();
+  for (std::size_t i = 0; i < count; ++i) {
+    const float score = score_buf[i] * scales[base + i];
+    if (score < threshold) {
+      continue;
+    }
+    topk.push(ids[base + i], score);
+    threshold = topk.reject_threshold();
+  }
+}
+
+void search_flat_vector_major(const ingest::VectorStore& store, const PreparedQuery& query,
+                              const quantize::LloydMaxCodebook& codebook, TopKHits& topk) {
+  constexpr std::size_t kScoreChunk = 512;
+  const std::size_t n = store.size();
   const std::size_t words = store.l0_words_per_vec();
   const auto codes = store.l0_codes();
   const auto ids = store.ids();
@@ -226,6 +263,17 @@ QueryEngine QueryEngine::from_rotated(const ingest::VectorStore& store) {
   return QueryEngine(store, std::nullopt, true, store.input_dim(), std::move(codebook));
 }
 
+const BlockedCodes& QueryEngine::blocked_codes() const {
+  if (blocked_n_ != store_.size()) {
+    blocked_.rebuild(store_.l0_codes(), store_.l0_words_per_vec(), store_.size(), store_.srht_dim(),
+                     store_.bits_per_dim());
+    blocked_n_ = store_.size();
+  }
+  return blocked_;
+}
+
+void QueryEngine::prepare_index() const { (void)blocked_codes(); }
+
 void QueryEngine::prepare_into(PreparedQuery& out, std::span<const float> query) const {
   prepare_query_into(store_, rotation_, query_is_rotated_, input_dim_, query, out);
 }
@@ -239,7 +287,54 @@ PreparedQuery QueryEngine::prepare(std::span<const float> query) const {
 std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared,
                                                    const QueryParams& params) const {
   TopKHits topk(params.k);
-  search_flat(store_, prepared, codebook_, topk);
+  const BlockedCodes& blocked = blocked_codes();
+  const bool byte_aligned =
+      lut_bits_supported(store_.bits_per_dim()) && (store_.srht_dim() * store_.bits_per_dim()) % 8 == 0;
+
+  if (!blocked.empty() && byte_aligned) {
+    QueryLut lut;
+    build_query_lut(prepared.rotated, codebook_, lut);
+    if (!lut.empty()) {
+      const std::size_t n_blocks = blocked.n_blocks();
+      const bool prefer_bit1_blocked = lut.has_bit1_deltas() && blocked.has_bit1_words();
+#if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
+      const bool prefer_parallel =
+          n_blocks >= kParallelMinBlocks && omp_get_max_threads() > 1;
+#else
+      const bool prefer_parallel = false;
+#endif
+      if (prefer_parallel || prefer_bit1_blocked) {
+#if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
+        if (prefer_parallel) {
+          const int nthreads = omp_get_max_threads();
+          std::vector<TopKHits> locals;
+          locals.reserve(static_cast<std::size_t>(nthreads));
+          for (int t = 0; t < nthreads; ++t) {
+            locals.emplace_back(params.k);
+          }
+#pragma omp parallel
+          {
+            const int tid = omp_get_thread_num();
+            TopKHits& local = locals[static_cast<std::size_t>(tid)];
+#pragma omp for schedule(static) nowait
+            for (int b = 0; b < static_cast<int>(n_blocks); ++b) {
+              score_block_into_topk(blocked, lut, store_, static_cast<std::size_t>(b), local);
+            }
+          }
+          for (auto& local : locals) {
+            topk.merge_from(local);
+          }
+          return topk.finalize();
+        }
+#endif
+        for (std::size_t block = 0; block < n_blocks; ++block) {
+          score_block_into_topk(blocked, lut, store_, block, topk);
+        }
+        return topk.finalize();
+      }
+    }
+  }
+  search_flat_vector_major(store_, prepared, codebook_, topk);
   return topk.finalize();
 }
 
