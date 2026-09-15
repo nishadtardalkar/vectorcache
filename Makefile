@@ -102,7 +102,7 @@ help:
 	@echo "  QUERY_LIMIT     --query-limit (query-bench only)"
 	@echo "  K               --k (query-bench only)"
 	@echo "  CALIBRATE=1     --calibrate (query-bench only)"
-	@echo "  RECALL=1        --recall (query-bench only)"
+	@echo "  RECALL=1        --recall (query-bench: Recall@1@k + Recall@k)"
 	@echo "  BENCH_EXTRA_ARGS  appended to both benches as-is"
 	@echo ""
 	@echo "For native SIMD on compute nodes: make compute DATASET=glove CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"

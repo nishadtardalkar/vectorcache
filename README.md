@@ -104,6 +104,8 @@ TurboQuantMSE uses `n` bits per SRHT coordinate (`2^n` Lloyd-Max centroids). Def
 make compute DATASET=glove BITS=2 RECALL=1
 ```
 
+With `RECALL=1` / `--recall`, query-bench prints **Recall@1@k** (exact NN in approx top-k; TurboVec-compatible) then set-overlap **Recall@k**.
+
 ## CLI tools
 
 ### fetch-datasets
@@ -147,7 +149,10 @@ Ingest into RAM, then flat-scan asymmetric IP scores:
 ```bash
 ./query-bench --dataset glove
 ./query-bench --dataset glove --k 10 --bits 2
+./query-bench --dataset glove --bits 4 --k 8 --limit 100000 --recall
 ```
+
+`--recall` reports **Recall@1@k** (exact cosine NN in approx top-k; matches TurboVec charts) and set-overlap **Recall@k**.
 
 Environment variables:
 - `VECTORCACHE_DATASET` / `VECTORCACHE_DATA_DIR`

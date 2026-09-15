@@ -214,6 +214,11 @@ double recall_at_k(const std::vector<std::size_t>& approx_ids,
   return static_cast<double>(hits) / static_cast<double>(k);
 }
 
+/// TurboVec-style recall@1@k: exact NN id present in approx top-k.
+bool recall_at_1_at_k(const std::vector<std::size_t>& approx_ids, std::size_t exact_top1) {
+  return std::find(approx_ids.begin(), approx_ids.end(), exact_top1) != approx_ids.end();
+}
+
 void print_score_stats(double sum_top1, double sum_topk_mean, std::size_t queries,
                        std::size_t k) {
   if (queries == 0) {
@@ -299,7 +304,8 @@ int main(int argc, char** argv) {
   app.add_option("--bits", bits, "TurboQuantMSE bits per dimension (1-8)");
   app.add_flag("--calibrate", calibrate, "Print L0 probe stats for the first query");
   app.add_flag("--recall", recall,
-               "Measure mean recall@k vs exact cosine top-k on original full-dim vectors");
+               "Measure Recall@1@k (exact NN in approx top-k; TurboVec-compatible) and "
+               "set-overlap Recall@k vs exact cosine on original full-dim vectors");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -412,6 +418,7 @@ int main(int argc, char** argv) {
           load_normalized_corpus(*corpus_reader, meta.dim, actual_index);
 
       double sum_recall = 0.0;
+      double sum_r1atk = 0.0;
       std::size_t recall_queries = 0;
       std::vector<float> q_norm(meta.dim);
       for (std::size_t qi = 0; qi < queries.size(); ++qi) {
@@ -423,12 +430,18 @@ int main(int argc, char** argv) {
         vectorcache::transform::l2_normalize_in_place(q_norm);
         const auto exact =
             exact_topk(q_norm, corpus, meta.dim, actual_index, k);
+        if (exact.empty()) {
+          throw vectorcache::Error("exact top-k empty for recall");
+        }
+        sum_r1atk += recall_at_1_at_k(approx_ids_per_query[qi], exact.front()) ? 1.0 : 0.0;
         sum_recall += recall_at_k(approx_ids_per_query[qi], exact, k);
         ++recall_queries;
       }
 
       if (recall_queries > 0) {
         std::cout << std::fixed << std::setprecision(4);
+        std::cout << "Recall@1@" << k << ": "
+                  << (sum_r1atk / static_cast<double>(recall_queries)) << '\n';
         std::cout << "Recall@" << k << ": "
                   << (sum_recall / static_cast<double>(recall_queries)) << '\n';
       }
