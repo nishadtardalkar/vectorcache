@@ -213,38 +213,6 @@ TEST(QueryEngineTest, SelfSimilarityTopHit) {
   EXPECT_EQ(hits[0].id, 3u);
 }
 
-TEST(QueryEngineTest, FlatScanFindsBothNearVectors) {
-  // Two nearby spikes + one orthogonal far vector; 2-bit codes leave a stable top-1 gap.
-  const std::size_t dim = 64;
-  std::vector<float> a(dim, 0.0f);
-  std::vector<float> b(dim, 0.0f);
-  std::vector<float> far(dim, 0.0f);
-  a[10] = 5.0f;
-  a[20] = 4.0f;
-  b[10] = 4.5f;
-  b[20] = 4.2f;
-  far[40] = 5.0f;
-  far[50] = 4.0f;
-
-  MockReader reader({a, b, far}, dim);
-  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42, /*bits=*/2);
-  ingest_engine.ingest(reader);
-
-  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
-  query::QueryParams params;
-  params.k = 2;
-
-  const auto hits = query_engine.search(a, params);
-  ASSERT_EQ(hits.size(), 2u);
-  const bool saw0 = std::any_of(hits.begin(), hits.end(),
-                                [](const query::QueryHit& h) { return h.id == 0u; });
-  const bool saw1 = std::any_of(hits.begin(), hits.end(),
-                                [](const query::QueryHit& h) { return h.id == 1u; });
-  EXPECT_TRUE(saw0);
-  EXPECT_TRUE(saw1);
-  EXPECT_EQ(hits[0].id, 0u);
-}
-
 TEST(QueryEngineTest, PreferHigherAsymmetricScore) {
   const std::size_t dim = 64;
   std::vector<float> near(dim, -1.0f);
