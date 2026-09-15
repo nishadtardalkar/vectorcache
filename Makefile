@@ -60,7 +60,6 @@ BENCH_COMMON_ARGS = \
 	$(call opt_arg,SPLIT,split) \
 	$(call opt_arg,LIMIT,limit) \
 	$(call opt_arg,SEED,seed) \
-	$(call opt_arg,TOP_D,top-d) \
 	$(BENCH_EXTRA_ARGS)
 
 INGEST_BENCH_ARGS = $(BENCH_COMMON_ARGS)
@@ -70,7 +69,6 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_SPLIT,query-split) \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
-	$(call opt_arg,N_BUCKETS,n-buckets) \
 	$(call flag_arg,CALIBRATE,calibrate) \
 	$(call flag_arg,RECALL,recall)
 
@@ -97,11 +95,9 @@ help:
 	@echo "  SPLIT           --split"
 	@echo "  LIMIT           --limit"
 	@echo "  SEED            --seed"
-	@echo "  TOP_D           --top-d"
 	@echo "  QUERY_SPLIT     --query-split (query-bench only)"
 	@echo "  QUERY_LIMIT     --query-limit (query-bench only)"
 	@echo "  K               --k (query-bench only)"
-	@echo "  N_BUCKETS       --n-buckets (query-bench only)"
 	@echo "  CALIBRATE=1     --calibrate (query-bench only)"
 	@echo "  RECALL=1        --recall (query-bench only)"
 	@echo "  BENCH_EXTRA_ARGS  appended to both benches as-is"

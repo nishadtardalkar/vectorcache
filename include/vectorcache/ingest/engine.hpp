@@ -10,7 +10,6 @@
 #include "vectorcache/datasets/reader.hpp"
 #include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/ingest/store.hpp"
-#include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/transform/srht.hpp"
 
 namespace vectorcache::ingest {
@@ -18,44 +17,39 @@ namespace vectorcache::ingest {
 inline constexpr std::size_t INGEST_BATCH_SIZE = 256;
 
 struct IngestReport {
-  std::size_t unique_parents = 0;
   std::uint64_t vectors_ingested = 0;
 };
 
 class IngestionEngine {
  public:
-  /// Already-SRHT'd vectors of length srht_dim; support key from full vector (input_dim==srht_dim).
-  static IngestionEngine from_rotated(std::size_t srht_dim,
-                                      std::size_t top_d = quantize::kDefaultSupportDepth);
-  static IngestionEngine with_rotation(std::size_t original_dim, std::uint64_t seed,
-                                       std::size_t top_d = quantize::kDefaultSupportDepth);
+  /// Already-SRHT'd vectors of length srht_dim (input_dim == srht_dim).
+  static IngestionEngine from_rotated(std::size_t srht_dim);
+  static IngestionEngine with_rotation(std::size_t original_dim, std::uint64_t seed);
 
   void reserve_vectors(std::size_t count);
   IngestReport ingest(datasets::DatasetReader& reader);
   IngestReport ingest_with_hook(datasets::DatasetReader& reader, VectorHook* hook);
-  const ParentStore& store() const { return store_; }
+  const VectorStore& store() const { return store_; }
 
  private:
   struct VectorWork {
     AlignedVector<float> buf;  // length srht_dim_
-    quantize::SupportKey support_key{};
     AlignedVector<std::uint64_t> l0;
   };
 
-  IngestionEngine(ParentStore store, std::optional<transform::SrhtRotation> rotation,
+  IngestionEngine(VectorStore store, std::optional<transform::SrhtRotation> rotation,
                   bool quantize_only, std::size_t input_dim, std::size_t srht_dim,
-                  std::size_t top_d, std::size_t l0_words_per_vec);
+                  std::size_t l0_words_per_vec);
 
   void ensure_batch_capacity(std::size_t batch_cap);
   std::size_t read_batch(datasets::DatasetReader& reader);
   void process_batch(std::size_t batch_len);
 
-  ParentStore store_;
+  VectorStore store_;
   std::optional<transform::SrhtRotation> rotation_;
   bool quantize_only_;
   std::size_t input_dim_;
   std::size_t srht_dim_;
-  std::size_t top_d_;
   std::size_t l0_words_per_vec_;
   std::vector<VectorWork> batch_work_;
 };

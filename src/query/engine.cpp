@@ -4,7 +4,6 @@
 #include <cstring>
 #include <immintrin.h>
 #include <limits>
-#include <utility>
 #include <vector>
 
 #include "vectorcache/error.hpp"
@@ -148,16 +147,16 @@ class TopKHits {
   std::vector<HeapHit> heap_;
 };
 
-void search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
-                  std::size_t l0_bits, TopKHits& topk) {
-  const std::size_t n = group.size();
+void search_flat(const ingest::VectorStore& store, const PreparedQuery& query, std::size_t l0_bits,
+                 TopKHits& topk) {
+  const std::size_t n = store.size();
   if (n == 0) {
     return;
   }
 
   const std::size_t words = query.l0.size();
-  const auto codes = group.l0_codes();
-  const auto ids = group.ids();
+  const auto codes = store.l0_codes();
+  const auto ids = store.ids();
 
   alignas(64) std::uint32_t disagree_buf[kScoreChunk];
   std::uint32_t threshold = topk.reject_threshold();
@@ -176,63 +175,16 @@ void search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
       }
       topk.push(ids[base + i], disagree_buf[i]);
     }
-    // Refresh once per chunk; next chunk sees the tightened reject bound.
     threshold = topk.reject_threshold();
   }
 }
 
-/// Rank every unique support key by intersection with the query key; scan top n_buckets.
-void search_with_ranked_buckets(const ingest::ParentStore& store, const PreparedQuery& query,
-                                const QueryParams& params, TopKHits& topk) {
-  if (params.n_buckets == 0) {
-    return;
-  }
-
-  const auto keys = store.unique_keys();
-  if (keys.empty()) {
-    return;
-  }
-
-  const std::size_t l0_bits = quantize::l0_bits_per_vector(store.srht_dim());
-  const std::size_t take = std::min(params.n_buckets, keys.size());
-
-  // (intersection_size, key_idx); higher intersection = closer support key.
-  thread_local std::vector<std::pair<std::uint8_t, std::uint32_t>> ranked;
-  ranked.resize(keys.size());
-  for (std::size_t i = 0; i < keys.size(); ++i) {
-    const std::uint8_t hd = quantize::support_hd(query.support_key, keys[i]);
-    const std::uint8_t inter =
-        static_cast<std::uint8_t>(query.support_key.d - static_cast<std::uint8_t>(hd / 2u));
-    ranked[i] = {inter, static_cast<std::uint32_t>(i)};
-  }
-
-  std::partial_sort(
-      ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(take), ranked.end(),
-      [](const std::pair<std::uint8_t, std::uint32_t>& a,
-         const std::pair<std::uint8_t, std::uint32_t>& b) {
-        if (a.first != b.first) {
-          return a.first > b.first;
-        }
-        return a.second < b.second;
-      });
-
-  for (std::size_t i = 0; i < take; ++i) {
-    const ingest::ParentGroup& group = store.group_at(ranked[i].second);
-    if (group.empty()) {
-      continue;
-    }
-    _mm_prefetch(reinterpret_cast<const char*>(group.l0_codes().data()), _MM_HINT_T0);
-    search_group(group, query, l0_bits, topk);
-  }
-}
-
-void prepare_query_into(const ingest::ParentStore& store,
+void prepare_query_into(const ingest::VectorStore& store,
                         const std::optional<transform::SrhtRotation>& rotation,
-                        bool query_is_rotated, std::size_t input_dim,
-                        std::span<const float> query, PreparedQuery& prepared) {
+                        bool query_is_rotated, std::size_t input_dim, std::span<const float> query,
+                        PreparedQuery& prepared) {
   const std::size_t srht_dim = store.srht_dim();
   const std::size_t l0_words = store.l0_words_per_vec();
-  const std::size_t top_d = store.top_d();
 
   if (prepared.rotated.size() != srht_dim) {
     prepared.rotated.assign(srht_dim, 0.0f);
@@ -246,16 +198,12 @@ void prepare_query_into(const ingest::ParentStore& store,
       throw Error("rotated query dimension mismatch");
     }
     std::memcpy(prepared.rotated.data(), query.data(), srht_dim * sizeof(float));
-    prepared.support_key = quantize::quantize_support_key(
-        std::span<const float>(prepared.rotated.data(), store.input_dim()), top_d);
   } else if (rotation.has_value()) {
     if (query.size() != input_dim) {
       throw Error("query dimension mismatch");
     }
     std::memcpy(prepared.rotated.data(), query.data(), input_dim * sizeof(float));
     transform::l2_normalize_in_place(std::span<float>(prepared.rotated.data(), input_dim));
-    prepared.support_key = quantize::quantize_support_key(
-        std::span<const float>(prepared.rotated.data(), input_dim), top_d);
     if (srht_dim > input_dim) {
       std::memset(prepared.rotated.data() + input_dim, 0, (srht_dim - input_dim) * sizeof(float));
     }
@@ -269,7 +217,7 @@ void prepare_query_into(const ingest::ParentStore& store,
 
 }  // namespace
 
-QueryEngine::QueryEngine(const ingest::ParentStore& store,
+QueryEngine::QueryEngine(const ingest::VectorStore& store,
                          std::optional<transform::SrhtRotation> rotation, bool query_is_rotated,
                          std::size_t input_dim)
     : store_(store),
@@ -277,12 +225,12 @@ QueryEngine::QueryEngine(const ingest::ParentStore& store,
       query_is_rotated_(query_is_rotated),
       input_dim_(input_dim) {}
 
-QueryEngine QueryEngine::with_rotation(const ingest::ParentStore& store, std::size_t input_dim,
+QueryEngine QueryEngine::with_rotation(const ingest::VectorStore& store, std::size_t input_dim,
                                        std::uint64_t seed) {
   return QueryEngine(store, transform::SrhtRotation(input_dim, seed), false, input_dim);
 }
 
-QueryEngine QueryEngine::from_rotated(const ingest::ParentStore& store) {
+QueryEngine QueryEngine::from_rotated(const ingest::VectorStore& store) {
   return QueryEngine(store, std::nullopt, true, store.input_dim());
 }
 
@@ -300,7 +248,7 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
                                                    const QueryParams& params) const {
   const std::size_t l0_bits = quantize::l0_bits_per_vector(store_.srht_dim());
   TopKHits topk(params.k, l0_bits);
-  search_with_ranked_buckets(store_, prepared, params, topk);
+  search_flat(store_, prepared, l0_bits, topk);
   return topk.finalize();
 }
 

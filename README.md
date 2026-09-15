@@ -1,8 +1,8 @@
 # VectorCache
 
-Support-keyed quantized vector retrieval engine (C++20).
+Flat quantized vector retrieval engine (C++20).
 
-VectorCache implements approximate nearest neighbor search via **top-d support keys** (sorted indices of the largest-magnitude coordinates on the true input dim), **SRHT** (zero-pad only for FWHT), and **1D→1bit (L0)** codes for ranking. Each vector is posted under **one** support key; query scores every unique key by dim intersection with the query key, scans the top `n_buckets`, then ranks L0 scores with a turbovec-style flat top-k.
+VectorCache implements approximate nearest neighbor search via **SRHT** (L2-normalize, zero-pad for FWHT) and **1D→1bit (L0)** codes. Vectors are stored in a flat in-RAM index; queries score every code with a turbovec-style L0 top-k scan.
 
 ## Requirements
 
@@ -53,7 +53,7 @@ make compute DATASET=glove
 make compute DATASET=glove BENCH_EXTRA_ARGS="--limit 50000"
 ```
 
-`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` against the required `DATASET` (e.g. `glove`, `openai-1536`, `openai-3072`). Indexes live entirely in `ParentStore` (RAM); queries rank support-key buckets and score L0 codes in memory.
+`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` against the required `DATASET` (e.g. `glove`, `openai-1536`, `openai-3072`). Indexes live entirely in `VectorStore` (RAM); queries flat-scan L0 codes in memory.
 
 ## Build
 
@@ -115,7 +115,6 @@ Ingest vectors and optionally report variance:
 ./ingest-sample --npy data/.cache/glove-sample-100.npy
 ./ingest-sample --dataset glove --limit 100 --variance
 ./ingest-sample --dataset glove --limit 100 --variance --show-index 0
-./ingest-sample --dataset glove --limit 100 --top-d 8
 ```
 
 Environment variables:
@@ -124,26 +123,22 @@ Environment variables:
 
 ### ingest-bench
 
-Profile ingestion stage hot paths into an in-memory `ParentStore`:
+Profile ingestion stage hot paths into an in-memory `VectorStore`:
 
 ```bash
 ./ingest-bench --dataset glove
 ./ingest-bench --dataset glove --limit 50000
 ./ingest-bench --npy data/openai-1536.npy --limit 50000
-./ingest-bench --dataset glove --top-d 8
 ```
 
 ### query-bench
 
-Ingest into RAM, then search (rank support-key buckets + L0 scoring):
+Ingest into RAM, then flat-scan L0 scores:
 
 ```bash
 ./query-bench --dataset glove
 ./query-bench --dataset glove --k 10
-./query-bench --dataset glove --top-d 8 --n-buckets 64
 ```
-
-`--top-d` sets support-key depth (default `4`, range `1..16`). `--n-buckets` is how many best-matching support keys to scan (default `32`).
 
 Environment variables:
 - `VECTORCACHE_DATASET` / `VECTORCACHE_DATA_DIR`

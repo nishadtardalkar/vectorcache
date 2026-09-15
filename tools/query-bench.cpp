@@ -71,9 +71,9 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 
 vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
                                                   std::size_t dim, std::uint64_t seed,
-                                                  std::size_t limit, std::size_t top_d) {
+                                                  std::size_t limit) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
-  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, top_d);
+  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed);
   engine.reserve_vectors(limit);
   const auto report = engine.ingest(limited);
   if (report.vectors_ingested != limit) {
@@ -265,13 +265,7 @@ void run_probe_stats(const vectorcache::query::QueryEngine& engine,
   std::cout << "\nProbe stats (first query, k=" << base_params.k << "):\n";
   const auto prepared = engine.prepare(queries.front());
   const auto hits = engine.search_prepared(prepared, base_params);
-  std::cout << "  support_key d=" << static_cast<unsigned>(prepared.support_key.d) << " dims=[";
-  for (std::uint8_t i = 0; i < prepared.support_key.d; ++i) {
-    if (i) std::cout << ',';
-    std::cout << prepared.support_key.dims[i];
-  }
-  std::cout << "]"
-            << " hits=" << hits.size() << '\n';
+  std::cout << "  l0_words=" << prepared.l0.size() << " hits=" << hits.size() << '\n';
 }
 
 }  // namespace
@@ -287,8 +281,6 @@ int main(int argc, char** argv) {
   std::size_t query_limit = 0;
   std::uint64_t seed = 42;
   std::size_t k = 10;
-  std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
-  std::size_t n_buckets = 32;
   bool calibrate = false;
   bool recall = false;
 
@@ -302,10 +294,7 @@ int main(int argc, char** argv) {
   app.add_option("--query-limit", query_limit, "Query count (default: 10000 GloVe, 1000 else)");
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
-  app.add_option("--top-d", top_d, "Support-key top-d (dim selection depth)");
-  app.add_option("--n-buckets", n_buckets,
-                 "Top support-key buckets to scan after ranking all keys vs query");
-  app.add_flag("--calibrate", calibrate, "Print parent-key probe stats for the first query");
+  app.add_flag("--calibrate", calibrate, "Print L0 probe stats for the first query");
   app.add_flag("--recall", recall,
                "Measure mean recall@k vs exact cosine top-k on original full-dim vectors");
 
@@ -314,10 +303,6 @@ int main(int argc, char** argv) {
   try {
     if (npy_path.empty() && dataset.empty()) {
       throw vectorcache::Error("pass --dataset or --npy");
-    }
-    if (top_d == 0 || top_d > vectorcache::quantize::kMaxSupportDepth) {
-      throw vectorcache::Error("--top-d must be in 1.." +
-                               std::to_string(vectorcache::quantize::kMaxSupportDepth));
     }
 
     if (query_split.empty()) {
@@ -337,15 +322,14 @@ int main(int argc, char** argv) {
     const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
     std::cout << "Query bench: index=" << source_label << " dim=" << meta.dim
               << " padded=" << padded << " index_n=" << actual_index
-              << " query_n=" << query_limit << " query_split=" << query_split
-              << " top_d=" << top_d << '\n';
+              << " query_n=" << query_limit << " query_split=" << query_split << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
     }
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
-    auto ingest_engine = ingest_index(index_limited, meta.dim, seed, actual_index, top_d);
-    std::cout << "  unique_parents=" << ingest_engine.store().unique_parent_count() << '\n';
+    auto ingest_engine = ingest_index(index_limited, meta.dim, seed, actual_index);
+    std::cout << "  stored_vectors=" << ingest_engine.store().size() << '\n';
 
     auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);
     const auto queries =
@@ -357,7 +341,6 @@ int main(int argc, char** argv) {
 
     vectorcache::query::QueryParams params;
     params.k = k;
-    params.n_buckets = n_buckets;
 
     std::vector<std::uint64_t> prep_ns;
     std::vector<std::uint64_t> search_ns;

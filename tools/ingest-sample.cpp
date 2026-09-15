@@ -163,34 +163,19 @@ class MultiRoundReader : public vectorcache::datasets::DatasetReader {
   std::vector<float> output_;
 };
 
-void print_stored_parent(std::size_t index, const vectorcache::ingest::IngestionEngine& engine) {
-  for (const auto& key : engine.store().unique_keys()) {
-    const auto* group = engine.store().find(key);
-    if (group == nullptr) {
-      continue;
-    }
-    for (std::size_t i = 0; i < group->size(); ++i) {
-      if (group->id_at(i) != index) {
-        continue;
-      }
-      std::cout << "Stored support key at index " << index << ": d=" << static_cast<unsigned>(key.d)
-                << " dims=[";
-      for (std::uint8_t d = 0; d < key.d; ++d) {
-        if (d) std::cout << ',';
-        std::cout << key.dims[d];
-      }
-      std::cout << "]\n";
-      const auto l0 = group->vector_l0(i);
-      std::cout << "Stored L0 codes (" << l0.size() << " u64 words):\n  [";
-      for (std::size_t w = 0; w < l0.size(); ++w) {
-        if (w > 0) std::cout << ", ";
-        std::cout << "0x" << std::hex << std::setw(16) << std::setfill('0') << l0[w];
-      }
-      std::cout << std::dec << "]\n";
-      return;
-    }
+void print_stored_vector(std::size_t index, const vectorcache::ingest::IngestionEngine& engine) {
+  const auto& store = engine.store();
+  if (index >= store.size()) {
+    throw vectorcache::Error("vector id not found in store");
   }
-  throw vectorcache::Error("vector id not found in parent store");
+  std::cout << "Stored vector id=" << store.id_at(index) << " at index " << index << '\n';
+  const auto l0 = store.vector_l0(index);
+  std::cout << "Stored L0 codes (" << l0.size() << " u64 words):\n  [";
+  for (std::size_t w = 0; w < l0.size(); ++w) {
+    if (w > 0) std::cout << ", ";
+    std::cout << "0x" << std::hex << std::setw(16) << std::setfill('0') << l0[w];
+  }
+  std::cout << std::dec << "]\n";
 }
 
 }  // namespace
@@ -204,7 +189,6 @@ int main(int argc, char** argv) {
   std::string split = "train";
   std::uint64_t seed = 42;
   std::size_t rounds = 1;
-  std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
   bool variance = false;
   std::optional<std::size_t> show_index;
 
@@ -215,7 +199,6 @@ int main(int argc, char** argv) {
   app.add_option("--split", split, "HDF5 split for GloVe (train or test)");
   app.add_option("--seed", seed, "SRHT rotation seed");
   app.add_option("--rounds", rounds, "Number of consecutive SRHT rounds");
-  app.add_option("--top-d", top_d, "Support-key top-d (dim selection depth)");
   app.add_flag("--variance", variance, "Report per-vector dimension variance");
   app.add_option("--show-index", show_index, "Print stored vector at index");
 
@@ -224,10 +207,6 @@ int main(int argc, char** argv) {
   try {
     if (rounds == 0) {
       throw vectorcache::Error("--rounds must be at least 1");
-    }
-    if (top_d == 0 || top_d > vectorcache::quantize::kMaxSupportDepth) {
-      throw vectorcache::Error("--top-d must be in 1.." +
-                               std::to_string(vectorcache::quantize::kMaxSupportDepth));
     }
 
     vectorcache::datasets::DatasetSplit dataset_split = vectorcache::datasets::DatasetSplit::Train;
@@ -263,7 +242,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Dataset: " << meta.label << " (dim=" << meta.dim << ", srht_dim=" << padded
               << ", available=" << meta.count << ", ingesting=" << ingest_limit
-              << ", srht_seed=" << seed << ", rounds=" << rounds << ", top_d=" << top_d << ")\n";
+              << ", srht_seed=" << seed << ", rounds=" << rounds << ")\n";
 
     VarianceHook variance_hook(capture_vectors);
     const auto ingest_start = std::chrono::steady_clock::now();
@@ -272,7 +251,7 @@ int main(int argc, char** argv) {
     std::vector<std::vector<double>> round_variances;
     vectorcache::ingest::IngestReport report{};
     vectorcache::ingest::IngestionEngine engine =
-        vectorcache::ingest::IngestionEngine::with_rotation(meta.dim, seed, top_d);
+        vectorcache::ingest::IngestionEngine::with_rotation(meta.dim, seed);
 
     if (rounds == 1) {
       LimitedReader limited(*reader_ptr, ingest_limit, variance ? &pre_variances : nullptr);
@@ -293,7 +272,7 @@ int main(int argc, char** argv) {
       for (std::size_t r = 0; r < rounds; ++r) {
         store_dim = vectorcache::transform::padded_dim(store_dim);
       }
-      engine = vectorcache::ingest::IngestionEngine::from_rotated(store_dim, top_d);
+      engine = vectorcache::ingest::IngestionEngine::from_rotated(store_dim);
       engine.reserve_vectors(ingest_limit);
       if (variance) {
         report = engine.ingest_with_hook(limited, &variance_hook);
@@ -326,14 +305,14 @@ int main(int argc, char** argv) {
                        static_cast<std::uint64_t>(per_vec))
                 << " (" << per_vec << " ns)\n";
     }
-    std::cout << "Unique parents: " << report.unique_parents
+    std::cout << "Stored vectors: " << engine.store().size()
               << " (L0 words/vec: " << engine.store().l0_words_per_vec() << ")\n";
 
     if (show_index) {
       if (*show_index >= report.vectors_ingested) {
         throw vectorcache::Error("--show-index out of range");
       }
-      print_stored_parent(*show_index, engine);
+      print_stored_vector(*show_index, engine);
       const auto& vectors = variance_hook.vectors();
       if (*show_index < vectors.size()) {
         const auto& vector = vectors[*show_index];

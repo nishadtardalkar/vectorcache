@@ -8,7 +8,6 @@
 
 #include "vectorcache/aligned.hpp"
 #include "vectorcache/ingest/store.hpp"
-#include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/transform/srht.hpp"
 
 namespace vectorcache::query {
@@ -20,21 +19,18 @@ struct QueryHit {
 
 struct QueryParams {
   std::size_t k = 10;
-  /// How many support-key buckets to scan after ranking all keys vs the query key.
-  std::size_t n_buckets = 32;
 };
 
 struct PreparedQuery {
   AlignedVector<float> rotated;
-  quantize::SupportKey support_key{};
   AlignedVector<std::uint64_t> l0;
 };
 
 class QueryEngine {
  public:
-  static QueryEngine with_rotation(const ingest::ParentStore& store, std::size_t input_dim,
+  static QueryEngine with_rotation(const ingest::VectorStore& store, std::size_t input_dim,
                                    std::uint64_t seed);
-  static QueryEngine from_rotated(const ingest::ParentStore& store);
+  static QueryEngine from_rotated(const ingest::VectorStore& store);
 
   PreparedQuery prepare(std::span<const float> query) const;
   void prepare_into(PreparedQuery& out, std::span<const float> query) const;
@@ -43,10 +39,10 @@ class QueryEngine {
                                         const QueryParams& params) const;
 
  private:
-  QueryEngine(const ingest::ParentStore& store, std::optional<transform::SrhtRotation> rotation,
+  QueryEngine(const ingest::VectorStore& store, std::optional<transform::SrhtRotation> rotation,
               bool query_is_rotated, std::size_t input_dim);
 
-  const ingest::ParentStore& store_;
+  const ingest::VectorStore& store_;
   std::optional<transform::SrhtRotation> rotation_;
   bool query_is_rotated_;
   std::size_t input_dim_;
