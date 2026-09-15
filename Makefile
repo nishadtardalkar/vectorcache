@@ -19,7 +19,7 @@ TOP_D         ?=
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
 K             ?=
-MAX_HD        ?=
+N_BUCKETS     ?=
 CALIBRATE     ?=
 RECALL        ?=
 FORCE         ?=
@@ -70,7 +70,7 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_SPLIT,query-split) \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
-	$(call opt_arg,MAX_HD,max-hd) \
+	$(call opt_arg,N_BUCKETS,n-buckets) \
 	$(call flag_arg,CALIBRATE,calibrate) \
 	$(call flag_arg,RECALL,recall)
 
@@ -101,7 +101,7 @@ help:
 	@echo "  QUERY_SPLIT     --query-split (query-bench only)"
 	@echo "  QUERY_LIMIT     --query-limit (query-bench only)"
 	@echo "  K               --k (query-bench only)"
-	@echo "  MAX_HD          --max-hd (query-bench only)"
+	@echo "  N_BUCKETS       --n-buckets (query-bench only)"
 	@echo "  CALIBRATE=1     --calibrate (query-bench only)"
 	@echo "  RECALL=1        --recall (query-bench only)"
 	@echo "  BENCH_EXTRA_ARGS  appended to both benches as-is"
@@ -110,7 +110,7 @@ help:
 	@echo "For 3-round SRHT at compile time: make compute DATASET=glove CMAKE_OPTS='-DVECTORCACHE_SRHT_ROUNDS=3'"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
-	@echo "Example: make compute DATASET=glove TOP_D=8 RECALL=1 MAX_HD=4"
+	@echo "Example: make compute DATASET=glove TOP_D=8 RECALL=1 N_BUCKETS=64"
 
 login: $(LOGIN_READY)
 

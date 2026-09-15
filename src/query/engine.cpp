@@ -181,45 +181,49 @@ void search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
   }
 }
 
-void search_with_probe(const ingest::ParentStore& store, const PreparedQuery& query,
-                       const QueryParams& params, TopKHits& topk) {
-  const std::size_t l0_bits = quantize::l0_bits_per_vector(store.srht_dim());
-
-  auto scan_group = [&](const ingest::ParentGroup* group) {
-    if (group == nullptr || group->empty()) {
-      return true;
-    }
-    _mm_prefetch(reinterpret_cast<const char*>(group->l0_codes().data()), _MM_HINT_T0);
-    search_group(*group, query, l0_bits, topk);
-    return true;
-  };
-
-  scan_group(store.find(query.support_key));
-  if (params.max_hd < 2) {
+/// Rank every unique support key by intersection with the query key; scan top n_buckets.
+void search_with_ranked_buckets(const ingest::ParentStore& store, const PreparedQuery& query,
+                                const QueryParams& params, TopKHits& topk) {
+  if (params.n_buckets == 0) {
     return;
   }
 
   const auto keys = store.unique_keys();
-  const auto& postings = store.dim_postings();
-
-  postings.for_each_hd2(keys, query.support_key,
-                        [&](const quantize::SupportKey&, std::uint32_t key_idx) {
-                          return scan_group(&store.group_at(key_idx));
-                        });
-
-  if (params.max_hd < 4) {
+  if (keys.empty()) {
     return;
   }
 
-  thread_local std::vector<std::uint8_t> hd4_visited;
-  if (hd4_visited.size() < keys.size()) {
-    hd4_visited.resize(keys.size());
+  const std::size_t l0_bits = quantize::l0_bits_per_vector(store.srht_dim());
+  const std::size_t take = std::min(params.n_buckets, keys.size());
+
+  // (intersection_size, key_idx); higher intersection = closer support key.
+  thread_local std::vector<std::pair<std::uint8_t, std::uint32_t>> ranked;
+  ranked.resize(keys.size());
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    const std::uint8_t hd = quantize::support_hd(query.support_key, keys[i]);
+    const std::uint8_t inter =
+        static_cast<std::uint8_t>(query.support_key.d - static_cast<std::uint8_t>(hd / 2u));
+    ranked[i] = {inter, static_cast<std::uint32_t>(i)};
   }
 
-  postings.for_each_hd4(keys, query.support_key, hd4_visited,
-                        [&](const quantize::SupportKey&, std::uint32_t key_idx) {
-                          return scan_group(&store.group_at(key_idx));
-                        });
+  std::partial_sort(
+      ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(take), ranked.end(),
+      [](const std::pair<std::uint8_t, std::uint32_t>& a,
+         const std::pair<std::uint8_t, std::uint32_t>& b) {
+        if (a.first != b.first) {
+          return a.first > b.first;
+        }
+        return a.second < b.second;
+      });
+
+  for (std::size_t i = 0; i < take; ++i) {
+    const ingest::ParentGroup& group = store.group_at(ranked[i].second);
+    if (group.empty()) {
+      continue;
+    }
+    _mm_prefetch(reinterpret_cast<const char*>(group.l0_codes().data()), _MM_HINT_T0);
+    search_group(group, query, l0_bits, topk);
+  }
 }
 
 void prepare_query_into(const ingest::ParentStore& store,
@@ -296,7 +300,7 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
                                                    const QueryParams& params) const {
   const std::size_t l0_bits = quantize::l0_bits_per_vector(store_.srht_dim());
   TopKHits topk(params.k, l0_bits);
-  search_with_probe(store_, prepared, params, topk);
+  search_with_ranked_buckets(store_, prepared, params, topk);
   return topk.finalize();
 }
 

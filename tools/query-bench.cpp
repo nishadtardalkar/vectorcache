@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
   std::uint64_t seed = 42;
   std::size_t k = 10;
   std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
-  std::uint8_t max_hd = 2;
+  std::size_t n_buckets = 32;
   bool calibrate = false;
   bool recall = false;
 
@@ -303,7 +303,8 @@ int main(int argc, char** argv) {
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
   app.add_option("--top-d", top_d, "Support-key top-d (dim selection depth)");
-  app.add_option("--max-hd", max_hd, "Max support-key Hamming distance to probe (0, 2, or 4)");
+  app.add_option("--n-buckets", n_buckets,
+                 "Top support-key buckets to scan after ranking all keys vs query");
   app.add_flag("--calibrate", calibrate, "Print parent-key probe stats for the first query");
   app.add_flag("--recall", recall,
                "Measure mean recall@k vs exact cosine top-k on original full-dim vectors");
@@ -356,7 +357,7 @@ int main(int argc, char** argv) {
 
     vectorcache::query::QueryParams params;
     params.k = k;
-    params.max_hd = max_hd;
+    params.n_buckets = n_buckets;
 
     std::vector<std::uint64_t> prep_ns;
     std::vector<std::uint64_t> search_ns;

@@ -6,7 +6,7 @@ Approximate nearest-neighbor search with **top-d support keys** for candidate ge
 2. Support key = sorted indices of the `d` largest `|x_i|` (default `d=4`)
 3. Zero-pad **only inside SRHT** to `srht_dim = next_pow2(input_dim)` for FWHT
 4. Store L0 sign bits on the SRHT output
-5. Query: Hamming-ball probe on support keys (HD 0 → 2 → 4), then L0 bit-agreement top-k
+5. Query: score every unique support key by dim intersection with the query key, scan top `n_buckets`, then L0 bit-agreement top-k
 
 ```
  INGEST                                              QUERY
@@ -24,8 +24,8 @@ Approximate nearest-neighbor search with **top-d support keys** for candidate ge
         │                 L0 sign bits                      │           L0 sign bits
         └──────────┬───────────┘                            └───────┬────────┘
                    ▼                                                ▼
-         hash(key) → bucket                              HD-ball hash probes
-         (ids + L0)                                      then L0 Hamming top-k
+         hash(key) → bucket                              score all keys vs query
+         (ids + L0)                                      take top n_buckets, L0 top-k
 ```
 
 ## Support key
@@ -33,7 +33,7 @@ Approximate nearest-neighbor search with **top-d support keys** for candidate ge
 - Depth `d` ∈ `[1, 16]` (`kDefaultSupportDepth = 4`)
 - Tie-break when `|x|` equal: **higher index wins**
 - Hamming distance between equal-weight keys: `HD = 2*(d − |intersection|)`
-- One posting per vector (no multipost). Recall via query-side HD expansion.
+- One posting per vector (no multipost). Recall via ranking all keys and scanning top buckets.
 
 ## Padding
 
@@ -48,7 +48,7 @@ Padding exists **only** so FWHT can run at power-of-two length. Support keys nev
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `k` | 10 | top-k |
-| `max_hd` | 2 | probe HD 0, then 2 (4 if set ≥ 4); every L0 row in probed buckets is scored |
+| `n_buckets` | 32 | after scoring every unique support key by intersection with the query key, scan this many best buckets |
 
 ## Primary sources
 

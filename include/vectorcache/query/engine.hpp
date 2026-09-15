@@ -20,8 +20,8 @@ struct QueryHit {
 
 struct QueryParams {
   std::size_t k = 10;
-  /// Max support-key Hamming distance to probe (0, 2, 4, ...). Default HD<=2.
-  std::uint8_t max_hd = 2;
+  /// How many support-key buckets to scan after ranking all keys vs the query key.
+  std::size_t n_buckets = 32;
 };
 
 struct PreparedQuery {

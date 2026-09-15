@@ -116,7 +116,7 @@ TEST(QueryEngineTest, SelfSimilarityTopScore) {
   auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
   query::QueryParams params;
   params.k = 3;
-  params.max_hd = 2;
+  params.n_buckets = 8;
 
   const auto hits = query_engine.search(vectors[3], params);
   ASSERT_FALSE(hits.empty());
@@ -128,7 +128,7 @@ TEST(QueryEngineTest, SelfSimilarityTopScore) {
   EXPECT_TRUE(found_self);
 }
 
-TEST(QueryEngineTest, HdProbeFindsNeighborWithCloseSupport) {
+TEST(QueryEngineTest, RankedBucketsFindSharedSupportKey) {
   // Same top-2 dims with different magnitudes → same support key → both in bucket.
   const std::size_t dim = 64;
   const std::size_t top_d = 2;
@@ -146,7 +146,7 @@ TEST(QueryEngineTest, HdProbeFindsNeighborWithCloseSupport) {
   auto query_engine = query::QueryEngine::from_rotated(ingest_engine.store());
   query::QueryParams params;
   params.k = 2;
-  params.max_hd = 0;
+  params.n_buckets = 1;
 
   const auto hits = query_engine.search(a, params);
   ASSERT_FALSE(hits.empty());
@@ -161,6 +161,34 @@ TEST(QueryEngineTest, HdProbeFindsNeighborWithCloseSupport) {
   const auto* group = ingest_engine.store().find(qkey);
   ASSERT_NE(group, nullptr);
   EXPECT_GE(group->size(), 2u);
+}
+
+TEST(QueryEngineTest, RankedBucketsPreferHigherIntersection) {
+  const std::size_t dim = 64;
+  const std::size_t top_d = 2;
+  std::vector<float> near(dim, 0.01f);
+  std::vector<float> far(dim, 0.01f);
+  near[10] = 5.0f;
+  near[20] = 4.0f;
+  // Shares one dim with near → HD=2; far shares none.
+  far[30] = 5.0f;
+  far[40] = 4.0f;
+
+  MockReader reader({near, far}, dim);
+  auto ingest_engine = ingest::IngestionEngine::from_rotated(dim, top_d);
+  ingest_engine.ingest(reader);
+
+  auto query_engine = query::QueryEngine::from_rotated(ingest_engine.store());
+  query::QueryParams params;
+  params.k = 1;
+  params.n_buckets = 1;
+
+  std::vector<float> query(dim, 0.01f);
+  query[10] = 5.0f;
+  query[21] = 4.0f;  // HD=2 vs near, HD=4 vs far
+  const auto hits = query_engine.search(query, params);
+  ASSERT_FALSE(hits.empty());
+  EXPECT_EQ(hits[0].id, 0u);
 }
 
 TEST(QueryEngineTest, SearchPreparedMatchesSearch) {
