@@ -53,6 +53,7 @@ void IngestionEngine::ensure_batch_capacity(std::size_t batch_cap) {
     for (auto& work : batch_work_) {
       work.buf.assign(srht_dim_, 0.0f);
       work.l0.assign(l0_words_per_vec_, 0);
+      work.alpha = 1.0f;
     }
   }
 }
@@ -88,26 +89,23 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
     auto& work = batch_work_[static_cast<std::size_t>(i)];
     if (has_rotation) {
       transform::l2_normalize_in_place(std::span<float>(work.buf.data(), input_dim));
-      if (srht_dim > input_dim) {
-        std::memset(work.buf.data() + input_dim, 0, (srht_dim - input_dim) * sizeof(float));
-      }
-      rotation->apply_in_place(work.buf);
+      rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
     }
     quantize::quantize_1dim_to_nbit_into(work.buf, *codebook, work.l0);
+    work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
 #else
   for (std::size_t i = 0; i < batch_len; ++i) {
     auto& work = batch_work_[i];
     if (has_rotation) {
       transform::l2_normalize_in_place(std::span<float>(work.buf.data(), input_dim));
-      if (srht_dim > input_dim) {
-        std::memset(work.buf.data() + input_dim, 0, (srht_dim - input_dim) * sizeof(float));
-      }
-      rotation->apply_in_place(work.buf);
+      rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
     }
     quantize::quantize_1dim_to_nbit_into(work.buf, *codebook, work.l0);
+    work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
 #endif
+  (void)quantize_only;
 }
 
 IngestReport IngestionEngine::ingest(datasets::DatasetReader& reader) {
@@ -137,7 +135,7 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
       if (hook != nullptr) {
         hook->on_vector(global_id, work.buf);
       }
-      store_.push(static_cast<std::size_t>(global_id), work.l0);
+      store_.push(static_cast<std::size_t>(global_id), work.l0, work.alpha);
       ++global_id;
     }
   }

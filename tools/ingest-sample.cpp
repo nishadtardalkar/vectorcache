@@ -137,7 +137,7 @@ class MultiRoundReader : public vectorcache::datasets::DatasetReader {
     vectorcache::transform::l2_normalize_in_place(output_);
     for (std::size_t round = 0; round < rounds_; ++round) {
       vectorcache::transform::SrhtRotation rot(output_.size(), seed_ + round);
-      scratch_.assign(rot.padded_dim(), 0.0f);
+      scratch_.assign(rot.srht_dim(), 0.0f);
       rot.apply(output_, scratch_);
       if (round_variances_ != nullptr && !round_variances_->empty()) {
         (*round_variances_)[round].push_back(variance_across_dims(scratch_));
@@ -241,10 +241,9 @@ int main(int argc, char** argv) {
 
     const auto meta = reader_ptr->meta();
     const std::size_t ingest_limit = std::min(limit, meta.count);
-    const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
     const bool capture_vectors = show_index.has_value() && variance;
 
-    std::cout << "Dataset: " << meta.label << " (dim=" << meta.dim << ", srht_dim=" << padded
+    std::cout << "Dataset: " << meta.label << " (dim=" << meta.dim << ", srht_dim=" << meta.dim
               << ", available=" << meta.count << ", ingesting=" << ingest_limit
               << ", srht_seed=" << seed << ", rounds=" << rounds << ", bits=" << bits << ")\n";
 
@@ -272,11 +271,7 @@ int main(int argc, char** argv) {
       }
       MultiRoundReader limited(*reader_ptr, ingest_limit, variance ? &pre_variances : nullptr,
                                rounds, seed, variance ? &round_variances : nullptr);
-      std::size_t store_dim = meta.dim;
-      for (std::size_t r = 0; r < rounds; ++r) {
-        store_dim = vectorcache::transform::padded_dim(store_dim);
-      }
-      engine = vectorcache::ingest::IngestionEngine::from_rotated(store_dim, bits);
+      engine = vectorcache::ingest::IngestionEngine::from_rotated(meta.dim, bits);
       engine.reserve_vectors(ingest_limit);
       if (variance) {
         report = engine.ingest_with_hook(limited, &variance_hook);

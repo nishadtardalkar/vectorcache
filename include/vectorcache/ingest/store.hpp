@@ -9,7 +9,7 @@
 
 namespace vectorcache::ingest {
 
-/// Flat in-RAM index: contiguous L0 codes + parallel ids.
+/// Flat in-RAM index: contiguous L0 codes + parallel ids + per-vector IP scales.
 class VectorStore {
  public:
   VectorStore(std::size_t l0_words_per_vec, std::size_t input_dim, std::size_t srht_dim,
@@ -28,9 +28,11 @@ class VectorStore {
   std::span<const std::uint64_t> vector_l0(std::size_t index) const;
   std::span<const std::uint64_t> l0_codes() const { return codes_; }
   std::span<const std::size_t> ids() const { return ids_; }
+  std::span<const float> scales() const { return scales_; }
   std::size_t id_at(std::size_t index) const;
+  float scale_at(std::size_t index) const;
 
-  void push(std::size_t id, std::span<const std::uint64_t> l0);
+  void push(std::size_t id, std::span<const std::uint64_t> l0, float scale = 1.0f);
   void reserve(std::size_t n);
 
  private:
@@ -40,6 +42,7 @@ class VectorStore {
   std::size_t srht_dim_;
   AlignedVector<std::uint64_t> codes_;
   std::vector<std::size_t> ids_;
+  std::vector<float> scales_;
 };
 
 }  // namespace vectorcache::ingest

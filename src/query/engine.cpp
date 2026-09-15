@@ -158,6 +158,7 @@ void search_flat(const ingest::VectorStore& store, const PreparedQuery& query,
   QueryLut lut;
   build_query_lut(query.rotated, codebook, lut);
 
+  const auto scales = store.scales();
   alignas(64) float score_buf[kScoreChunk];
   float threshold = topk.reject_threshold();
   for (std::size_t base = 0; base < n; base += kScoreChunk) {
@@ -165,10 +166,11 @@ void search_flat(const ingest::VectorStore& store, const PreparedQuery& query,
     asymmetric_ip_batch_lut(lut, codes.subspan(base * words, chunk * words), words, chunk, codebook,
                             query.rotated, std::span<float>(score_buf, chunk));
     for (std::size_t i = 0; i < chunk; ++i) {
-      if (score_buf[i] < threshold) {
+      const float score = score_buf[i] * scales[base + i];
+      if (score < threshold) {
         continue;
       }
-      topk.push(ids[base + i], score_buf[i]);
+      topk.push(ids[base + i], score);
     }
     threshold = topk.reject_threshold();
   }
@@ -195,10 +197,7 @@ void prepare_query_into(const ingest::VectorStore& store,
     }
     std::memcpy(prepared.rotated.data(), query.data(), input_dim * sizeof(float));
     transform::l2_normalize_in_place(std::span<float>(prepared.rotated.data(), input_dim));
-    if (srht_dim > input_dim) {
-      std::memset(prepared.rotated.data() + input_dim, 0, (srht_dim - input_dim) * sizeof(float));
-    }
-    rotation->apply_in_place(prepared.rotated);
+    rotation->apply_in_place(std::span<float>(prepared.rotated.data(), srht_dim));
   } else {
     throw Error("QueryEngine requires with_rotation() or from_rotated()");
   }

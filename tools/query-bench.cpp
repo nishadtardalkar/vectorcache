@@ -188,8 +188,7 @@ std::vector<std::size_t> exact_topk(std::span<const float> query_norm, const std
   }
 
   std::sort_heap(heap.begin(), heap.end(), worse);
-  // After sort_heap with worse (max-oriented), ascending by worse means best last; reverse.
-  std::reverse(heap.begin(), heap.end());
+  // `worse` treats higher score as "less", so sort_heap places the best hit first.
 
   std::vector<std::size_t> ids;
   ids.reserve(heap.size());
@@ -329,9 +328,8 @@ int main(int argc, char** argv) {
       throw vectorcache::Error("empty index");
     }
 
-    const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
     std::cout << "Query bench: index=" << source_label << " dim=" << meta.dim
-              << " padded=" << padded << " index_n=" << actual_index
+              << " srht_dim=" << meta.dim << " index_n=" << actual_index
               << " query_n=" << query_limit << " query_split=" << query_split
               << " bits=" << bits << '\n';
     if (limit && *limit < meta.count) {

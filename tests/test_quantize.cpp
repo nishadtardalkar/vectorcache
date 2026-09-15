@@ -55,20 +55,46 @@ TEST(QuantizeTest, Bits2NearestCentroidAndPack) {
   EXPECT_EQ(unpack_code(words, 0, 2), 3u);
   EXPECT_EQ(unpack_code(words, 1, 2), 0u);
 
-  // Round-trip: reconstructed value is the chosen centroid.
   EXPECT_FLOAT_EQ(codebook.centroid_at(unpack_code(words, 0, 2)), codebook.centroid_at(3));
 }
 
-TEST(QuantizeTest, Bits1CentroidsMatchAnalytical) {
-  constexpr std::size_t dim = 256;
-  LloydMaxCodebook codebook(dim, 1);
-  const float expected = std::sqrt(2.0f / (static_cast<float>(3.14159265f) * static_cast<float>(dim)));
-  EXPECT_NEAR(codebook.centroid_at(1), expected, 1e-4f);
-  EXPECT_NEAR(codebook.centroid_at(0), -expected, 1e-4f);
+TEST(QuantizeTest, BetaCodebookSymmetricAndOrdered) {
+  constexpr std::size_t dim = 200;
+  LloydMaxCodebook codebook(dim, 4);
+  ASSERT_EQ(codebook.num_centroids(), 16u);
+  ASSERT_EQ(codebook.boundaries().size(), 15u);
+
+  // Centroids and boundaries ascending; roughly symmetric around 0.
+  for (std::size_t i = 0; i + 1 < codebook.num_centroids(); ++i) {
+    EXPECT_LT(codebook.centroid_at(static_cast<std::uint32_t>(i)),
+              codebook.centroid_at(static_cast<std::uint32_t>(i + 1)));
+  }
+  for (std::size_t i = 0; i < codebook.boundaries().size(); ++i) {
+    const float expect =
+        0.5f * (codebook.centroid_at(static_cast<std::uint32_t>(i)) +
+                codebook.centroid_at(static_cast<std::uint32_t>(i + 1)));
+    EXPECT_FLOAT_EQ(codebook.boundaries()[i], expect);
+  }
+  const float c0 = codebook.centroid_at(0);
+  const float cN = codebook.centroid_at(15);
+  EXPECT_NEAR(c0, -cN, 1e-4f);
+  EXPECT_GT(std::abs(c0), 0.0f);
+  EXPECT_LE(std::abs(c0), 1.0f);
+}
+
+TEST(QuantizeTest, IpScaleAlphaUnitSelf) {
+  constexpr std::size_t dim = 32;
+  LloydMaxCodebook codebook(dim, 2);
+  std::vector<float> u(dim, 0.0f);
+  u[0] = 1.0f;  // already unit
+  const auto [words, _] = quantize_1dim_to_nbit(u, codebook);
+  const float alpha = ip_scale_alpha(u, words, codebook);
+  EXPECT_GT(alpha, 1.0f);  // reconstruction shorter than unit → α > 1
 }
 
 TEST(QuantizeTest, RejectInvalidBits) {
   EXPECT_THROW(validate_bits_per_dim(0), vectorcache::Error);
   EXPECT_THROW(validate_bits_per_dim(9), vectorcache::Error);
   EXPECT_THROW(LloydMaxCodebook(64, 0), vectorcache::Error);
+  EXPECT_THROW(LloydMaxCodebook(1, 2), vectorcache::Error);
 }

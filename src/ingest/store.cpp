@@ -49,12 +49,20 @@ std::size_t VectorStore::id_at(std::size_t index) const {
   return ids_[index];
 }
 
+float VectorStore::scale_at(std::size_t index) const {
+  if (index >= scales_.size()) {
+    throw Error("VectorStore::scale_at index out of range");
+  }
+  return scales_[index];
+}
+
 void VectorStore::reserve(std::size_t n) {
   codes_.reserve(n * l0_words_per_vec_);
   ids_.reserve(n);
+  scales_.reserve(n);
 }
 
-void VectorStore::push(std::size_t id, std::span<const std::uint64_t> l0) {
+void VectorStore::push(std::size_t id, std::span<const std::uint64_t> l0, float scale) {
   if (l0.size() != l0_words_per_vec_) {
     throw Error("L0 word count mismatch: expected " + std::to_string(l0_words_per_vec_) + ", got " +
                 std::to_string(l0.size()));
@@ -63,6 +71,7 @@ void VectorStore::push(std::size_t id, std::span<const std::uint64_t> l0) {
   codes_.resize(offset + l0_words_per_vec_);
   std::memcpy(codes_.data() + offset, l0.data(), l0.size_bytes());
   ids_.push_back(id);
+  scales_.push_back(scale);
 }
 
 }  // namespace vectorcache::ingest

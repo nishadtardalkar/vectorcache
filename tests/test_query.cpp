@@ -215,10 +215,10 @@ TEST(QueryEngineTest, FlatScanFindsBothNearVectors) {
   b[20] = 4.2f;
 
   MockReader reader({a, b}, dim);
-  auto ingest_engine = ingest::IngestionEngine::from_rotated(dim);
+  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42, /*bits=*/4);
   ingest_engine.ingest(reader);
 
-  auto query_engine = query::QueryEngine::from_rotated(ingest_engine.store());
+  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
   query::QueryParams params;
   params.k = 2;
 

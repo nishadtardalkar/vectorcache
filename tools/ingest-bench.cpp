@@ -160,10 +160,6 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
                                                                t_norm)
               .count());
 
-      if (srht_dim > dim) {
-        std::memset(rotated[i].data() + dim, 0, (srht_dim - dim) * sizeof(float));
-      }
-
       const auto t_srht = std::chrono::steady_clock::now();
       rotation.apply_in_place(rotated[i]);
       totals.srht_ns += static_cast<std::uint64_t>(
@@ -173,13 +169,14 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
 
       const auto t_l0 = std::chrono::steady_clock::now();
       vectorcache::quantize::quantize_1dim_to_nbit_into(rotated[i], codebook, l0[i]);
+      const float alpha = vectorcache::quantize::ip_scale_alpha(rotated[i], l0[i], codebook);
       totals.quantize_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                t_l0)
               .count());
 
       const auto t_store = std::chrono::steady_clock::now();
-      store.push(processed + i, l0[i]);
+      store.push(processed + i, l0[i], alpha);
       totals.store_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                                t_store)
@@ -314,9 +311,8 @@ int main(int argc, char** argv) {
       throw vectorcache::Error("dataset has no vectors to profile");
     }
 
-    const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
-    std::cout << "Ingest bench: " << source_label << " (dim=" << meta.dim << ", srht_dim=" << padded
-              << ", vectors=" << actual_limit
+    std::cout << "Ingest bench: " << source_label << " (dim=" << meta.dim
+              << ", srht_dim=" << meta.dim << ", vectors=" << actual_limit
               << ", srht_rounds=" << vectorcache::transform::srht_rounds()
               << ", bits=" << bits << ")\n";
     if (limit && *limit < meta.count) {
@@ -324,7 +320,7 @@ int main(int argc, char** argv) {
     }
     std::cout << '\n';
 
-    const auto stages = profile_stages(*reader1, meta.dim, padded, seed, actual_limit, bits);
+    const auto stages = profile_stages(*reader1, meta.dim, meta.dim, seed, actual_limit, bits);
     print_stage_report("Per-stage (sequential micro-profile)", stages);
 
     auto [reader2, _] = open_reader(npy_path, dataset, data_dir, split);

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -15,65 +14,197 @@ namespace vectorcache::quantize {
 
 namespace {
 
-constexpr double kPi = 3.14159265358979323846;
+/// Continued fraction for incomplete beta (Numerical Recipes / Cephes style).
+double betacf(double a, double b, double x) {
+  constexpr int kMaxIt = 200;
+  constexpr double kEps = 3e-14;
+  constexpr double kFpmin = 1e-300;
 
-double gaussian_pdf(double x) {
-  return std::exp(-0.5 * x * x) / std::sqrt(2.0 * kPi);
-}
+  const double qab = a + b;
+  const double qap = a + 1.0;
+  const double qam = a - 1.0;
+  double c = 1.0;
+  double d = 1.0 - qab * x / qap;
+  if (std::abs(d) < kFpmin) {
+    d = kFpmin;
+  }
+  d = 1.0 / d;
+  double h = d;
 
-double gaussian_cdf(double x) {
-  return 0.5 * (1.0 + std::erf(x / std::sqrt(2.0)));
-}
-
-/// Conditional expectation E[X | a < X <= b] for X ~ N(0,1).
-double gaussian_conditional_mean(double a, double b) {
-  const double fa = std::isfinite(a) ? gaussian_pdf(a) : 0.0;
-  const double fb = std::isfinite(b) ? gaussian_pdf(b) : 0.0;
-  const double ca = std::isfinite(a) ? gaussian_cdf(a) : 0.0;
-  const double cb = std::isfinite(b) ? gaussian_cdf(b) : 1.0;
-  const double mass = cb - ca;
-  if (mass < 1e-15) {
-    if (std::isfinite(a) && std::isfinite(b)) {
-      return 0.5 * (a + b);
+  for (int m = 1; m <= kMaxIt; ++m) {
+    const int m2 = 2 * m;
+    double aa = static_cast<double>(m) * (b - static_cast<double>(m)) * x /
+                ((qam + m2) * (a + m2));
+    d = 1.0 + aa * d;
+    if (std::abs(d) < kFpmin) {
+      d = kFpmin;
     }
+    c = 1.0 + aa / c;
+    if (std::abs(c) < kFpmin) {
+      c = kFpmin;
+    }
+    d = 1.0 / d;
+    h *= d * c;
+
+    aa = -(a + static_cast<double>(m)) * (qab + static_cast<double>(m)) * x /
+         ((a + m2) * (qap + m2));
+    d = 1.0 + aa * d;
+    if (std::abs(d) < kFpmin) {
+      d = kFpmin;
+    }
+    c = 1.0 + aa / c;
+    if (std::abs(c) < kFpmin) {
+      c = kFpmin;
+    }
+    d = 1.0 / d;
+    const double del = d * c;
+    h *= del;
+    if (std::abs(del - 1.0) < kEps) {
+      break;
+    }
+  }
+  return h;
+}
+
+/// Regularized incomplete beta I_x(a, b).
+double betai(double a, double b, double x) {
+  if (x <= 0.0) {
     return 0.0;
   }
-  return (fa - fb) / mass;
+  if (x >= 1.0) {
+    return 1.0;
+  }
+  const double lbeta = std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b);
+  const double bt = std::exp(a * std::log(x) + b * std::log(1.0 - x) - lbeta);
+  if (x < (a + 1.0) / (a + b + 2.0)) {
+    return bt * betacf(a, b, x) / a;
+  }
+  return 1.0 - bt * betacf(b, a, 1.0 - x) / b;
 }
 
-std::vector<double> lloyd_max_std_normal(std::size_t bits) {
-  const std::size_t k = std::size_t{1} << bits;
-  constexpr double kRange = 4.0;
-  std::vector<double> centroids(k);
-  for (std::size_t i = 0; i < k; ++i) {
-    centroids[i] = -kRange + (2.0 * kRange) * (static_cast<double>(i) + 0.5) / static_cast<double>(k);
+struct BetaAA {
+  double a;
+  double log_norm;  // -log B(a,a) = lgamma(2a) - 2*lgamma(a)
+
+  explicit BetaAA(double shape) : a(shape), log_norm(std::lgamma(2.0 * shape) - 2.0 * std::lgamma(shape)) {}
+
+  double pdf01(double t) const {
+    if (t <= 0.0 || t >= 1.0) {
+      return 0.0;
+    }
+    return std::exp((a - 1.0) * std::log(t) + (a - 1.0) * std::log(1.0 - t) + log_norm);
   }
 
-  std::vector<double> boundaries(k > 1 ? k - 1 : 0);
+  double cdf01(double t) const {
+    if (t <= 0.0) {
+      return 0.0;
+    }
+    if (t >= 1.0) {
+      return 1.0;
+    }
+    return betai(a, a, t);
+  }
+
+  /// PDF of shifted Beta on [-1, 1]: X = 2T - 1.
+  double pdf_shifted(double x) const { return pdf01((x + 1.0) / 2.0) / 2.0; }
+
+  double cdf_shifted(double x) const { return cdf01((x + 1.0) / 2.0); }
+};
+
+double adaptive_simpson(const auto& f, double a, double b, double tol, int max_depth) {
+  const auto rec = [&](auto&& self, double lo, double hi, double flo, double fhi, double fmid,
+                       double whole, double eps, int depth) -> double {
+    const double mid = 0.5 * (lo + hi);
+    const double m1 = 0.5 * (lo + mid);
+    const double m2 = 0.5 * (mid + hi);
+    const double fm1 = f(m1);
+    const double fm2 = f(m2);
+    const double left = (mid - lo) / 6.0 * (flo + 4.0 * fm1 + fmid);
+    const double right = (hi - mid) / 6.0 * (fmid + 4.0 * fm2 + fhi);
+    const double refined = left + right;
+    if (depth == 0 || std::abs(refined - whole) < 15.0 * eps) {
+      return refined + (refined - whole) / 15.0;
+    }
+    return self(self, lo, mid, flo, fmid, fm1, left, eps * 0.5, depth - 1) +
+           self(self, mid, hi, fmid, fhi, fm2, right, eps * 0.5, depth - 1);
+  };
+
+  const double mid = 0.5 * (a + b);
+  const double fa = f(a);
+  const double fb = f(b);
+  const double fm = f(mid);
+  const double whole = (b - a) / 6.0 * (fa + 4.0 * fm + fb);
+  return rec(rec, a, b, fa, fb, fm, whole, tol, max_depth);
+}
+
+/// Lloyd-Max for Beta((dim-1)/2,(dim-1)/2) on [-1, 1] (TurboVec codebook.rs).
+std::pair<std::vector<float>, std::vector<float>> lloyd_max_beta(std::size_t bits, std::size_t dim) {
+  const double a = (static_cast<double>(dim) - 1.0) / 2.0;
+  const BetaAA beta(a);
+  const std::size_t n_levels = std::size_t{1} << bits;
+
+  // std of Beta on [-1,1]: sqrt(2a / ((2a+1) * 4a))
+  const double std_dev = std::sqrt(2.0 * a / ((2.0 * a + 1.0) * 4.0 * a));
+  const double spread = 3.0 * std_dev;
+  std::vector<double> centroids(n_levels);
+  if (n_levels == 1) {
+    centroids[0] = 0.0;
+  } else {
+    for (std::size_t i = 0; i < n_levels; ++i) {
+      centroids[i] = -spread + 2.0 * spread * static_cast<double>(i) / static_cast<double>(n_levels - 1);
+    }
+  }
+
   constexpr int kMaxIters = 200;
-  constexpr double kTol = 1e-10;
+  constexpr double kTol = 1e-12;
   for (int iter = 0; iter < kMaxIters; ++iter) {
-    for (std::size_t i = 0; i + 1 < k; ++i) {
+    std::vector<double> boundaries(n_levels > 1 ? n_levels - 1 : 0);
+    for (std::size_t i = 0; i + 1 < n_levels; ++i) {
       boundaries[i] = 0.5 * (centroids[i] + centroids[i + 1]);
     }
 
-    double max_delta = 0.0;
-    for (std::size_t i = 0; i < k; ++i) {
-      const double lo = (i == 0) ? -std::numeric_limits<double>::infinity() : boundaries[i - 1];
-      const double hi =
-          (i + 1 == k) ? std::numeric_limits<double>::infinity() : boundaries[i];
-      const double updated = gaussian_conditional_mean(lo, hi);
-      max_delta = std::max(max_delta, std::abs(updated - centroids[i]));
-      centroids[i] = updated;
+    std::vector<double> edges;
+    edges.reserve(n_levels + 1);
+    edges.push_back(-1.0);
+    edges.insert(edges.end(), boundaries.begin(), boundaries.end());
+    edges.push_back(1.0);
+
+    std::vector<double> new_centroids(n_levels);
+    for (std::size_t i = 0; i < n_levels; ++i) {
+      const double lo = edges[i];
+      const double hi = edges[i + 1];
+      const double cdf_lo = beta.cdf_shifted(lo);
+      const double cdf_hi = beta.cdf_shifted(hi);
+      const double prob = cdf_hi - cdf_lo;
+      if (prob < 1e-15) {
+        new_centroids[i] = centroids[i];
+      } else {
+        const double mean = adaptive_simpson(
+            [&](double x) { return x * beta.pdf_shifted(x); }, lo, hi, 1e-14, 50);
+        new_centroids[i] = mean / prob;
+      }
     }
-    if (max_delta < kTol) {
+
+    double max_change = 0.0;
+    for (std::size_t i = 0; i < n_levels; ++i) {
+      max_change = std::max(max_change, std::abs(new_centroids[i] - centroids[i]));
+    }
+    centroids = std::move(new_centroids);
+    if (max_change < kTol) {
       break;
     }
   }
 
-  // Enforce ascending order (numerical safety).
-  std::sort(centroids.begin(), centroids.end());
-  return centroids;
+  // Cast to f32 first, then midpoints in f32 (TurboVec cross-platform stability).
+  std::vector<float> centroids_f32(n_levels);
+  for (std::size_t i = 0; i < n_levels; ++i) {
+    centroids_f32[i] = static_cast<float>(centroids[i]);
+  }
+  std::vector<float> boundaries_f32(n_levels > 1 ? n_levels - 1 : 0);
+  for (std::size_t i = 0; i + 1 < n_levels; ++i) {
+    boundaries_f32[i] = 0.5f * (centroids_f32[i] + centroids_f32[i + 1]);
+  }
+  return {std::move(boundaries_f32), std::move(centroids_f32)};
 }
 
 }  // namespace
@@ -95,24 +226,15 @@ std::size_t l0_words_per_vector(std::size_t dim, std::size_t bits) {
   return (total_bits + 63) / 64;
 }
 
-LloydMaxCodebook::LloydMaxCodebook(std::size_t srht_dim, std::size_t bits)
-    : srht_dim_(srht_dim), bits_(bits) {
-  if (srht_dim_ == 0) {
-    throw Error("LloydMaxCodebook: srht_dim must be > 0");
+LloydMaxCodebook::LloydMaxCodebook(std::size_t dim, std::size_t bits) : dim_(dim), bits_(bits) {
+  if (dim_ < 2) {
+    throw Error("LloydMaxCodebook: dim must be >= 2");
   }
   validate_bits_per_dim(bits_);
 
-  const auto std_centroids = lloyd_max_std_normal(bits_);
-  const float scale = 1.0f / std::sqrt(static_cast<float>(srht_dim_));
-  centroids_.resize(std_centroids.size());
-  for (std::size_t i = 0; i < std_centroids.size(); ++i) {
-    centroids_[i] = static_cast<float>(std_centroids[i]) * scale;
-  }
-
-  boundaries_.resize(centroids_.size() > 1 ? centroids_.size() - 1 : 0);
-  for (std::size_t i = 0; i + 1 < centroids_.size(); ++i) {
-    boundaries_[i] = 0.5f * (centroids_[i] + centroids_[i + 1]);
-  }
+  auto [boundaries, centroids] = lloyd_max_beta(bits_, dim_);
+  boundaries_ = std::move(boundaries);
+  centroids_ = std::move(centroids);
 }
 
 std::uint32_t LloydMaxCodebook::encode(float x) const {
@@ -120,6 +242,7 @@ std::uint32_t LloydMaxCodebook::encode(float x) const {
   if (k == 0) {
     throw Error("LloydMaxCodebook::encode on empty codebook");
   }
+  // Clamp to support region [-1, 1]; extremes map to edge codes.
   std::uint32_t idx = 0;
   while (idx < boundaries_.size() && x > boundaries_[idx]) {
     ++idx;
@@ -140,7 +263,6 @@ std::uint32_t unpack_code(std::span<const std::uint64_t> words, std::size_t dim_
     }
     return static_cast<std::uint32_t>((words[word_i] >> bit_i) & mask);
   }
-  // Spans two words.
   if (word_i + 1 >= words.size()) {
     throw Error("unpack_code: straddling word index out of range");
   }
@@ -155,8 +277,8 @@ std::size_t quantize_1dim_to_nbit_into(std::span<const float> vector,
                                        std::span<std::uint64_t> out) {
   const std::size_t dim = vector.size();
   const std::size_t bits = codebook.bits();
-  if (dim != codebook.srht_dim()) {
-    throw Error("quantize_1dim_to_nbit_into: vector dim must match codebook srht_dim");
+  if (dim != codebook.dim()) {
+    throw Error("quantize_1dim_to_nbit_into: vector dim must match codebook dim");
   }
   const std::size_t need_words = l0_words_per_vector(dim, bits);
   if (out.size() < need_words) {
@@ -187,6 +309,28 @@ std::pair<std::vector<std::uint64_t>, std::size_t> quantize_1dim_to_nbit(
   std::vector<std::uint64_t> words(num_words, 0);
   const std::size_t num_bits = quantize_1dim_to_nbit_into(vector, codebook, words);
   return {std::move(words), num_bits};
+}
+
+float ip_scale_alpha(std::span<const float> rotated_unit, std::span<const std::uint64_t> codes,
+                     const LloydMaxCodebook& codebook) {
+  const std::size_t dim = codebook.dim();
+  const std::size_t bits = codebook.bits();
+  if (rotated_unit.size() != dim) {
+    throw Error("ip_scale_alpha: rotated dim mismatch");
+  }
+  if (codes.size() < l0_words_per_vector(dim, bits)) {
+    throw Error("ip_scale_alpha: codes too small");
+  }
+  double ip = 0.0;
+  for (std::size_t d = 0; d < dim; ++d) {
+    const std::uint32_t code = unpack_code(codes, d, bits);
+    ip += static_cast<double>(rotated_unit[d]) * static_cast<double>(codebook.centroid_at(code));
+  }
+  if (std::abs(ip) < 1e-12) {
+    return 0.0f;
+  }
+  // Unit vectors: ||v|| = 1 after L2 normalize → α = 1 / <u, x_hat>.
+  return static_cast<float>(1.0 / ip);
 }
 
 }  // namespace vectorcache::quantize

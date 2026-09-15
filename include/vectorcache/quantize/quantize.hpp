@@ -20,13 +20,15 @@ std::size_t l0_bits_per_vector(std::size_t dim, std::size_t bits = 1);
 /// Number of u64 words needed to store L0 codes for dim floats at bits-per-dim.
 std::size_t l0_words_per_vector(std::size_t dim, std::size_t bits = 1);
 
-/// Lloyd-Max codebook for N(0, 1/srht_dim) with 2^bits centroids (TurboQuantMSE).
+/// Lloyd-Max codebook for Beta((dim-1)/2, (dim-1)/2) on [-1, 1] (TurboQuant / TurboVec).
+/// After an orthogonal rotation of a unit vector, each coordinate follows this law.
 class LloydMaxCodebook {
  public:
   LloydMaxCodebook() = default;
-  LloydMaxCodebook(std::size_t srht_dim, std::size_t bits);
+  LloydMaxCodebook(std::size_t dim, std::size_t bits);
 
-  std::size_t srht_dim() const { return srht_dim_; }
+  std::size_t srht_dim() const { return dim_; }
+  std::size_t dim() const { return dim_; }
   std::size_t bits() const { return bits_; }
   std::size_t num_centroids() const { return centroids_.size(); }
   std::span<const float> centroids() const { return centroids_; }
@@ -38,7 +40,7 @@ class LloydMaxCodebook {
   float centroid_at(std::uint32_t index) const { return centroids_[index]; }
 
  private:
-  std::size_t srht_dim_ = 0;
+  std::size_t dim_ = 0;
   std::size_t bits_ = 0;
   std::vector<float> centroids_;
   std::vector<float> boundaries_;  // size K-1; region i is (-inf, b0], (b0,b1], ...
@@ -56,5 +58,9 @@ std::pair<std::vector<std::uint64_t>, std::size_t> quantize_1dim_to_nbit(
 /// Unpack centroid index for dimension `dim_index` from a packed L0 code row.
 std::uint32_t unpack_code(std::span<const std::uint64_t> words, std::size_t dim_index,
                           std::size_t bits);
+
+/// RaBitQ / TurboVec length-renorm scale: ||u|| / <u, x_hat> for unit u (||u||=1 → 1/<u,x_hat>).
+float ip_scale_alpha(std::span<const float> rotated_unit, std::span<const std::uint64_t> codes,
+                     const LloydMaxCodebook& codebook);
 
 }  // namespace vectorcache::quantize

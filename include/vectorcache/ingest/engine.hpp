@@ -39,6 +39,7 @@ class IngestionEngine {
   struct VectorWork {
     AlignedVector<float> buf;  // length srht_dim_
     AlignedVector<std::uint64_t> l0;
+    float alpha = 1.0f;
   };
 
   IngestionEngine(VectorStore store, std::optional<transform::SrhtRotation> rotation,

@@ -2,7 +2,7 @@
 
 Flat quantized vector retrieval engine (C++20).
 
-VectorCache implements approximate nearest neighbor search via **SRHT** (L2-normalize, zero-pad for FWHT) and **TurboQuantMSE** codes (`n` bits per dimension, default 1). Vectors are stored in a flat in-RAM index; queries score every code with asymmetric inner-product top-k in rotated space.
+VectorCache implements approximate nearest neighbor search via a **TurboVec-style** orthogonal rotation (perm + signs + block Walsh–Hadamard) and **TurboQuant** Beta Lloyd-Max codes (`n` bits per dimension, default 1), with per-vector IP length renormalization. Vectors are stored in a flat in-RAM index; queries score every code with asymmetric inner-product top-k in rotated space.
 
 ## Requirements
 
@@ -85,9 +85,9 @@ For maximum single-node performance on homogeneous clusters:
 cmake .. -DCMAKE_CXX_FLAGS="-march=native"
 ```
 
-### SRHT round count (compile-time)
+### Rotation round count (compile-time)
 
-Default is 1 round (`H·D`). To build with multiple rounds:
+Default is **2** rounds (TurboVec-compatible). Each round is global perm → signs → block Hadamard. To override:
 
 ```bash
 cmake .. -DVECTORCACHE_SRHT_ROUNDS=3
@@ -97,7 +97,7 @@ Allowed values: `1`, `2`, or `3`. Reconfigure and rebuild after changing; there 
 
 ### Bits per dimension (runtime)
 
-TurboQuantMSE uses `n` bits per SRHT coordinate (`2^n` Lloyd-Max centroids). Default is `1`. Pass `--bits` on CLI tools or `BITS=` to `make compute` (allowed: 1–8).
+TurboQuant uses `n` bits per rotated coordinate (`2^n` Lloyd-Max centroids for Beta((d−1)/2,(d−1)/2) on `[-1,1]`). Default is `1`. Pass `--bits` on CLI tools or `BITS=` to `make compute` (allowed: 1–8).
 
 ```bash
 ./query-bench --dataset glove --bits 2
