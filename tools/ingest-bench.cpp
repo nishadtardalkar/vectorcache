@@ -113,8 +113,8 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 }
 
 StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::size_t dim,
-                           std::size_t srht_dim, std::uint64_t seed, std::size_t limit) {
-  constexpr std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
+                           std::size_t srht_dim, std::uint64_t seed, std::size_t limit,
+                           std::size_t top_d) {
   const vectorcache::transform::SrhtRotation rotation(dim, seed);
   const std::size_t l0_words = vectorcache::quantize::l0_words_per_vector(srht_dim);
   const std::size_t batch_cap =
@@ -203,9 +203,8 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
 }
 
 std::uint64_t profile_engine(vectorcache::datasets::DatasetReader& reader, std::size_t dim,
-                             std::uint64_t seed, std::size_t limit) {
+                             std::uint64_t seed, std::size_t limit, std::size_t top_d) {
   LimitedReader limited(reader, limit);
-  constexpr std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
   auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, top_d);
   engine.reserve_vectors(limit);
   const auto start = std::chrono::steady_clock::now();
@@ -303,6 +302,7 @@ int main(int argc, char** argv) {
   std::string split = "train";
   std::optional<std::size_t> limit;
   std::uint64_t seed = 42;
+  std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
   app.add_option("--dataset", dataset, "Dataset name")->envname("VECTORCACHE_DATASET");
@@ -310,12 +310,17 @@ int main(int argc, char** argv) {
   app.add_option("--split", split, "HDF5 split for GloVe");
   app.add_option("--limit", limit, "Cap vectors profiled");
   app.add_option("--seed", seed, "SRHT seed");
+  app.add_option("--top-d", top_d, "Support-key top-d (dim selection depth)");
 
   CLI11_PARSE(app, argc, argv);
 
   try {
     if (npy_path.empty() && dataset.empty()) {
       throw vectorcache::Error("pass --dataset or --npy");
+    }
+    if (top_d == 0 || top_d > vectorcache::quantize::kMaxSupportDepth) {
+      throw vectorcache::Error("--top-d must be in 1.." +
+                               std::to_string(vectorcache::quantize::kMaxSupportDepth));
     }
 
     auto [reader1, source_label] = open_reader(npy_path, dataset, data_dir, split);
@@ -327,18 +332,18 @@ int main(int argc, char** argv) {
 
     const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
     std::cout << "Ingest bench: " << source_label << " (dim=" << meta.dim << ", srht_dim=" << padded
-              << ", vectors=" << actual_limit
+              << ", vectors=" << actual_limit << ", top_d=" << top_d
               << ", srht_rounds=" << vectorcache::transform::srht_rounds() << ")\n";
     if (limit && *limit < meta.count) {
       std::cout << "  (capped from " << meta.count << " vectors in dataset)\n";
     }
     std::cout << '\n';
 
-    const auto stages = profile_stages(*reader1, meta.dim, padded, seed, actual_limit);
+    const auto stages = profile_stages(*reader1, meta.dim, padded, seed, actual_limit, top_d);
     print_stage_report("Per-stage (sequential micro-profile)", stages);
 
     auto [reader2, _] = open_reader(npy_path, dataset, data_dir, split);
-    const auto wall_ns = profile_engine(*reader2, meta.dim, seed, actual_limit);
+    const auto wall_ns = profile_engine(*reader2, meta.dim, seed, actual_limit, top_d);
     print_wall_report(wall_ns, actual_limit, stages);
 
     return 0;

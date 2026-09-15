@@ -115,6 +115,7 @@ Ingest vectors and optionally report variance:
 ./ingest-sample --npy data/.cache/glove-sample-100.npy
 ./ingest-sample --dataset glove --limit 100 --variance
 ./ingest-sample --dataset glove --limit 100 --variance --show-index 0
+./ingest-sample --dataset glove --limit 100 --top-d 8
 ```
 
 Environment variables:
@@ -129,6 +130,7 @@ Profile ingestion stage hot paths into an in-memory `ParentStore`:
 ./ingest-bench --dataset glove
 ./ingest-bench --dataset glove --limit 50000
 ./ingest-bench --npy data/openai-1536.npy --limit 50000
+./ingest-bench --dataset glove --top-d 8
 ```
 
 ### query-bench
@@ -138,7 +140,10 @@ Ingest into RAM, then search (support-key probe + L0 scoring):
 ```bash
 ./query-bench --dataset glove
 ./query-bench --dataset glove --k 10
+./query-bench --dataset glove --top-d 8
 ```
+
+`--top-d` sets support-key depth (default `4`, range `1..16`).
 
 Environment variables:
 - `VECTORCACHE_DATASET` / `VECTORCACHE_DATA_DIR`

@@ -71,9 +71,8 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 
 vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
                                                   std::size_t dim, std::uint64_t seed,
-                                                  std::size_t limit) {
+                                                  std::size_t limit, std::size_t top_d) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
-  constexpr std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
   auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, top_d);
   engine.reserve_vectors(limit);
   const auto report = engine.ingest(limited);
@@ -288,6 +287,7 @@ int main(int argc, char** argv) {
   std::size_t query_limit = 0;
   std::uint64_t seed = 42;
   std::size_t k = 10;
+  std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
   std::uint8_t max_hd = 2;
   std::size_t max_l0_candidates = 4096;
   bool calibrate = false;
@@ -303,6 +303,7 @@ int main(int argc, char** argv) {
   app.add_option("--query-limit", query_limit, "Query count (default: 10000 GloVe, 1000 else)");
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
+  app.add_option("--top-d", top_d, "Support-key top-d (dim selection depth)");
   app.add_option("--max-hd", max_hd, "Max support-key Hamming distance to probe (0, 2, or 4)");
   app.add_option("--max-l0-candidates", max_l0_candidates, "Cap on L0 rows scored per query");
   app.add_flag("--calibrate", calibrate, "Print parent-key probe stats for the first query");
@@ -314,6 +315,10 @@ int main(int argc, char** argv) {
   try {
     if (npy_path.empty() && dataset.empty()) {
       throw vectorcache::Error("pass --dataset or --npy");
+    }
+    if (top_d == 0 || top_d > vectorcache::quantize::kMaxSupportDepth) {
+      throw vectorcache::Error("--top-d must be in 1.." +
+                               std::to_string(vectorcache::quantize::kMaxSupportDepth));
     }
 
     if (query_split.empty()) {
@@ -333,13 +338,14 @@ int main(int argc, char** argv) {
     const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
     std::cout << "Query bench: index=" << source_label << " dim=" << meta.dim
               << " padded=" << padded << " index_n=" << actual_index
-              << " query_n=" << query_limit << " query_split=" << query_split << '\n';
+              << " query_n=" << query_limit << " query_split=" << query_split
+              << " top_d=" << top_d << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
     }
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
-    auto ingest_engine = ingest_index(index_limited, meta.dim, seed, actual_index);
+    auto ingest_engine = ingest_index(index_limited, meta.dim, seed, actual_index, top_d);
     std::cout << "  unique_parents=" << ingest_engine.store().unique_parent_count() << '\n';
 
     auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);

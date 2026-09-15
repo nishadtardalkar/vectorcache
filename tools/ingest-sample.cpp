@@ -204,6 +204,7 @@ int main(int argc, char** argv) {
   std::string split = "train";
   std::uint64_t seed = 42;
   std::size_t rounds = 1;
+  std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
   bool variance = false;
   std::optional<std::size_t> show_index;
 
@@ -214,6 +215,7 @@ int main(int argc, char** argv) {
   app.add_option("--split", split, "HDF5 split for GloVe (train or test)");
   app.add_option("--seed", seed, "SRHT rotation seed");
   app.add_option("--rounds", rounds, "Number of consecutive SRHT rounds");
+  app.add_option("--top-d", top_d, "Support-key top-d (dim selection depth)");
   app.add_flag("--variance", variance, "Report per-vector dimension variance");
   app.add_option("--show-index", show_index, "Print stored vector at index");
 
@@ -222,6 +224,10 @@ int main(int argc, char** argv) {
   try {
     if (rounds == 0) {
       throw vectorcache::Error("--rounds must be at least 1");
+    }
+    if (top_d == 0 || top_d > vectorcache::quantize::kMaxSupportDepth) {
+      throw vectorcache::Error("--top-d must be in 1.." +
+                               std::to_string(vectorcache::quantize::kMaxSupportDepth));
     }
 
     vectorcache::datasets::DatasetSplit dataset_split = vectorcache::datasets::DatasetSplit::Train;
@@ -257,7 +263,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Dataset: " << meta.label << " (dim=" << meta.dim << ", srht_dim=" << padded
               << ", available=" << meta.count << ", ingesting=" << ingest_limit
-              << ", srht_seed=" << seed << ", rounds=" << rounds << ")\n";
+              << ", srht_seed=" << seed << ", rounds=" << rounds << ", top_d=" << top_d << ")\n";
 
     VarianceHook variance_hook(capture_vectors);
     const auto ingest_start = std::chrono::steady_clock::now();
@@ -266,7 +272,7 @@ int main(int argc, char** argv) {
     std::vector<std::vector<double>> round_variances;
     vectorcache::ingest::IngestReport report{};
     vectorcache::ingest::IngestionEngine engine =
-        vectorcache::ingest::IngestionEngine::with_rotation(meta.dim, seed);
+        vectorcache::ingest::IngestionEngine::with_rotation(meta.dim, seed, top_d);
 
     if (rounds == 1) {
       LimitedReader limited(*reader_ptr, ingest_limit, variance ? &pre_variances : nullptr);
@@ -287,7 +293,7 @@ int main(int argc, char** argv) {
       for (std::size_t r = 0; r < rounds; ++r) {
         store_dim = vectorcache::transform::padded_dim(store_dim);
       }
-      engine = vectorcache::ingest::IngestionEngine::from_rotated(store_dim);
+      engine = vectorcache::ingest::IngestionEngine::from_rotated(store_dim, top_d);
       engine.reserve_vectors(ingest_limit);
       if (variance) {
         report = engine.ingest_with_hook(limited, &variance_hook);
