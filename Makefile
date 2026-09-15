@@ -11,6 +11,18 @@ JOBS          ?= $(shell nproc 2>/dev/null || echo 4)
 DATA_DIR      ?= data
 DATASETS      ?= all
 DATASET       ?=
+NPY           ?=
+SPLIT         ?=
+LIMIT         ?=
+SEED          ?=
+TOP_D         ?=
+QUERY_SPLIT   ?=
+QUERY_LIMIT   ?=
+K             ?=
+MAX_HD        ?=
+CALIBRATE     ?=
+RECALL        ?=
+FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
 ENV_SCRIPT    := scripts/envs.sh
@@ -39,6 +51,29 @@ CMAKE_COMPUTE_FLAGS := $(CMAKE_COMMON_FLAGS) \
 	-DVECTORCACHE_FETCH_DATASETS=OFF \
 	-DVECTORCACHE_FETCH_OPENAI=OFF
 
+# Optional CLI flags: only emit when the Make variable is non-empty.
+opt_arg = $(if $(strip $($(1))),--$(2) $($(1)),)
+flag_arg = $(if $(filter 1 ON on true TRUE yes YES,$($(1))),--$(2),)
+
+# Shared ingest-bench / query-bench args (DATASET|NPY + DATA_DIR always set by compute).
+BENCH_COMMON_ARGS = \
+	$(call opt_arg,SPLIT,split) \
+	$(call opt_arg,LIMIT,limit) \
+	$(call opt_arg,SEED,seed) \
+	$(call opt_arg,TOP_D,top-d) \
+	$(BENCH_EXTRA_ARGS)
+
+INGEST_BENCH_ARGS = $(BENCH_COMMON_ARGS)
+
+QUERY_BENCH_ARGS = \
+	$(BENCH_COMMON_ARGS) \
+	$(call opt_arg,QUERY_SPLIT,query-split) \
+	$(call opt_arg,QUERY_LIMIT,query-limit) \
+	$(call opt_arg,K,k) \
+	$(call opt_arg,MAX_HD,max-hd) \
+	$(call flag_arg,CALIBRATE,calibrate) \
+	$(call flag_arg,RECALL,recall)
+
 .PHONY: help login compute clean
 
 .DEFAULT_GOAL := help
@@ -47,21 +82,35 @@ help:
 	@echo "VectorCache HPC targets:"
 	@echo ""
 	@echo "  make login    Configure CMake, fetch dependencies, download datasets (login node)"
-	@echo "  make compute  Build, test, ingest-bench, and query-bench offline (compute node; DATASET required)"
+	@echo "  make compute  Build, test, ingest-bench, and query-bench offline (compute node)"
 	@echo "  make clean    Remove build directory"
 	@echo ""
-	@echo "Variables:"
+	@echo "Build / login variables:"
 	@echo "  BUILD_DIR=$(BUILD_DIR)  BUILD_TYPE=$(BUILD_TYPE)  JOBS=$(JOBS)"
-	@echo "  DATA_DIR=$(DATA_DIR)  DATASETS=$(DATASETS)  DATASET=$(DATASET)"
-	@echo "  BENCH_EXTRA_ARGS=$(BENCH_EXTRA_ARGS)"
+	@echo "  DATA_DIR=$(DATA_DIR)  DATASETS=$(DATASETS)  FORCE=$(FORCE)"
 	@echo "  CMAKE_OPTS=$(CMAKE_OPTS)"
 	@echo "  VECTORCACHE_SRHT_ROUNDS (cmake cache, default 1): set to 2 or 3 for multi-round SRHT"
+	@echo ""
+	@echo "Bench variables (map to ingest-bench / query-bench CLI):"
+	@echo "  DATASET / NPY   --dataset or --npy (one required for compute)"
+	@echo "  DATA_DIR        --data-dir"
+	@echo "  SPLIT           --split"
+	@echo "  LIMIT           --limit"
+	@echo "  SEED            --seed"
+	@echo "  TOP_D           --top-d"
+	@echo "  QUERY_SPLIT     --query-split (query-bench only)"
+	@echo "  QUERY_LIMIT     --query-limit (query-bench only)"
+	@echo "  K               --k (query-bench only)"
+	@echo "  MAX_HD          --max-hd (query-bench only)"
+	@echo "  CALIBRATE=1     --calibrate (query-bench only)"
+	@echo "  RECALL=1        --recall (query-bench only)"
+	@echo "  BENCH_EXTRA_ARGS  appended to both benches as-is"
 	@echo ""
 	@echo "For native SIMD on compute nodes: make compute DATASET=glove CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 	@echo "For 3-round SRHT at compile time: make compute DATASET=glove CMAKE_OPTS='-DVECTORCACHE_SRHT_ROUNDS=3'"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
-	@echo "Example: make compute DATASET=glove"
+	@echo "Example: make compute DATASET=glove TOP_D=8 RECALL=1 MAX_HD=4"
 
 login: $(LOGIN_READY)
 
@@ -71,7 +120,7 @@ $(LOGIN_READY):
 	mkdir -p $(BUILD_DIR)
 	cmake -S . -B $(BUILD_DIR) $(CMAKE_COMPILER_FLAGS) $(CMAKE_LOGIN_FLAGS)
 	cmake --build $(BUILD_DIR) --target fetch-datasets -j$(JOBS)
-	$(BUILD_DIR)/fetch-datasets --data-dir $(DATA_DIR) $(DATASETS)
+	$(BUILD_DIR)/fetch-datasets --data-dir $(DATA_DIR) $(call flag_arg,FORCE,force) $(DATASETS)
 	touch $(LOGIN_READY)
 
 compute:
@@ -79,8 +128,12 @@ compute:
 		echo "Run 'make login' on a login node first."; \
 		exit 1; \
 	fi
-	@if [ -z "$(DATASET)" ]; then \
-		echo "DATASET is required, e.g. make compute DATASET=glove"; \
+	@if [ -z "$(strip $(DATASET)$(NPY))" ]; then \
+		echo "DATASET or NPY is required, e.g. make compute DATASET=glove"; \
+		exit 1; \
+	fi
+	@if [ -n "$(strip $(DATASET))" ] && [ -n "$(strip $(NPY))" ]; then \
+		echo "Pass only one of DATASET or NPY, not both."; \
 		exit 1; \
 	fi
 	set -euo pipefail
@@ -117,7 +170,11 @@ compute:
 		echo "Inspect the build log above for ingest-bench compile/link errors."
 		exit 1
 	fi
-	"$$INGEST_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(BENCH_EXTRA_ARGS)
+	if [ -n "$(strip $(NPY))" ]; then
+		"$$INGEST_BENCH" --npy $(NPY) --data-dir $(DATA_DIR) $(INGEST_BENCH_ARGS)
+	else
+		"$$INGEST_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(INGEST_BENCH_ARGS)
+	fi
 	QUERY_BENCH=""
 	for candidate in \
 		"$(BUILD_DIR_ABS)/query-bench" \
@@ -136,7 +193,11 @@ compute:
 		echo "Inspect the build log above for query-bench compile/link errors."
 		exit 1
 	fi
-	"$$QUERY_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(BENCH_EXTRA_ARGS)
+	if [ -n "$(strip $(NPY))" ]; then
+		"$$QUERY_BENCH" --npy $(NPY) --data-dir $(DATA_DIR) $(QUERY_BENCH_ARGS)
+	else
+		"$$QUERY_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(QUERY_BENCH_ARGS)
+	fi
 
 clean:
 	rm -rf $(BUILD_DIR)
