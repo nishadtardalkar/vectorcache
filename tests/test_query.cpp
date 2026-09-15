@@ -184,8 +184,16 @@ TEST(QueryDistanceTest, OddBitsUsesScalarFallback) {
 }
 
 TEST(QueryEngineTest, SelfSimilarityTopHit) {
+  // Spikes at disjoint coords so 1-bit asymmetric IP keeps a clear self margin
+  // (dense near-duplicates can land within ~1e-3 after α-scaling and flip on GCC/FMA).
   const std::size_t dim = 64;
-  const auto vectors = make_vectors(8, dim);
+  std::vector<std::vector<float>> vectors;
+  for (std::size_t i = 0; i < 8; ++i) {
+    std::vector<float> v(dim, 0.0f);
+    v[i * 8] = 3.0f;
+    v[i * 8 + 1] = 2.0f;
+    vectors.push_back(std::move(v));
+  }
   MockReader reader(vectors, dim);
 
   auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42);
@@ -206,16 +214,20 @@ TEST(QueryEngineTest, SelfSimilarityTopHit) {
 }
 
 TEST(QueryEngineTest, FlatScanFindsBothNearVectors) {
+  // Two nearby spikes + one orthogonal far vector; 2-bit codes leave a stable top-1 gap.
   const std::size_t dim = 64;
-  std::vector<float> a(dim, 0.01f);
-  std::vector<float> b(dim, 0.01f);
+  std::vector<float> a(dim, 0.0f);
+  std::vector<float> b(dim, 0.0f);
+  std::vector<float> far(dim, 0.0f);
   a[10] = 5.0f;
   a[20] = 4.0f;
   b[10] = 4.5f;
   b[20] = 4.2f;
+  far[40] = 5.0f;
+  far[50] = 4.0f;
 
-  MockReader reader({a, b}, dim);
-  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42, /*bits=*/4);
+  MockReader reader({a, b, far}, dim);
+  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42, /*bits=*/2);
   ingest_engine.ingest(reader);
 
   auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
