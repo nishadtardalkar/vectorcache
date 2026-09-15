@@ -98,3 +98,35 @@ TEST(QuantizeTest, RejectInvalidBits) {
   EXPECT_THROW(LloydMaxCodebook(64, 0), vectorcache::Error);
   EXPECT_THROW(LloydMaxCodebook(1, 2), vectorcache::Error);
 }
+
+TEST(QuantizeTest, BlockDimsHalvesBitCount) {
+  EXPECT_EQ(l0_bits_per_vector(64, 1, 2), 32u);
+  EXPECT_EQ(l0_words_per_vector(64, 1, 2), 1u);
+  EXPECT_EQ(num_blocks(64, 2), 32u);
+  EXPECT_THROW(l0_bits_per_vector(65, 1, 2), vectorcache::Error);
+  EXPECT_THROW(validate_block_dims(0), vectorcache::Error);
+  EXPECT_THROW(validate_block_dims(17), vectorcache::Error);
+  EXPECT_THROW(LloydMaxCodebook(64, 1, 3), vectorcache::Error);  // 64 % 3 != 0
+}
+
+TEST(QuantizeTest, BlockDims2Bits1PackAndAlpha) {
+  constexpr std::size_t dim = 64;
+  constexpr std::size_t block_dims = 2;
+  LloydMaxCodebook codebook(dim, 1, block_dims);
+  ASSERT_EQ(codebook.block_dims(), 2u);
+  ASSERT_EQ(codebook.num_centroids(), 2u);
+  ASSERT_EQ(codebook.centroid(0).size(), 2u);
+
+  std::vector<float> v(dim, 0.0f);
+  for (std::size_t i = 0; i < dim; ++i) {
+    v[i] = (i % 2 == 0) ? 0.5f : -0.25f;
+  }
+  const auto [words, bits] = quantize_blocks_to_nbit(v, codebook);
+  EXPECT_EQ(bits, dim / block_dims);
+  EXPECT_EQ(words.size(), 1u);
+  EXPECT_EQ(unpack_code(words, 0, 1), codebook.encode(std::span<const float>(v.data(), 2)));
+
+  const float alpha = ip_scale_alpha(v, words, codebook);
+  EXPECT_TRUE(std::isfinite(alpha));
+  EXPECT_NE(alpha, 0.0f);
+}

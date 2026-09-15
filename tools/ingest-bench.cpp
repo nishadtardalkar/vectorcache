@@ -114,10 +114,11 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 
 StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::size_t dim,
                            std::size_t srht_dim, std::uint64_t seed, std::size_t limit,
-                           std::size_t bits) {
+                           std::size_t bits, std::size_t block_dims) {
   const vectorcache::transform::SrhtRotation rotation(dim, seed);
-  const vectorcache::quantize::LloydMaxCodebook codebook(srht_dim, bits);
-  const std::size_t l0_words = vectorcache::quantize::l0_words_per_vector(srht_dim, bits);
+  const vectorcache::quantize::LloydMaxCodebook codebook(srht_dim, bits, block_dims);
+  const std::size_t l0_words =
+      vectorcache::quantize::l0_words_per_vector(srht_dim, bits, block_dims);
   const std::size_t batch_cap =
       std::min(vectorcache::ingest::INGEST_BATCH_SIZE, std::max(limit, std::size_t{1}));
 
@@ -126,8 +127,8 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
   std::vector<std::vector<float>> rotated(batch_cap, std::vector<float>(srht_dim));
   std::vector<std::vector<std::uint64_t>> l0(batch_cap, std::vector<std::uint64_t>(l0_words));
 
-  auto store =
-      vectorcache::ingest::VectorStore::with_capacity(l0_words, dim, srht_dim, limit, bits);
+  auto store = vectorcache::ingest::VectorStore::with_capacity(l0_words, dim, srht_dim, limit, bits,
+                                                              block_dims);
   StageTotals totals;
   std::size_t processed = 0;
 
@@ -168,7 +169,7 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
               .count());
 
       const auto t_l0 = std::chrono::steady_clock::now();
-      vectorcache::quantize::quantize_1dim_to_nbit_into(rotated[i], codebook, l0[i]);
+      vectorcache::quantize::quantize_blocks_to_nbit_into(rotated[i], codebook, l0[i]);
       const float alpha = vectorcache::quantize::ip_scale_alpha(rotated[i], l0[i], codebook);
       totals.quantize_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
@@ -191,9 +192,10 @@ StageTotals profile_stages(vectorcache::datasets::DatasetReader& reader, std::si
 }
 
 std::uint64_t profile_engine(vectorcache::datasets::DatasetReader& reader, std::size_t dim,
-                             std::uint64_t seed, std::size_t limit, std::size_t bits) {
+                             std::uint64_t seed, std::size_t limit, std::size_t bits,
+                             std::size_t block_dims) {
   LimitedReader limited(reader, limit);
-  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits);
+  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits, block_dims);
   engine.reserve_vectors(limit);
   const auto start = std::chrono::steady_clock::now();
   const auto report = engine.ingest(limited);
@@ -287,6 +289,7 @@ int main(int argc, char** argv) {
   std::optional<std::size_t> limit;
   std::uint64_t seed = 42;
   std::size_t bits = 1;
+  std::size_t block_dims = 1;
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
   app.add_option("--dataset", dataset, "Dataset name")->envname("VECTORCACHE_DATASET");
@@ -294,7 +297,8 @@ int main(int argc, char** argv) {
   app.add_option("--split", split, "HDF5 split for GloVe");
   app.add_option("--limit", limit, "Cap vectors profiled");
   app.add_option("--seed", seed, "SRHT seed");
-  app.add_option("--bits", bits, "TurboQuantMSE bits per dimension (1-8)");
+  app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
+  app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -303,6 +307,7 @@ int main(int argc, char** argv) {
       throw vectorcache::Error("pass --dataset or --npy");
     }
     vectorcache::quantize::validate_bits_per_dim(bits);
+    vectorcache::quantize::validate_block_dims(block_dims);
 
     auto [reader1, source_label] = open_reader(npy_path, dataset, data_dir, split);
     const auto meta = reader1->meta();
@@ -314,17 +319,19 @@ int main(int argc, char** argv) {
     std::cout << "Ingest bench: " << source_label << " (dim=" << meta.dim
               << ", srht_dim=" << meta.dim << ", vectors=" << actual_limit
               << ", srht_rounds=" << vectorcache::transform::srht_rounds()
-              << ", bits=" << bits << ")\n";
+              << ", bits=" << bits << ", block_dims=" << block_dims << ")\n";
     if (limit && *limit < meta.count) {
       std::cout << "  (capped from " << meta.count << " vectors in dataset)\n";
     }
     std::cout << '\n';
 
-    const auto stages = profile_stages(*reader1, meta.dim, meta.dim, seed, actual_limit, bits);
+    const auto stages =
+        profile_stages(*reader1, meta.dim, meta.dim, seed, actual_limit, bits, block_dims);
     print_stage_report("Per-stage (sequential micro-profile)", stages);
 
     auto [reader2, _] = open_reader(npy_path, dataset, data_dir, split);
-    const auto wall_ns = profile_engine(*reader2, meta.dim, seed, actual_limit, bits);
+    const auto wall_ns =
+        profile_engine(*reader2, meta.dim, seed, actual_limit, bits, block_dims);
     print_wall_report(wall_ns, actual_limit, stages);
 
     return 0;

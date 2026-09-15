@@ -24,26 +24,28 @@ IngestionEngine::IngestionEngine(VectorStore store, std::optional<transform::Srh
       l0_words_per_vec_(l0_words_per_vec),
       codebook_(std::move(codebook)) {}
 
-IngestionEngine IngestionEngine::from_rotated(std::size_t srht_dim, std::size_t bits_per_dim) {
-  quantize::LloydMaxCodebook codebook(srht_dim, bits_per_dim);
-  const std::size_t l0_words = quantize::l0_words_per_vector(srht_dim, bits_per_dim);
-  return IngestionEngine(VectorStore(l0_words, srht_dim, srht_dim, bits_per_dim), std::nullopt, true,
-                         srht_dim, srht_dim, l0_words, std::move(codebook));
+IngestionEngine IngestionEngine::from_rotated(std::size_t srht_dim, std::size_t bits_per_dim,
+                                              std::size_t block_dims) {
+  quantize::LloydMaxCodebook codebook(srht_dim, bits_per_dim, block_dims);
+  const std::size_t l0_words = quantize::l0_words_per_vector(srht_dim, bits_per_dim, block_dims);
+  return IngestionEngine(VectorStore(l0_words, srht_dim, srht_dim, bits_per_dim, block_dims),
+                         std::nullopt, true, srht_dim, srht_dim, l0_words, std::move(codebook));
 }
 
 IngestionEngine IngestionEngine::with_rotation(std::size_t original_dim, std::uint64_t seed,
-                                               std::size_t bits_per_dim) {
+                                               std::size_t bits_per_dim, std::size_t block_dims) {
   transform::SrhtRotation rotation(original_dim, seed);
   const std::size_t srht = rotation.srht_dim();
-  quantize::LloydMaxCodebook codebook(srht, bits_per_dim);
-  const std::size_t l0_words = quantize::l0_words_per_vector(srht, bits_per_dim);
-  return IngestionEngine(VectorStore(l0_words, original_dim, srht, bits_per_dim), std::move(rotation),
-                         false, original_dim, srht, l0_words, std::move(codebook));
+  quantize::LloydMaxCodebook codebook(srht, bits_per_dim, block_dims);
+  const std::size_t l0_words = quantize::l0_words_per_vector(srht, bits_per_dim, block_dims);
+  return IngestionEngine(VectorStore(l0_words, original_dim, srht, bits_per_dim, block_dims),
+                         std::move(rotation), false, original_dim, srht, l0_words,
+                         std::move(codebook));
 }
 
 void IngestionEngine::reserve_vectors(std::size_t count) {
   store_ = VectorStore::with_capacity(l0_words_per_vec_, input_dim_, srht_dim_, count,
-                                      codebook_.bits());
+                                      codebook_.bits(), codebook_.block_dims());
   ensure_batch_capacity(std::min(INGEST_BATCH_SIZE, std::max(count, std::size_t{1})));
 }
 
@@ -91,7 +93,7 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       transform::l2_normalize_in_place(std::span<float>(work.buf.data(), input_dim));
       rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
     }
-    quantize::quantize_1dim_to_nbit_into(work.buf, *codebook, work.l0);
+    quantize::quantize_blocks_to_nbit_into(work.buf, *codebook, work.l0);
     work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
 #else
@@ -101,7 +103,7 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       transform::l2_normalize_in_place(std::span<float>(work.buf.data(), input_dim));
       rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
     }
-    quantize::quantize_1dim_to_nbit_into(work.buf, *codebook, work.l0);
+    quantize::quantize_blocks_to_nbit_into(work.buf, *codebook, work.l0);
     work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
 #endif

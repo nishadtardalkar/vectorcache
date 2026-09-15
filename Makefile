@@ -16,6 +16,7 @@ SPLIT         ?=
 LIMIT         ?=
 SEED          ?=
 BITS          ?=
+BLOCK_DIMS    ?=
 TOP_D         ?=
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
@@ -62,6 +63,7 @@ BENCH_COMMON_ARGS = \
 	$(call opt_arg,LIMIT,limit) \
 	$(call opt_arg,SEED,seed) \
 	$(call opt_arg,BITS,bits) \
+	$(call opt_arg,BLOCK_DIMS,block-dims) \
 	$(BENCH_EXTRA_ARGS)
 
 INGEST_BENCH_ARGS = $(BENCH_COMMON_ARGS)
@@ -97,7 +99,8 @@ help:
 	@echo "  SPLIT           --split"
 	@echo "  LIMIT           --limit"
 	@echo "  SEED            --seed"
-	@echo "  BITS            --bits (TurboQuantMSE bits/dim, 1-8)"
+	@echo "  BITS            --bits (TurboQuantMSE bits/block, 1-8)"
+	@echo "  BLOCK_DIMS      --block-dims (dims per codebook block, 1-16; default 1)"
 	@echo "  QUERY_SPLIT     --query-split (query-bench only)"
 	@echo "  QUERY_LIMIT     --query-limit (query-bench only)"
 	@echo "  K               --k (query-bench only)"
@@ -110,6 +113,7 @@ help:
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make compute DATASET=glove BITS=2 RECALL=1"
+	@echo "Example: make compute DATASET=glove BITS=1 BLOCK_DIMS=2"
 
 login: $(LOGIN_READY)
 

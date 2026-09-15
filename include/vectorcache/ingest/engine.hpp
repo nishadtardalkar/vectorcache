@@ -24,9 +24,10 @@ struct IngestReport {
 class IngestionEngine {
  public:
   /// Already-SRHT'd vectors of length srht_dim (input_dim == srht_dim).
-  static IngestionEngine from_rotated(std::size_t srht_dim, std::size_t bits_per_dim = 1);
+  static IngestionEngine from_rotated(std::size_t srht_dim, std::size_t bits_per_dim = 1,
+                                      std::size_t block_dims = 1);
   static IngestionEngine with_rotation(std::size_t original_dim, std::uint64_t seed,
-                                       std::size_t bits_per_dim = 1);
+                                       std::size_t bits_per_dim = 1, std::size_t block_dims = 1);
 
   void reserve_vectors(std::size_t count);
   IngestReport ingest(datasets::DatasetReader& reader);
@@ -34,6 +35,7 @@ class IngestionEngine {
   const VectorStore& store() const { return store_; }
   const quantize::LloydMaxCodebook& codebook() const { return codebook_; }
   std::size_t bits_per_dim() const { return codebook_.bits(); }
+  std::size_t block_dims() const { return codebook_.block_dims(); }
 
  private:
   struct VectorWork {

@@ -13,13 +13,15 @@ namespace vectorcache::ingest {
 class VectorStore {
  public:
   VectorStore(std::size_t l0_words_per_vec, std::size_t input_dim, std::size_t srht_dim,
-              std::size_t bits_per_dim = 1);
+              std::size_t bits_per_dim = 1, std::size_t block_dims = 1);
   static VectorStore with_capacity(std::size_t l0_words_per_vec, std::size_t input_dim,
                                    std::size_t srht_dim, std::size_t vector_count,
-                                   std::size_t bits_per_dim = 1);
+                                   std::size_t bits_per_dim = 1, std::size_t block_dims = 1);
 
   std::size_t l0_words_per_vec() const { return l0_words_per_vec_; }
+  /// Bits per codebook block (per dim when block_dims == 1).
   std::size_t bits_per_dim() const { return bits_per_dim_; }
+  std::size_t block_dims() const { return block_dims_; }
   std::size_t input_dim() const { return input_dim_; }
   std::size_t srht_dim() const { return srht_dim_; }
   std::size_t size() const { return ids_.size(); }
@@ -38,6 +40,7 @@ class VectorStore {
  private:
   std::size_t l0_words_per_vec_;
   std::size_t bits_per_dim_;
+  std::size_t block_dims_;
   std::size_t input_dim_;
   std::size_t srht_dim_;
   AlignedVector<std::uint64_t> codes_;

@@ -9,9 +9,10 @@
 namespace vectorcache::ingest {
 
 VectorStore::VectorStore(std::size_t l0_words_per_vec, std::size_t input_dim, std::size_t srht_dim,
-                         std::size_t bits_per_dim)
+                         std::size_t bits_per_dim, std::size_t block_dims)
     : l0_words_per_vec_(l0_words_per_vec),
       bits_per_dim_(bits_per_dim),
+      block_dims_(block_dims),
       input_dim_(input_dim),
       srht_dim_(srht_dim) {
   if (l0_words_per_vec_ == 0 || input_dim_ == 0 || srht_dim_ == 0) {
@@ -20,17 +21,17 @@ VectorStore::VectorStore(std::size_t l0_words_per_vec, std::size_t input_dim, st
   if (srht_dim_ < input_dim_) {
     throw Error("VectorStore srht_dim must be >= input_dim");
   }
-  quantize::validate_bits_per_dim(bits_per_dim_);
-  const std::size_t expected = quantize::l0_words_per_vector(srht_dim_, bits_per_dim_);
+  quantize::validate_quant_spec(srht_dim_, quantize::QuantSpec{block_dims_, bits_per_dim_});
+  const std::size_t expected = quantize::l0_words_per_vector(srht_dim_, bits_per_dim_, block_dims_);
   if (l0_words_per_vec_ != expected) {
-    throw Error("VectorStore l0_words_per_vec mismatch for bits_per_dim");
+    throw Error("VectorStore l0_words_per_vec mismatch for bits_per_dim/block_dims");
   }
 }
 
 VectorStore VectorStore::with_capacity(std::size_t l0_words_per_vec, std::size_t input_dim,
                                        std::size_t srht_dim, std::size_t vector_count,
-                                       std::size_t bits_per_dim) {
-  VectorStore store(l0_words_per_vec, input_dim, srht_dim, bits_per_dim);
+                                       std::size_t bits_per_dim, std::size_t block_dims) {
+  VectorStore store(l0_words_per_vec, input_dim, srht_dim, bits_per_dim, block_dims);
   store.reserve(vector_count);
   return store;
 }

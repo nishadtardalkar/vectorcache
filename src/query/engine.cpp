@@ -253,20 +253,20 @@ QueryEngine::QueryEngine(const ingest::VectorStore& store,
 
 QueryEngine QueryEngine::with_rotation(const ingest::VectorStore& store, std::size_t input_dim,
                                        std::uint64_t seed) {
-  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim());
+  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim(), store.block_dims());
   return QueryEngine(store, transform::SrhtRotation(input_dim, seed), false, input_dim,
                      std::move(codebook));
 }
 
 QueryEngine QueryEngine::from_rotated(const ingest::VectorStore& store) {
-  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim());
+  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim(), store.block_dims());
   return QueryEngine(store, std::nullopt, true, store.input_dim(), std::move(codebook));
 }
 
 const BlockedCodes& QueryEngine::blocked_codes() const {
   if (blocked_n_ != store_.size()) {
     blocked_.rebuild(store_.l0_codes(), store_.l0_words_per_vec(), store_.size(), store_.srht_dim(),
-                     store_.bits_per_dim());
+                     store_.bits_per_dim(), store_.block_dims());
     blocked_n_ = store_.size();
   }
   return blocked_;
@@ -288,8 +288,9 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
                                                    const QueryParams& params) const {
   TopKHits topk(params.k);
   const BlockedCodes& blocked = blocked_codes();
+  const std::size_t m = store_.srht_dim() / store_.block_dims();
   const bool byte_aligned =
-      lut_bits_supported(store_.bits_per_dim()) && (store_.srht_dim() * store_.bits_per_dim()) % 8 == 0;
+      lut_bits_supported(store_.bits_per_dim()) && (m * store_.bits_per_dim()) % 8 == 0;
 
   if (!blocked.empty() && byte_aligned) {
     QueryLut lut;

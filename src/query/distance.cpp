@@ -17,26 +17,33 @@ float asymmetric_ip_score_scalar(std::span<const float> query_rotated,
                                  const quantize::LloydMaxCodebook& codebook) {
   const std::size_t dim = codebook.srht_dim();
   const std::size_t bits = codebook.bits();
-  const auto centroids = codebook.centroids();
+  const std::size_t block_dims = codebook.block_dims();
+  const std::size_t m = dim / block_dims;
 
   float score = 0.0f;
-  for (std::size_t d = 0; d < dim; ++d) {
-    const std::uint32_t code = quantize::unpack_code(data_words, d, bits);
-    score += query_rotated[d] * centroids[code];
+  for (std::size_t b = 0; b < m; ++b) {
+    const std::uint32_t code = quantize::unpack_code(data_words, b, bits);
+    const auto c = codebook.centroid(code);
+    for (std::size_t j = 0; j < block_dims; ++j) {
+      score += query_rotated[b * block_dims + j] * c[j];
+    }
   }
   return score;
 }
 
 void fill_group_lut(float* table, std::span<const float> query_slice,
                     std::span<const float> centroids, std::size_t bits,
-                    std::size_t dims_in_group) {
+                    std::size_t codes_in_group, std::size_t block_dims) {
   const std::uint32_t code_mask = (bits == 32) ? 0xffffffffu : ((1u << bits) - 1u);
   for (std::size_t b = 0; b < QueryLut::kEntries; ++b) {
     float sum = 0.0f;
-    for (std::size_t i = 0; i < dims_in_group; ++i) {
+    for (std::size_t i = 0; i < codes_in_group; ++i) {
       const std::uint32_t code =
           static_cast<std::uint32_t>((b >> (i * bits)) & code_mask);
-      sum += query_slice[i] * centroids[code];
+      const float* c = centroids.data() + static_cast<std::size_t>(code) * block_dims;
+      for (std::size_t j = 0; j < block_dims; ++j) {
+        sum += query_slice[i * block_dims + j] * c[j];
+      }
     }
     table[b] = sum;
   }
@@ -76,12 +83,12 @@ void score_lut_batch(const QueryLut& lut, const std::uint8_t* base, std::size_t 
 }
 
 float score_bit1_one(const float* delta, float base, const std::uint64_t* words,
-                     std::size_t dim) {
+                     std::size_t num_codes) {
   __m512 acc0 = _mm512_setzero_ps();
   __m512 acc1 = _mm512_setzero_ps();
   std::size_t d = 0;
   std::size_t word_i = 0;
-  for (; d + 64 <= dim; d += 64, ++word_i) {
+  for (; d + 64 <= num_codes; d += 64, ++word_i) {
     const std::uint64_t w = words[word_i];
     {
       const __mmask16 m0 = static_cast<__mmask16>(w & 0xFFFFu);
@@ -97,9 +104,9 @@ float score_bit1_one(const float* delta, float base, const std::uint64_t* words,
     }
   }
   float score = base + _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
-  if (d < dim) {
+  if (d < num_codes) {
     const std::uint64_t w = words[word_i];
-    for (; d < dim; ++d) {
+    for (; d < num_codes; ++d) {
       if ((w >> (d % 64)) & 1ull) {
         score += delta[d];
       }
@@ -111,7 +118,7 @@ float score_bit1_one(const float* delta, float base, const std::uint64_t* words,
 /// Interleave 4 DB rows so mask-adds and delta loads overlap.
 void score_bit1_four(const float* delta, float base, const std::uint64_t* r0,
                      const std::uint64_t* r1, const std::uint64_t* r2, const std::uint64_t* r3,
-                     std::size_t dim, float* out4) {
+                     std::size_t num_codes, float* out4) {
   __m512 a0 = _mm512_setzero_ps();
   __m512 a1 = _mm512_setzero_ps();
   __m512 b0 = _mm512_setzero_ps();
@@ -123,7 +130,7 @@ void score_bit1_four(const float* delta, float base, const std::uint64_t* r0,
 
   std::size_t off = 0;
   std::size_t word_i = 0;
-  for (; off + 64 <= dim; off += 64, ++word_i) {
+  for (; off + 64 <= num_codes; off += 64, ++word_i) {
     const std::uint64_t w0 = r0[word_i];
     const std::uint64_t w1 = r1[word_i];
     const std::uint64_t w2 = r2[word_i];
@@ -164,7 +171,7 @@ void score_bit1_batch(const QueryLut& lut, const std::uint64_t* data, std::size_
                       std::size_t num_vectors, std::span<float> out_scores) {
   const float* delta = lut.bit1_delta();
   const float base = lut.bit1_base();
-  const std::size_t dim = lut.dim();
+  const std::size_t num_codes = lut.num_codes();
   std::size_t v = 0;
   for (; v + 4 <= num_vectors; v += 4) {
     const std::uint64_t* r0 = data + (v + 0) * words_per_vec;
@@ -176,10 +183,10 @@ void score_bit1_batch(const QueryLut& lut, const std::uint64_t* data, std::size_
 #else
     __builtin_prefetch(r0 + 4 * words_per_vec, 0, 3);
 #endif
-    score_bit1_four(delta, base, r0, r1, r2, r3, dim, out_scores.data() + v);
+    score_bit1_four(delta, base, r0, r1, r2, r3, num_codes, out_scores.data() + v);
   }
   for (; v < num_vectors; ++v) {
-    out_scores[v] = score_bit1_one(delta, base, data + v * words_per_vec, dim);
+    out_scores[v] = score_bit1_one(delta, base, data + v * words_per_vec, num_codes);
   }
 }
 
@@ -204,6 +211,7 @@ void build_query_lut(std::span<const float> query_rotated,
                      const quantize::LloydMaxCodebook& codebook, QueryLut& out) {
   const std::size_t dim = codebook.srht_dim();
   const std::size_t bits = codebook.bits();
+  const std::size_t block_dims = codebook.block_dims();
   if (query_rotated.size() != dim) {
     throw Error("build_query_lut: query dim mismatch");
   }
@@ -211,30 +219,43 @@ void build_query_lut(std::span<const float> query_rotated,
     out.clear();
     return;
   }
-  if ((dim * bits) % 8 != 0) {
+  if (dim % block_dims != 0) {
+    out.clear();
+    return;
+  }
+  const std::size_t m = dim / block_dims;
+  if ((m * bits) % 8 != 0) {
     out.clear();
     return;
   }
 
-  const std::size_t dims_per_group = 8 / bits;
-  const std::size_t num_groups = dim / dims_per_group;
-  out.resize(num_groups, bits, dims_per_group, dim);
+  const std::size_t codes_per_group = 8 / bits;
+  const std::size_t num_groups = m / codes_per_group;
+  out.resize(num_groups, bits, codes_per_group, dim, block_dims, m);
 
   const auto centroids = codebook.centroids();
   for (std::size_t g = 0; g < num_groups; ++g) {
-    fill_group_lut(out.table(g), query_rotated.subspan(g * dims_per_group, dims_per_group),
-                   centroids, bits, dims_per_group);
+    const std::size_t q_off = g * codes_per_group * block_dims;
+    fill_group_lut(out.table(g),
+                   query_rotated.subspan(q_off, codes_per_group * block_dims), centroids, bits,
+                   codes_per_group, block_dims);
   }
 
-  if (bits == 1 && (dim % 64) == 0) {
-    const float c0 = centroids[0];
-    const float c1 = centroids[1];
-    const float dc = c1 - c0;
-    AlignedVector<float> delta(dim);
+  if (bits == 1 && (m % 64) == 0 && codebook.num_centroids() >= 2) {
+    AlignedVector<float> delta(m);
     float base = 0.0f;
-    for (std::size_t d = 0; d < dim; ++d) {
-      base += query_rotated[d] * c0;
-      delta[d] = query_rotated[d] * dc;
+    const auto c0 = codebook.centroid(0);
+    const auto c1 = codebook.centroid(1);
+    for (std::size_t b = 0; b < m; ++b) {
+      float base_b = 0.0f;
+      float delta_b = 0.0f;
+      for (std::size_t j = 0; j < block_dims; ++j) {
+        const float q = query_rotated[b * block_dims + j];
+        base_b += q * c0[j];
+        delta_b += q * (c1[j] - c0[j]);
+      }
+      base += base_b;
+      delta[b] = delta_b;
     }
     out.set_bit1_deltas(base, std::move(delta));
   }
@@ -245,14 +266,16 @@ float asymmetric_ip_score(std::span<const float> query_rotated,
                           const quantize::LloydMaxCodebook& codebook) {
   const std::size_t dim = codebook.srht_dim();
   const std::size_t bits = codebook.bits();
+  const std::size_t block_dims = codebook.block_dims();
   if (query_rotated.size() != dim) {
     throw Error("asymmetric_ip_score: query dim mismatch");
   }
-  if (data_words.size() < quantize::l0_words_per_vector(dim, bits)) {
+  if (data_words.size() < quantize::l0_words_per_vector(dim, bits, block_dims)) {
     throw Error("asymmetric_ip_score: data words too small");
   }
 
-  if (lut_bits_supported(bits) && (dim * bits) % 8 == 0) {
+  const std::size_t m = dim / block_dims;
+  if (lut_bits_supported(bits) && (m * bits) % 8 == 0) {
     QueryLut lut;
     build_query_lut(query_rotated, codebook, lut);
     return asymmetric_ip_score_lut(lut, data_words);
@@ -269,7 +292,7 @@ float asymmetric_ip_score_lut(const QueryLut& lut, std::span<const std::uint64_t
     throw Error("asymmetric_ip_score_lut: data words too small");
   }
   if (lut.has_bit1_deltas()) {
-    return score_bit1_one(lut.bit1_delta(), lut.bit1_base(), data_words.data(), lut.dim());
+    return score_bit1_one(lut.bit1_delta(), lut.bit1_base(), data_words.data(), lut.num_codes());
   }
   return score_lut_one(lut, reinterpret_cast<const std::uint8_t*>(data_words.data()));
 }
@@ -295,22 +318,24 @@ void asymmetric_ip_batch_lut(const QueryLut& lut, std::span<const std::uint64_t>
   }
   const std::size_t dim = codebook.srht_dim();
   const std::size_t bits = codebook.bits();
+  const std::size_t block_dims = codebook.block_dims();
+  const std::size_t m = dim / block_dims;
   if (query_rotated.size() != dim) {
     throw Error("asymmetric_ip_batch: query dim mismatch");
   }
-  if (data_words_per_vec != quantize::l0_words_per_vector(dim, bits)) {
+  if (data_words_per_vec != quantize::l0_words_per_vector(dim, bits, block_dims)) {
     throw Error("asymmetric_ip_batch: words_per_vec mismatch");
   }
   if (data_words.size() < num_vectors * data_words_per_vec) {
     throw Error("asymmetric_ip_batch: data buffer too small");
   }
 
-  if (lut.has_bit1_deltas() && lut.bits() == 1 && lut.dim() == dim) {
+  if (lut.has_bit1_deltas() && lut.bits() == 1 && lut.num_codes() == m) {
     score_bit1_batch(lut, data_words.data(), data_words_per_vec, num_vectors, out_scores);
     return;
   }
 
-  if (lut.empty() || lut.bits() != bits || lut.bytes_per_vector() != (dim * bits) / 8) {
+  if (lut.empty() || lut.bits() != bits || lut.bytes_per_vector() != (m * bits) / 8) {
     asymmetric_ip_batch_scalar(query_rotated, data_words, data_words_per_vec, num_vectors,
                                codebook, out_scores);
     return;
@@ -330,7 +355,7 @@ void score_blocked_bit1(const QueryLut& lut, const BlockedCodes& blocked, std::s
   const std::size_t count = blocked.block_count(block);
   const float* delta = lut.bit1_delta();
   const float base = lut.bit1_base();
-  const std::size_t dim = lut.dim();
+  const std::size_t num_codes = lut.num_codes();
   const std::size_t words = blocked.words_per_vec();
 
   std::size_t vin = 0;
@@ -345,7 +370,7 @@ void score_blocked_bit1(const QueryLut& lut, const BlockedCodes& blocked, std::s
     __m512 d1 = _mm512_setzero_ps();
 
     std::size_t off = 0;
-    for (std::size_t word_i = 0; word_i < words && off + 64 <= dim; ++word_i, off += 64) {
+    for (std::size_t word_i = 0; word_i < words && off + 64 <= num_codes; ++word_i, off += 64) {
       const std::uint64_t* col = blocked.bit1_word_column(block, word_i);
       const std::uint64_t w0 = col[vin + 0];
       const std::uint64_t w1 = col[vin + 1];
@@ -386,7 +411,7 @@ void score_blocked_bit1(const QueryLut& lut, const BlockedCodes& blocked, std::s
     __m512 a0 = _mm512_setzero_ps();
     __m512 a1 = _mm512_setzero_ps();
     std::size_t off = 0;
-    for (std::size_t word_i = 0; word_i < words && off + 64 <= dim; ++word_i, off += 64) {
+    for (std::size_t word_i = 0; word_i < words && off + 64 <= num_codes; ++word_i, off += 64) {
       const std::uint64_t w = blocked.bit1_word_column(block, word_i)[vin];
       const __m512 v0 = _mm512_loadu_ps(delta + off);
       const __m512 v1 = _mm512_loadu_ps(delta + off + 16);

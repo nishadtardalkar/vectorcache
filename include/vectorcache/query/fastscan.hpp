@@ -32,10 +32,14 @@ class BlockedCodes {
   bool has_bit1_words() const { return !bit1_words_.empty(); }
 
   /// Rebuild from vector-major packed codes. Pads the last block with zeros.
+  /// `dim` is srht_dim; `block_dims` is codebook block size (default 1).
   void rebuild(std::span<const std::uint64_t> codes, std::size_t words_per_vec, std::size_t n,
-               std::size_t dim, std::size_t bits);
+               std::size_t dim, std::size_t bits, std::size_t block_dims = 1);
 
   void clear();
+
+  std::size_t block_dims() const { return block_dims_; }
+  std::size_t num_codes() const { return num_codes_; }
 
   /// Pointer to kBlock bytes for (block, group).
   const std::uint8_t* group_bytes(std::size_t block, std::size_t group) const;
@@ -53,6 +57,8 @@ class BlockedCodes {
   std::size_t n_ = 0;
   std::size_t bits_ = 0;
   std::size_t dim_ = 0;
+  std::size_t block_dims_ = 1;
+  std::size_t num_codes_ = 0;
   std::size_t num_groups_ = 0;
   std::size_t words_per_vec_ = 0;
   std::size_t n_blocks_ = 0;

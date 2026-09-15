@@ -2,7 +2,7 @@
 
 Flat quantized vector retrieval engine (C++20).
 
-VectorCache implements approximate nearest neighbor search via a **TurboVec-style** orthogonal rotation (perm + signs + block Walsh–Hadamard) and **TurboQuant** Beta Lloyd-Max codes (`n` bits per dimension, default 1), with per-vector IP length renormalization. Vectors are stored in a flat in-RAM index; queries score every code with asymmetric inner-product top-k in rotated space.
+VectorCache implements approximate nearest neighbor search via a **TurboVec-style** orthogonal rotation (perm + signs + block Walsh–Hadamard) and **TurboQuant** Beta Lloyd-Max / block-VQ codes (`n` bits per block of `d` dims; default `d=1`), with per-vector IP length renormalization. Vectors are stored in a flat in-RAM index; queries score every code with asymmetric inner-product top-k in rotated space.
 
 ## Requirements
 
@@ -98,13 +98,15 @@ cmake .. -DVECTORCACHE_SRHT_ROUNDS=3
 
 Allowed values: `1`, `2`, or `3`. Reconfigure and rebuild after changing; there is no runtime flag.
 
-### Bits per dimension (runtime)
+### Bits per block / block dims (runtime)
 
-TurboQuant uses `n` bits per rotated coordinate (`2^n` Lloyd-Max centroids for Beta((d−1)/2,(d−1)/2) on `[-1,1]`). Default is `1`. Pass `--bits` on CLI tools or `BITS=` to `make compute` (allowed: 1–8).
+TurboQuant uses `n` bits per codebook block of `d` rotated coordinates (`2^n` Lloyd-Max centroids). With `d=1` (default) this is scalar Beta((dim−1)/2,(dim−1)/2) on `[-1,1]`; with `d>1` it is product-Beta VQ in `R^d`. Pass `--bits` / `--block-dims` on CLI tools or `BITS=` / `BLOCK_DIMS=` to `make compute` (`bits` 1–8, `block_dims` 1–16, `dim % block_dims == 0`).
 
 ```bash
 ./query-bench --dataset glove --bits 2
+./query-bench --dataset glove --bits 1 --block-dims 2
 make compute DATASET=glove BITS=2 RECALL=1
+make compute DATASET=glove BITS=1 BLOCK_DIMS=2
 ```
 
 With `RECALL=1` / `--recall`, query-bench prints **Recall@1@k** (exact NN in approx top-k; TurboVec-compatible) then set-overlap **Recall@k**.
@@ -129,6 +131,7 @@ Ingest vectors and optionally report variance:
 ./ingest-sample --npy data/.cache/glove-sample-100.npy
 ./ingest-sample --dataset glove --limit 100 --variance
 ./ingest-sample --dataset glove --limit 100 --bits 2 --show-index 0
+./ingest-sample --dataset glove --limit 100 --bits 1 --block-dims 2
 ```
 
 Environment variables:
@@ -142,6 +145,7 @@ Profile ingestion stage hot paths into an in-memory `VectorStore`:
 ```bash
 ./ingest-bench --dataset glove
 ./ingest-bench --dataset glove --limit 50000 --bits 2
+./ingest-bench --dataset glove --limit 50000 --bits 1 --block-dims 2
 ./ingest-bench --npy data/openai-1536.npy --limit 50000
 ```
 
@@ -152,6 +156,7 @@ Ingest into RAM, then flat-scan asymmetric IP scores:
 ```bash
 ./query-bench --dataset glove
 ./query-bench --dataset glove --k 10 --bits 2
+./query-bench --dataset glove --bits 1 --block-dims 2 --k 10
 ./query-bench --dataset glove --bits 4 --k 8 --limit 100000 --recall
 ```
 

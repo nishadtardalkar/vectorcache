@@ -1,10 +1,10 @@
 # VectorCache Algorithm
 
-Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation** and **TurboQuant** scalar codes (`n` bits per dimension) with a flat full-corpus scan.
+Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation** and **TurboQuant** block codes (`n` bits per block of `d` dimensions; default `d=1`) with a flat full-corpus scan.
 
 1. L2-normalize on `dim`
 2. Apply `K` rounds of (global Fisher–Yates permutation → ±1 signs → normalized block Walsh–Hadamard); `K` is compile-time (`VECTORCACHE_SRHT_ROUNDS`, default **2**). Block size is the largest power-of-two divisor of `dim` (no zero-pad).
-3. Lloyd-Max scalar quantize each rotated coordinate to `2^n` centroids for **Beta((dim−1)/2, (dim−1)/2)** on `[-1, 1]`; pack `n`-bit indices
+3. Lloyd-Max / block-VQ: each contiguous block of `d` rotated coords → one of `2^n` centroids in `R^d` for **Beta((dim−1)/2, (dim−1)/2)** (product measure when `d>1`); pack `n`-bit indices (`M = dim/d` codes)
 4. Store per-vector IP scale `α = 1 / ⟨u, x̂⟩` (unit `u`, reconstruction `x̂`) for RaBitQ-style length renormalization
 5. Query: same prep (keep query float in rotated space), score **every** stored code with asymmetric IP, multiply by `α`, take top-k
 
@@ -20,7 +20,7 @@ Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation** a
  perm+signs+block-WH (×K)       perm+signs+block-WH (×K)
         │                              │
         ▼                              ▼
- Lloyd-Max n bits/dim           (rotated float query)
+ Lloyd-Max n bits / d dims      (rotated float query)
  + store α = 1/⟨u,x̂⟩                    │
         │                              ▼
  append to flat store           score ALL codes × α → top-k
@@ -30,20 +30,20 @@ Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation** a
 
 Asymmetric inner product in rotated space with length renormalization:
 
-`score = α · Σ_i q_rot[i] · centroid[code_i]`
+`score = α · Σ_b ⟨q_block_b, centroid[code_b]⟩`
 
-Higher is better. Same path for all `n`.
+Higher is better. Same path for all `(d, n)`.
 
-For byte-aligned widths (`n ∈ {1,2,4,8}`), search builds exact float query LUTs (one 256-entry table per packed byte-group) and scores from a **FAISS FastScan-style blocked cache** (`BLOCK=32`: for each byte-group, 32 vectors’ bytes are contiguous). Canonical ingest storage remains vector-major packed codes; the blocked view is rebuilt lazily on search (or via `QueryEngine::prepare_index()`).
+For byte-aligned widths (`n ∈ {1,2,4,8}` and `(M·n) % 8 == 0`), search builds exact float query LUTs (one 256-entry table per packed **code** byte-group) and scores from a **FAISS FastScan-style blocked cache** (`BLOCK=32`: for each byte-group, 32 vectors’ bytes are contiguous). Canonical ingest storage remains vector-major packed codes; the blocked view is rebuilt lazily on search (or via `QueryEngine::prepare_index()`).
 
 | bits | Hot path |
 |------|----------|
-| 1 | Transposed u64 columns + AVX-512 mask-add (`score = base + Σ_{bit i set} Δ_i`), 4-way interleave within each block |
+| 1 | Transposed u64 columns + AVX-512 mask-add (`score = base + Σ_{bit b set} Δ_b` over `M` codes), 4-way interleave within each block; requires `M % 64 == 0` |
 | 4 | Nibble-split float LUTs + `_mm512_permutexvar_ps` (exact) |
 | 2 / 8 | Blocked float LUT lookup across 32 lanes |
-| odd | Scalar unpack + MAC (no blocked cache) |
+| odd | Scalar unpack + block MAC (no blocked cache) |
 
-With `VECTORCACHE_OPENMP`, the block loop parallelizes when `n_blocks ≥ 1024` (~32K vectors) **and** `omp_get_max_threads() > 1`: per-thread top-k then merge. Single-thread / smaller corpora use the existing vector-major LUT/mask-add kernels (blocked layout is still built for bits=1 mask-add when `dim % 64 == 0`). The math is unchanged; `α` is applied after the block score.
+With `VECTORCACHE_OPENMP`, the block loop parallelizes when `n_blocks ≥ 1024` (~32K vectors) **and** `omp_get_max_threads() > 1`: per-thread top-k then merge. Single-thread / smaller corpora use the existing vector-major LUT/mask-add kernels (blocked layout is still built for bits=1 mask-add when `M % 64 == 0`). The math is unchanged; `α` is applied after the block score.
 
 ## Query knobs (`QueryParams`)
 
@@ -51,7 +51,7 @@ With `VECTORCACHE_OPENMP`, the block loop parallelizes when `n_blocks ≥ 1024` 
 |-------|---------|---------|
 | `k` | 10 | top-k |
 
-Runtime bits-per-dim is set at ingest (`IngestionEngine` / `--bits` / `BITS`) and stored on `VectorStore` (range 1–8).
+Runtime bits-per-block (`bits_per_dim` field name kept for compatibility) and `block_dims` are set at ingest (`IngestionEngine` / `--bits` / `--block-dims` / `BITS` / `BLOCK_DIMS`) and stored on `VectorStore` (`bits` 1–8, `block_dims` 1–16, `srht_dim % block_dims == 0`).
 
 ## Primary sources
 
