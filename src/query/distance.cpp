@@ -49,6 +49,21 @@ void fill_group_lut(float* table, std::span<const float> query_slice,
   }
 }
 
+/// bits=8, block_dims==2: table[k] = q0*c[k,0] + q1*c[k,1] via AVX-512 FMA.
+void fill_group_lut_bits8_d2(float* table, float q0, float q1, const float* centroids) {
+  const __m512 vq0 = _mm512_set1_ps(q0);
+  const __m512 vq1 = _mm512_set1_ps(q1);
+  const __m512i pr_x = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 0, 2, 4, 6, 8, 10, 12, 14);
+  const __m512i pr_y = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 1, 3, 5, 7, 9, 11, 13, 15);
+  for (std::size_t k = 0; k < QueryLut::kEntries; k += 8) {
+    const __m512 xy = _mm512_loadu_ps(centroids + k * 2);
+    const __m512 xs = _mm512_permutexvar_ps(pr_x, xy);
+    const __m512 ys = _mm512_permutexvar_ps(pr_y, xy);
+    const __m512 dots = _mm512_fmadd_ps(vq0, xs, _mm512_mul_ps(vq1, ys));
+    _mm256_storeu_ps(table + k, _mm512_castps512_ps256(dots));
+  }
+}
+
 float score_lut_one(const QueryLut& lut, const std::uint8_t* bytes) {
   const std::size_t groups = lut.num_groups();
   float a0 = 0.0f;
@@ -236,9 +251,12 @@ void build_query_lut(std::span<const float> query_rotated,
   const auto centroids = codebook.centroids();
   for (std::size_t g = 0; g < num_groups; ++g) {
     const std::size_t q_off = g * codes_per_group * block_dims;
-    fill_group_lut(out.table(g),
-                   query_rotated.subspan(q_off, codes_per_group * block_dims), centroids, bits,
-                   codes_per_group, block_dims);
+    const auto q_slice = query_rotated.subspan(q_off, codes_per_group * block_dims);
+    if (bits == 8 && block_dims == 2) {
+      fill_group_lut_bits8_d2(out.table(g), q_slice[0], q_slice[1], centroids.data());
+    } else {
+      fill_group_lut(out.table(g), q_slice, centroids, bits, codes_per_group, block_dims);
+    }
   }
 
   if (bits == 1 && (m % 64) == 0 && codebook.num_centroids() >= 2) {
@@ -510,10 +528,44 @@ void score_blocked_nibble4(const QueryLut& lut, const BlockedCodes& blocked, std
   std::memcpy(out_scores.data(), acc, count * sizeof(float));
 }
 
-/// bits=2/8: blocked float LUT (exact).
+/// bits=2: blocked float LUT (exact).
 void score_blocked_nibble2(const QueryLut& lut, const BlockedCodes& blocked, std::size_t block,
                            std::span<float> out_scores) {
   score_blocked_float_lut(lut, blocked, block, out_scores);
+}
+
+/// bits=8 FastScan: AVX-512 gather from 256-entry float LUTs (exact).
+void score_blocked_bits8(const QueryLut& lut, const BlockedCodes& blocked, std::size_t block,
+                         std::span<float> out_scores) {
+  const std::size_t count = blocked.block_count(block);
+  const std::size_t groups = lut.num_groups();
+  alignas(64) float acc[BlockedCodes::kBlock] = {};
+
+  for (std::size_t g = 0; g < groups; ++g) {
+    const std::uint8_t* codes = blocked.group_bytes(block, g);
+    const float* table = lut.table(g);
+#if defined(_MSC_VER)
+    if (g + 1 < groups) {
+      _mm_prefetch(reinterpret_cast<const char*>(blocked.group_bytes(block, g + 1)), _MM_HINT_T0);
+    }
+#else
+    if (g + 1 < groups) {
+      __builtin_prefetch(blocked.group_bytes(block, g + 1), 0, 3);
+    }
+#endif
+    std::size_t v = 0;
+    for (; v + 16 <= count; v += 16) {
+      const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes + v));
+      const __m512i idx = _mm512_cvtepu8_epi32(bytes);
+      const __m512 vals = _mm512_i32gather_ps(idx, table, 4);
+      const __m512 vacc = _mm512_loadu_ps(acc + v);
+      _mm512_storeu_ps(acc + v, _mm512_add_ps(vacc, vals));
+    }
+    for (; v < count; ++v) {
+      acc[v] += table[codes[v]];
+    }
+  }
+  std::memcpy(out_scores.data(), acc, count * sizeof(float));
 }
 
 }  // namespace
@@ -538,6 +590,11 @@ void score_blocked_batch(const QueryLut& lut, const BlockedCodes& blocked, std::
 
   if (lut.bits() == 4 && blocked.bits() == 4 && lut.num_groups() == blocked.num_groups()) {
     score_blocked_nibble4(lut, blocked, block, out_scores);
+    return;
+  }
+
+  if (lut.bits() == 8 && blocked.bits() == 8 && lut.num_groups() == blocked.num_groups()) {
+    score_blocked_bits8(lut, blocked, block, out_scores);
     return;
   }
 

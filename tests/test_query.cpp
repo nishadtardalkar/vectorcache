@@ -231,6 +231,29 @@ TEST(QueryDistanceTest, BlockDims2Bits1MaskAddWhenAligned) {
   EXPECT_NEAR(query::asymmetric_ip_score_lut(lut, words), ref, 1e-5f);
 }
 
+TEST(QueryDistanceTest, BlockDims2Bits8LutMatchesScalar) {
+  constexpr std::size_t dim = 64;
+  constexpr std::size_t bits = 8;
+  constexpr std::size_t block_dims = 2;
+  quantize::LloydMaxCodebook codebook(dim, bits, block_dims);
+  std::vector<float> q(dim);
+  for (std::size_t i = 0; i < dim; ++i) {
+    q[i] = static_cast<float>(static_cast<int>(i % 7) - 3) * 0.06f;
+  }
+  const auto [words, _] = quantize::quantize_blocks_to_nbit(q, codebook);
+  const float ref = reference_asymmetric_ip(q, words, codebook);
+
+  query::QueryLut lut;
+  query::build_query_lut(q, codebook, lut);
+  ASSERT_FALSE(lut.empty());
+  EXPECT_EQ(lut.bits(), 8u);
+  EXPECT_EQ(lut.num_codes(), dim / block_dims);
+  EXPECT_EQ(lut.block_dims(), block_dims);
+
+  EXPECT_NEAR(query::asymmetric_ip_score(q, words, codebook), ref, 1e-5f);
+  EXPECT_NEAR(query::asymmetric_ip_score_lut(lut, words), ref, 1e-5f);
+}
+
 TEST(QueryEngineTest, SelfSimilarityTopHit) {
   // Spikes at disjoint coords so 1-bit asymmetric IP keeps a clear self margin
   // (dense near-duplicates can land within ~1e-3 after α-scaling and flip on GCC/FMA).

@@ -297,42 +297,35 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
     build_query_lut(prepared.rotated, codebook_, lut);
     if (!lut.empty()) {
       const std::size_t n_blocks = blocked.n_blocks();
-      const bool prefer_bit1_blocked = lut.has_bit1_deltas() && blocked.has_bit1_words();
 #if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
       const bool prefer_parallel =
           n_blocks >= kParallelMinBlocks && omp_get_max_threads() > 1;
-#else
-      const bool prefer_parallel = false;
-#endif
-      if (prefer_parallel || prefer_bit1_blocked) {
-#if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
-        if (prefer_parallel) {
-          const int nthreads = omp_get_max_threads();
-          std::vector<TopKHits> locals;
-          locals.reserve(static_cast<std::size_t>(nthreads));
-          for (int t = 0; t < nthreads; ++t) {
-            locals.emplace_back(params.k);
-          }
-#pragma omp parallel
-          {
-            const int tid = omp_get_thread_num();
-            TopKHits& local = locals[static_cast<std::size_t>(tid)];
-#pragma omp for schedule(static) nowait
-            for (int b = 0; b < static_cast<int>(n_blocks); ++b) {
-              score_block_into_topk(blocked, lut, store_, static_cast<std::size_t>(b), local);
-            }
-          }
-          for (auto& local : locals) {
-            topk.merge_from(local);
-          }
-          return topk.finalize();
+      if (prefer_parallel) {
+        const int nthreads = omp_get_max_threads();
+        std::vector<TopKHits> locals;
+        locals.reserve(static_cast<std::size_t>(nthreads));
+        for (int t = 0; t < nthreads; ++t) {
+          locals.emplace_back(params.k);
         }
-#endif
-        for (std::size_t block = 0; block < n_blocks; ++block) {
-          score_block_into_topk(blocked, lut, store_, block, topk);
+#pragma omp parallel
+        {
+          const int tid = omp_get_thread_num();
+          TopKHits& local = locals[static_cast<std::size_t>(tid)];
+#pragma omp for schedule(static) nowait
+          for (int b = 0; b < static_cast<int>(n_blocks); ++b) {
+            score_block_into_topk(blocked, lut, store_, static_cast<std::size_t>(b), local);
+          }
+        }
+        for (auto& local : locals) {
+          topk.merge_from(local);
         }
         return topk.finalize();
       }
+#endif
+      for (std::size_t block = 0; block < n_blocks; ++block) {
+        score_block_into_topk(blocked, lut, store_, block, topk);
+      }
+      return topk.finalize();
     }
   }
   search_flat_vector_major(store_, prepared, codebook_, topk);

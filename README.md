@@ -80,7 +80,7 @@ ctest --output-on-failure
 
 The library requires AVX-512F/DQ/BW/VL/VBMI/VNNI + VPOPCNTDQ. GCC/Clang builds use `-mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vpopcntdq -mavx512vbmi -mavx512vnni -mfma`; MSVC uses `/arch:AVX512` (with VBMI/VNNI macros forced). There are no scalar fallbacks.
 
-Query scoring uses a FastScan-style `BLOCK=32` code cache (see `ALGORITHM.md`): bits=1 transposed mask-add, bits=4 nibble permute LUTs, and OpenMP over blocks when the corpus is large enough.
+Query scoring uses a FastScan-style `BLOCK=32` code cache (see `ALGORITHM.md`): bits=1 transposed mask-add, bits=4 nibble permute LUTs, bits=8 AVX-512 gather, and OpenMP over blocks when the corpus is large enough.
 
 For maximum single-node performance on homogeneous clusters:
 

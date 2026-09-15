@@ -111,7 +111,7 @@ void asymmetric_ip_batch_lut(const QueryLut& lut, std::span<const std::uint64_t>
 class BlockedCodes;
 
 /// Score one FastScan block (up to BlockedCodes::kBlock vectors) into out_scores.
-/// Uses bits=1 transposed mask-add when available; otherwise blocked float LUT.
+/// bits=1 mask-add, bits=4 nibble permute, bits=8 gather, else blocked float LUT.
 void score_blocked_batch(const QueryLut& lut, const BlockedCodes& blocked, std::size_t block,
                          std::span<float> out_scores);
 

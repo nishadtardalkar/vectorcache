@@ -40,10 +40,11 @@ For byte-aligned widths (`n ∈ {1,2,4,8}` and `(M·n) % 8 == 0`), search builds
 |------|----------|
 | 1 | Transposed u64 columns + AVX-512 mask-add (`score = base + Σ_{bit b set} Δ_b` over `M` codes), 4-way interleave within each block; requires `M % 64 == 0` |
 | 4 | Nibble-split float LUTs + `_mm512_permutexvar_ps` (exact) |
-| 2 / 8 | Blocked float LUT lookup across 32 lanes |
+| 8 | AVX-512 gather from 256-entry float LUTs across 32 lanes (exact); LUT fill specialized for one code/group (`d=2` uses FMA over centroids) |
+| 2 | Blocked float LUT lookup across 32 lanes |
 | odd | Scalar unpack + block MAC (no blocked cache) |
 
-With `VECTORCACHE_OPENMP`, the block loop parallelizes when `n_blocks ≥ 1024` (~32K vectors) **and** `omp_get_max_threads() > 1`: per-thread top-k then merge. Single-thread / smaller corpora use the existing vector-major LUT/mask-add kernels (blocked layout is still built for bits=1 mask-add when `M % 64 == 0`). The math is unchanged; `α` is applied after the block score.
+With `VECTORCACHE_OPENMP`, the block loop parallelizes when `n_blocks ≥ 1024` (~32K vectors) **and** `omp_get_max_threads() > 1`: per-thread top-k then merge. Byte-aligned widths always score from the blocked cache when the query LUT is non-empty (single-thread or parallel); odd / non-byte-aligned widths fall back to vector-major scalar unpack. The math is unchanged; `α` is applied after the block score.
 
 ## Query knobs (`QueryParams`)
 
