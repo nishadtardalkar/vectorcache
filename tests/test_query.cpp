@@ -57,53 +57,35 @@ std::vector<std::vector<float>> make_vectors(std::size_t count, std::size_t dim)
 
 }  // namespace
 
-TEST(QueryDistanceTest, BitAgreementPerfectMatch) {
-  const std::vector<std::uint64_t> bits = {0xAAAAAAAAAAAAAAAAULL};
-  const float score = query::bit_agreement_score(bits, bits, 64);
-  EXPECT_FLOAT_EQ(score, 1.0f);
-}
-
-TEST(QueryDistanceTest, BitAgreementOpposite) {
-  const std::vector<std::uint64_t> a = {0};
-  const std::vector<std::uint64_t> b = {~0ULL};
-  const float score = query::bit_agreement_score(a, b, 64);
-  EXPECT_FLOAT_EQ(score, -1.0f);
-}
-
-TEST(QueryDistanceTest, BitAgreementSimdFullWords) {
-  std::vector<std::uint64_t> a(8, 0);
-  std::vector<std::uint64_t> b(8, ~0ULL);
-  EXPECT_FLOAT_EQ(query::bit_agreement_score(a, a, 512), 1.0f);
-  EXPECT_FLOAT_EQ(query::bit_agreement_score(a, b, 512), -1.0f);
-}
-
-TEST(QueryDistanceTest, BitAgreementBatchMatchesScalar) {
-  constexpr std::size_t words = 4;
-  constexpr std::size_t bits = words * 64;
-  constexpr std::size_t n = 5;
-  std::vector<std::uint64_t> query(words, 0x0f0f0f0f0f0f0f0fULL);
-  std::vector<std::uint64_t> data(n * words);
-  for (std::size_t v = 0; v < n; ++v) {
-    for (std::size_t w = 0; w < words; ++w) {
-      data[v * words + w] = query[w] ^ (static_cast<std::uint64_t>(v) << w);
-    }
+TEST(QueryDistanceTest, AsymmetricIpSelfMatch) {
+  constexpr std::size_t dim = 64;
+  quantize::LloydMaxCodebook codebook(dim, 1);
+  std::vector<float> q(dim);
+  for (std::size_t i = 0; i < dim; ++i) {
+    q[i] = (i % 2 == 0) ? 0.1f : -0.1f;
   }
-  std::vector<float> batch(n);
-  query::bit_agreement_batch(query, bits, data, words, n, batch);
-  for (std::size_t v = 0; v < n; ++v) {
-    const float scalar = query::bit_agreement_score(
-        query, std::span<const std::uint64_t>(data.data() + v * words, words), bits);
-    EXPECT_NEAR(batch[v], scalar, 1e-6f);
-  }
+  const auto [words, _] = quantize::quantize_1dim_to_nbit(q, codebook);
+  const float score = query::asymmetric_ip_score(q, words, codebook);
+  // All coords contribute positively when code matches sign of q.
+  EXPECT_GT(score, 0.0f);
 
-  std::vector<std::uint32_t> disagree(n);
-  query::bit_agreement_batch_disagree(query, bits, data, words, n, disagree);
-  for (std::size_t v = 0; v < n; ++v) {
-    EXPECT_NEAR(query::score_from_disagree(disagree[v], bits), batch[v], 1e-6f);
-  }
+  std::vector<float> scores(1);
+  query::asymmetric_ip_batch(q, words, words.size(), 1, codebook, scores);
+  EXPECT_FLOAT_EQ(scores[0], score);
 }
 
-TEST(QueryEngineTest, SelfSimilarityTopScore) {
+TEST(QueryDistanceTest, AsymmetricIpPrefersMatchingCodes) {
+  constexpr std::size_t dim = 32;
+  quantize::LloydMaxCodebook codebook(dim, 2);
+  std::vector<float> q(dim, 0.5f);
+  const auto [good, _] = quantize::quantize_1dim_to_nbit(q, codebook);
+  std::vector<float> opposite(dim, -0.5f);
+  const auto [bad, _b] = quantize::quantize_1dim_to_nbit(opposite, codebook);
+  EXPECT_GT(query::asymmetric_ip_score(q, good, codebook),
+            query::asymmetric_ip_score(q, bad, codebook));
+}
+
+TEST(QueryEngineTest, SelfSimilarityTopHit) {
   const std::size_t dim = 64;
   const auto vectors = make_vectors(8, dim);
   MockReader reader(vectors, dim);
@@ -117,12 +99,12 @@ TEST(QueryEngineTest, SelfSimilarityTopScore) {
 
   const auto hits = query_engine.search(vectors[3], params);
   ASSERT_FALSE(hits.empty());
-  EXPECT_NEAR(hits[0].score, 1.0f, 1e-4f);
   const bool found_self =
       std::any_of(hits.begin(), hits.end(), [](const query::QueryHit& h) {
-        return h.id == 3u && h.score > 0.999f;
+        return h.id == 3u;
       });
   EXPECT_TRUE(found_self);
+  EXPECT_EQ(hits[0].id, 3u);
 }
 
 TEST(QueryEngineTest, FlatScanFindsBothNearVectors) {
@@ -153,7 +135,7 @@ TEST(QueryEngineTest, FlatScanFindsBothNearVectors) {
   EXPECT_EQ(hits[0].id, 0u);
 }
 
-TEST(QueryEngineTest, PreferHigherL0Agreement) {
+TEST(QueryEngineTest, PreferHigherAsymmetricScore) {
   const std::size_t dim = 64;
   std::vector<float> near(dim, -1.0f);
   std::vector<float> far(dim, -1.0f);
@@ -200,7 +182,7 @@ TEST(QueryEngineTest, SearchPreparedMatchesSearch) {
   }
 }
 
-TEST(QueryEngineTest, QueryCodesMatchIngestion) {
+TEST(QueryEngineTest, StoredCodesMatchIngestion) {
   const std::size_t dim = 64;
   std::vector<float> vector(dim);
   for (std::size_t i = 0; i < dim; ++i) {
@@ -212,13 +194,14 @@ TEST(QueryEngineTest, QueryCodesMatchIngestion) {
   CapturingHook hook;
   ingest_engine.ingest_with_hook(reader, &hook);
 
-  const auto [expected_l0, _l0] = quantize::quantize_1dim_to_1bit(hook.last);
+  const auto [expected_l0, _l0] =
+      quantize::quantize_1dim_to_nbit(hook.last, ingest_engine.codebook());
   EXPECT_EQ(ingest_engine.store().size(), 1u);
+  EXPECT_EQ(ingest_engine.store().vector_l0(0)[0], expected_l0[0]);
 
   auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
   const auto prepared = query_engine.prepare(vector);
-  EXPECT_EQ(prepared.l0[0], expected_l0[0]);
-  EXPECT_EQ(ingest_engine.store().vector_l0(0)[0], expected_l0[0]);
+  EXPECT_EQ(prepared.rotated.size(), ingest_engine.store().srht_dim());
 }
 
 TEST(QueryEngineTest, TopKKeepsHighestScores) {
@@ -238,4 +221,28 @@ TEST(QueryEngineTest, TopKKeepsHighestScores) {
   for (std::size_t i = 1; i < hits.size(); ++i) {
     EXPECT_GE(hits[i - 1].score, hits[i].score);
   }
+}
+
+TEST(QueryEngineTest, MultiBitSearchRanksSelfFirst) {
+  const std::size_t dim = 64;
+  std::vector<std::vector<float>> vectors;
+  for (std::size_t i = 0; i < 4; ++i) {
+    std::vector<float> v(dim, 0.0f);
+    // Distinct sparse spikes so asymmetric IP cleanly prefers the matching code.
+    v[i * 8] = 5.0f;
+    v[i * 8 + 1] = 4.0f;
+    vectors.push_back(std::move(v));
+  }
+  MockReader reader(vectors, dim);
+
+  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42, 2);
+  ingest_engine.ingest(reader);
+
+  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
+  query::QueryParams params;
+  params.k = 1;
+  const auto hits = query_engine.search(vectors[2], params);
+  ASSERT_FALSE(hits.empty());
+  EXPECT_EQ(hits[0].id, 2u);
+  EXPECT_EQ(ingest_engine.store().bits_per_dim(), 2u);
 }

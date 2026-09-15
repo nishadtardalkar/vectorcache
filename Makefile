@@ -15,6 +15,7 @@ NPY           ?=
 SPLIT         ?=
 LIMIT         ?=
 SEED          ?=
+BITS          ?=
 TOP_D         ?=
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
@@ -60,6 +61,7 @@ BENCH_COMMON_ARGS = \
 	$(call opt_arg,SPLIT,split) \
 	$(call opt_arg,LIMIT,limit) \
 	$(call opt_arg,SEED,seed) \
+	$(call opt_arg,BITS,bits) \
 	$(BENCH_EXTRA_ARGS)
 
 INGEST_BENCH_ARGS = $(BENCH_COMMON_ARGS)
@@ -95,6 +97,7 @@ help:
 	@echo "  SPLIT           --split"
 	@echo "  LIMIT           --limit"
 	@echo "  SEED            --seed"
+	@echo "  BITS            --bits (TurboQuantMSE bits/dim, 1-8)"
 	@echo "  QUERY_SPLIT     --query-split (query-bench only)"
 	@echo "  QUERY_LIMIT     --query-limit (query-bench only)"
 	@echo "  K               --k (query-bench only)"
@@ -106,7 +109,7 @@ help:
 	@echo "For 3-round SRHT at compile time: make compute DATASET=glove CMAKE_OPTS='-DVECTORCACHE_SRHT_ROUNDS=3'"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
-	@echo "Example: make compute DATASET=glove TOP_D=8 RECALL=1 N_BUCKETS=64"
+	@echo "Example: make compute DATASET=glove BITS=2 RECALL=1"
 
 login: $(LOGIN_READY)
 

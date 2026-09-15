@@ -2,35 +2,21 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <span>
+
+#include "vectorcache/quantize/quantize.hpp"
 
 namespace vectorcache::query {
 
-/// Sign-bit agreement score in [-1, 1] for num_bits valid bits in each word span.
-float bit_agreement_score(std::span<const std::uint64_t> query_words,
-                          std::span<const std::uint64_t> data_words, std::size_t num_bits);
+/// Asymmetric inner-product score: sum_i q_rot[i] * centroid[code_i] for one DB vector.
+float asymmetric_ip_score(std::span<const float> query_rotated,
+                          std::span<const std::uint64_t> data_words,
+                          const quantize::LloydMaxCodebook& codebook);
 
-/// Score num_vectors contiguous data vectors (data_words_per_vec u64 words each) against query.
-void bit_agreement_batch(std::span<const std::uint64_t> query_words, std::size_t num_bits,
+/// Score num_vectors contiguous packed codes against a rotated float query.
+void asymmetric_ip_batch(std::span<const float> query_rotated,
                          std::span<const std::uint64_t> data_words, std::size_t data_words_per_vec,
-                         std::size_t num_vectors, std::span<float> out_scores);
-
-/// Same as bit_agreement_batch but writes XOR popcount (disagreement bit counts).
-/// Lower disagree is better; float score = (2*(num_bits-disagree) - num_bits) / num_bits.
-/// If a partial popcount already exceeds reject_threshold, the row may early-exit with a
-/// disagree value > reject_threshold (exact value not required when rejected).
-void bit_agreement_batch_disagree(
-    std::span<const std::uint64_t> query_words, std::size_t num_bits,
-    std::span<const std::uint64_t> data_words, std::size_t data_words_per_vec,
-    std::size_t num_vectors, std::span<std::uint32_t> out_disagree,
-    std::uint32_t reject_threshold = std::numeric_limits<std::uint32_t>::max());
-
-/// Convert disagreement bit count to agreement score in [-1, 1].
-inline float score_from_disagree(std::uint32_t disagree, std::size_t num_bits) {
-  const std::size_t agree = num_bits - static_cast<std::size_t>(disagree);
-  return (2.0f * static_cast<float>(agree) - static_cast<float>(num_bits)) /
-         static_cast<float>(num_bits);
-}
+                         std::size_t num_vectors, const quantize::LloydMaxCodebook& codebook,
+                         std::span<float> out_scores);
 
 }  // namespace vectorcache::query

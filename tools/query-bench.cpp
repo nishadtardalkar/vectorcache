@@ -71,9 +71,9 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 
 vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
                                                   std::size_t dim, std::uint64_t seed,
-                                                  std::size_t limit) {
+                                                  std::size_t limit, std::size_t bits) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
-  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed);
+  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits);
   engine.reserve_vectors(limit);
   const auto report = engine.ingest(limited);
   if (report.vectors_ingested != limit) {
@@ -265,7 +265,8 @@ void run_probe_stats(const vectorcache::query::QueryEngine& engine,
   std::cout << "\nProbe stats (first query, k=" << base_params.k << "):\n";
   const auto prepared = engine.prepare(queries.front());
   const auto hits = engine.search_prepared(prepared, base_params);
-  std::cout << "  l0_words=" << prepared.l0.size() << " hits=" << hits.size() << '\n';
+  std::cout << "  rotated_dim=" << prepared.rotated.size()
+            << " bits=" << engine.codebook().bits() << " hits=" << hits.size() << '\n';
 }
 
 }  // namespace
@@ -281,6 +282,7 @@ int main(int argc, char** argv) {
   std::size_t query_limit = 0;
   std::uint64_t seed = 42;
   std::size_t k = 10;
+  std::size_t bits = 1;
   bool calibrate = false;
   bool recall = false;
 
@@ -294,6 +296,7 @@ int main(int argc, char** argv) {
   app.add_option("--query-limit", query_limit, "Query count (default: 10000 GloVe, 1000 else)");
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
+  app.add_option("--bits", bits, "TurboQuantMSE bits per dimension (1-8)");
   app.add_flag("--calibrate", calibrate, "Print L0 probe stats for the first query");
   app.add_flag("--recall", recall,
                "Measure mean recall@k vs exact cosine top-k on original full-dim vectors");
@@ -304,6 +307,7 @@ int main(int argc, char** argv) {
     if (npy_path.empty() && dataset.empty()) {
       throw vectorcache::Error("pass --dataset or --npy");
     }
+    vectorcache::quantize::validate_bits_per_dim(bits);
 
     if (query_split.empty()) {
       query_split = (dataset == "glove") ? "test" : "holdout";
@@ -322,13 +326,14 @@ int main(int argc, char** argv) {
     const std::size_t padded = vectorcache::transform::padded_dim(meta.dim);
     std::cout << "Query bench: index=" << source_label << " dim=" << meta.dim
               << " padded=" << padded << " index_n=" << actual_index
-              << " query_n=" << query_limit << " query_split=" << query_split << '\n';
+              << " query_n=" << query_limit << " query_split=" << query_split
+              << " bits=" << bits << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
     }
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
-    auto ingest_engine = ingest_index(index_limited, meta.dim, seed, actual_index);
+    auto ingest_engine = ingest_index(index_limited, meta.dim, seed, actual_index, bits);
     std::cout << "  stored_vectors=" << ingest_engine.store().size() << '\n';
 
     auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);

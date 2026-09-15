@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <immintrin.h>
 #include <limits>
 #include <vector>
 
@@ -21,57 +20,56 @@ constexpr std::size_t kScoreChunk = 64;
 
 class TopKHits {
  public:
-  explicit TopKHits(std::size_t k, std::size_t num_bits)
+  explicit TopKHits(std::size_t k)
       : k_(k),
-        num_bits_(num_bits),
         use_heap_(k > kHeapTopKThreshold),
         size_(0),
-        max_disagree_(0),
-        max_idx_(0),
-        disagrees_(use_heap_ ? 0 : k, 0),
+        min_score_(0.0f),
+        min_idx_(0),
+        scores_(use_heap_ ? 0 : k, 0.0f),
         ids_(use_heap_ ? 0 : k, 0) {
     if (use_heap_) {
       heap_.reserve(k);
     }
   }
 
-  std::uint32_t reject_threshold() const {
+  float reject_threshold() const {
     if (k_ == 0) {
-      return 0;
+      return std::numeric_limits<float>::infinity();
     }
     if (use_heap_) {
       if (heap_.size() < k_) {
-        return std::numeric_limits<std::uint32_t>::max();
+        return -std::numeric_limits<float>::infinity();
       }
-      return heap_.front().disagree;
+      return heap_.front().score;
     }
     if (size_ < k_) {
-      return std::numeric_limits<std::uint32_t>::max();
+      return -std::numeric_limits<float>::infinity();
     }
-    return max_disagree_;
+    return min_score_;
   }
 
-  void push(std::size_t id, std::uint32_t disagree) {
+  void push(std::size_t id, float score) {
     if (k_ == 0) {
       return;
     }
     if (use_heap_) {
-      push_heap(id, disagree);
+      push_heap(id, score);
       return;
     }
     if (size_ < k_) {
-      disagrees_[size_] = disagree;
+      scores_[size_] = score;
       ids_[size_] = id;
       ++size_;
       if (size_ == k_) {
-        rescan_max();
+        rescan_min();
       }
       return;
     }
-    if (disagree < max_disagree_ || (disagree == max_disagree_ && id < ids_[max_idx_])) {
-      disagrees_[max_idx_] = disagree;
-      ids_[max_idx_] = id;
-      rescan_max();
+    if (score > min_score_ || (score == min_score_ && id < ids_[min_idx_])) {
+      scores_[min_idx_] = score;
+      ids_[min_idx_] = id;
+      rescan_min();
     }
   }
 
@@ -80,12 +78,12 @@ class TopKHits {
     if (use_heap_) {
       out.reserve(heap_.size());
       for (const auto& hit : heap_) {
-        out.push_back({hit.id, score_from_disagree(hit.disagree, num_bits_)});
+        out.push_back({hit.id, hit.score});
       }
     } else {
       out.reserve(size_);
       for (std::size_t i = 0; i < size_; ++i) {
-        out.push_back({ids_[i], score_from_disagree(disagrees_[i], num_bits_)});
+        out.push_back({ids_[i], scores_[i]});
       }
     }
     std::sort(out.begin(), out.end(), [](const QueryHit& a, const QueryHit& b) {
@@ -99,81 +97,75 @@ class TopKHits {
 
  private:
   struct HeapHit {
-    std::uint32_t disagree;
+    float score;
     std::size_t id;
   };
 
+  /// Max-heap of the worst (lowest) scores among the current top-k.
   static bool heap_worse(const HeapHit& a, const HeapHit& b) {
-    if (a.disagree != b.disagree) {
-      return a.disagree < b.disagree;
+    if (a.score != b.score) {
+      return a.score > b.score;  // better (higher) score is "less"
     }
-    return a.id < b.id;
+    return a.id < b.id;  // smaller id is better when scores tie
   }
 
-  void push_heap(std::size_t id, std::uint32_t disagree) {
+  void push_heap(std::size_t id, float score) {
     if (heap_.size() < k_) {
-      heap_.push_back({disagree, id});
+      heap_.push_back({score, id});
       std::push_heap(heap_.begin(), heap_.end(), heap_worse);
       return;
     }
     const auto& worst = heap_.front();
-    if (disagree < worst.disagree || (disagree == worst.disagree && id < worst.id)) {
+    if (score > worst.score || (score == worst.score && id < worst.id)) {
       std::pop_heap(heap_.begin(), heap_.end(), heap_worse);
-      heap_.back() = {disagree, id};
+      heap_.back() = {score, id};
       std::push_heap(heap_.begin(), heap_.end(), heap_worse);
     }
   }
 
-  void rescan_max() {
+  void rescan_min() {
     std::size_t mi = 0;
     for (std::size_t h = 1; h < size_; ++h) {
-      if (disagrees_[h] > disagrees_[mi] ||
-          (disagrees_[h] == disagrees_[mi] && ids_[h] > ids_[mi])) {
+      if (scores_[h] < scores_[mi] || (scores_[h] == scores_[mi] && ids_[h] > ids_[mi])) {
         mi = h;
       }
     }
-    max_disagree_ = disagrees_[mi];
-    max_idx_ = mi;
+    min_score_ = scores_[mi];
+    min_idx_ = mi;
   }
 
   std::size_t k_;
-  std::size_t num_bits_;
   bool use_heap_;
   std::size_t size_;
-  std::uint32_t max_disagree_;
-  std::size_t max_idx_;
-  std::vector<std::uint32_t> disagrees_;
+  float min_score_;
+  std::size_t min_idx_;
+  std::vector<float> scores_;
   std::vector<std::size_t> ids_;
   std::vector<HeapHit> heap_;
 };
 
-void search_flat(const ingest::VectorStore& store, const PreparedQuery& query, std::size_t l0_bits,
-                 TopKHits& topk) {
+void search_flat(const ingest::VectorStore& store, const PreparedQuery& query,
+                 const quantize::LloydMaxCodebook& codebook, TopKHits& topk) {
   const std::size_t n = store.size();
   if (n == 0) {
     return;
   }
 
-  const std::size_t words = query.l0.size();
+  const std::size_t words = store.l0_words_per_vec();
   const auto codes = store.l0_codes();
   const auto ids = store.ids();
 
-  alignas(64) std::uint32_t disagree_buf[kScoreChunk];
-  std::uint32_t threshold = topk.reject_threshold();
+  alignas(64) float score_buf[kScoreChunk];
+  float threshold = topk.reject_threshold();
   for (std::size_t base = 0; base < n; base += kScoreChunk) {
     const std::size_t chunk = std::min(kScoreChunk, n - base);
-    if (base + chunk + 8 <= n) {
-      _mm_prefetch(reinterpret_cast<const char*>(codes.data() + (base + chunk + 4) * words),
-                   _MM_HINT_T0);
-    }
-    bit_agreement_batch_disagree(query.l0, l0_bits, codes.subspan(base * words, chunk * words),
-                                 words, chunk, std::span<std::uint32_t>(disagree_buf, chunk),
-                                 threshold);
+    asymmetric_ip_batch(query.rotated, codes.subspan(base * words, chunk * words), words, chunk,
+                        codebook, std::span<float>(score_buf, chunk));
     for (std::size_t i = 0; i < chunk; ++i) {
-      if (disagree_buf[i] > threshold) {
+      if (score_buf[i] < threshold) {
         continue;
       }
-      topk.push(ids[base + i], disagree_buf[i]);
+      topk.push(ids[base + i], score_buf[i]);
     }
     threshold = topk.reject_threshold();
   }
@@ -184,13 +176,9 @@ void prepare_query_into(const ingest::VectorStore& store,
                         bool query_is_rotated, std::size_t input_dim, std::span<const float> query,
                         PreparedQuery& prepared) {
   const std::size_t srht_dim = store.srht_dim();
-  const std::size_t l0_words = store.l0_words_per_vec();
 
   if (prepared.rotated.size() != srht_dim) {
     prepared.rotated.assign(srht_dim, 0.0f);
-  }
-  if (prepared.l0.size() != l0_words) {
-    prepared.l0.assign(l0_words, 0);
   }
 
   if (query_is_rotated) {
@@ -211,27 +199,29 @@ void prepare_query_into(const ingest::VectorStore& store,
   } else {
     throw Error("QueryEngine requires with_rotation() or from_rotated()");
   }
-
-  quantize::quantize_1dim_to_1bit_into(prepared.rotated, prepared.l0);
 }
 
 }  // namespace
 
 QueryEngine::QueryEngine(const ingest::VectorStore& store,
                          std::optional<transform::SrhtRotation> rotation, bool query_is_rotated,
-                         std::size_t input_dim)
+                         std::size_t input_dim, quantize::LloydMaxCodebook codebook)
     : store_(store),
       rotation_(std::move(rotation)),
       query_is_rotated_(query_is_rotated),
-      input_dim_(input_dim) {}
+      input_dim_(input_dim),
+      codebook_(std::move(codebook)) {}
 
 QueryEngine QueryEngine::with_rotation(const ingest::VectorStore& store, std::size_t input_dim,
                                        std::uint64_t seed) {
-  return QueryEngine(store, transform::SrhtRotation(input_dim, seed), false, input_dim);
+  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim());
+  return QueryEngine(store, transform::SrhtRotation(input_dim, seed), false, input_dim,
+                     std::move(codebook));
 }
 
 QueryEngine QueryEngine::from_rotated(const ingest::VectorStore& store) {
-  return QueryEngine(store, std::nullopt, true, store.input_dim());
+  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim());
+  return QueryEngine(store, std::nullopt, true, store.input_dim(), std::move(codebook));
 }
 
 void QueryEngine::prepare_into(PreparedQuery& out, std::span<const float> query) const {
@@ -246,9 +236,8 @@ PreparedQuery QueryEngine::prepare(std::span<const float> query) const {
 
 std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared,
                                                    const QueryParams& params) const {
-  const std::size_t l0_bits = quantize::l0_bits_per_vector(store_.srht_dim());
-  TopKHits topk(params.k, l0_bits);
-  search_flat(store_, prepared, l0_bits, topk);
+  TopKHits topk(params.k);
+  search_flat(store_, prepared, codebook_, topk);
   return topk.finalize();
 }
 

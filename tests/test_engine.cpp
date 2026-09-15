@@ -67,6 +67,7 @@ TEST(EngineTest, IngestDefaultHasNoHook) {
 
   EXPECT_EQ(report.vectors_ingested, n);
   EXPECT_EQ(engine.store().size(), n);
+  EXPECT_EQ(engine.bits_per_dim(), 1u);
 }
 
 TEST(EngineTest, IngestWithHookCountsVectors) {
@@ -91,7 +92,7 @@ TEST(EngineTest, IngestStoresL0) {
   CapturingHook hook;
   engine.ingest_with_hook(reader, &hook);
 
-  const auto [expected_l0, _] = quantize::quantize_1dim_to_1bit(hook.last);
+  const auto [expected_l0, _] = quantize::quantize_1dim_to_nbit(hook.last, engine.codebook());
   EXPECT_EQ(engine.store().size(), 1u);
   EXPECT_EQ(engine.store().id_at(0), 0u);
   ASSERT_EQ(engine.store().vector_l0(0).size(), expected_l0.size());
@@ -118,12 +119,23 @@ TEST(EngineTest, FromRotatedQuantizesWithoutSrht) {
   for (std::size_t i = 0; i < 16; ++i) {
     vector[i] = static_cast<float>(i) * 0.1f - 0.5f;
   }
-  const auto [expected_l0, _] = quantize::quantize_1dim_to_1bit(vector);
+  auto engine = ingest::IngestionEngine::from_rotated(16);
+  const auto [expected_l0, _] = quantize::quantize_1dim_to_nbit(vector, engine.codebook());
 
   MockReader reader({vector}, 16);
-  auto engine = ingest::IngestionEngine::from_rotated(16);
   engine.ingest(reader);
 
   EXPECT_EQ(engine.store().size(), 1u);
   EXPECT_EQ(engine.store().vector_l0(0)[0], expected_l0[0]);
+}
+
+TEST(EngineTest, MultiBitIngest) {
+  const std::size_t dim = 16;
+  std::vector<float> v(dim, 0.25f);
+  MockReader reader({v}, dim);
+  auto engine = ingest::IngestionEngine::from_rotated(dim, 2);
+  engine.ingest(reader);
+  EXPECT_EQ(engine.bits_per_dim(), 2u);
+  EXPECT_EQ(engine.store().l0_words_per_vec(), quantize::l0_words_per_vector(dim, 2));
+  EXPECT_EQ(engine.store().size(), 1u);
 }

@@ -8,6 +8,7 @@
 
 #include "vectorcache/aligned.hpp"
 #include "vectorcache/ingest/store.hpp"
+#include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/transform/srht.hpp"
 
 namespace vectorcache::query {
@@ -23,7 +24,6 @@ struct QueryParams {
 
 struct PreparedQuery {
   AlignedVector<float> rotated;
-  AlignedVector<std::uint64_t> l0;
 };
 
 class QueryEngine {
@@ -38,14 +38,17 @@ class QueryEngine {
   std::vector<QueryHit> search_prepared(const PreparedQuery& prepared,
                                         const QueryParams& params) const;
 
+  const quantize::LloydMaxCodebook& codebook() const { return codebook_; }
+
  private:
   QueryEngine(const ingest::VectorStore& store, std::optional<transform::SrhtRotation> rotation,
-              bool query_is_rotated, std::size_t input_dim);
+              bool query_is_rotated, std::size_t input_dim, quantize::LloydMaxCodebook codebook);
 
   const ingest::VectorStore& store_;
   std::optional<transform::SrhtRotation> rotation_;
   bool query_is_rotated_;
   std::size_t input_dim_;
+  quantize::LloydMaxCodebook codebook_;
 };
 
 }  // namespace vectorcache::query

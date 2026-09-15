@@ -2,7 +2,7 @@
 
 Flat quantized vector retrieval engine (C++20).
 
-VectorCache implements approximate nearest neighbor search via **SRHT** (L2-normalize, zero-pad for FWHT) and **1D→1bit (L0)** codes. Vectors are stored in a flat in-RAM index; queries score every code with a turbovec-style L0 top-k scan.
+VectorCache implements approximate nearest neighbor search via **SRHT** (L2-normalize, zero-pad for FWHT) and **TurboQuantMSE** codes (`n` bits per dimension, default 1). Vectors are stored in a flat in-RAM index; queries score every code with asymmetric inner-product top-k in rotated space.
 
 ## Requirements
 
@@ -53,7 +53,7 @@ make compute DATASET=glove
 make compute DATASET=glove BENCH_EXTRA_ARGS="--limit 50000"
 ```
 
-`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` against the required `DATASET` (e.g. `glove`, `openai-1536`, `openai-3072`). Indexes live entirely in `VectorStore` (RAM); queries flat-scan L0 codes in memory.
+`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` against the required `DATASET` (e.g. `glove`, `openai-1536`, `openai-3072`). Indexes live entirely in `VectorStore` (RAM); queries flat-scan packed TurboQuantMSE codes in memory.
 
 ## Build
 
@@ -95,6 +95,15 @@ cmake .. -DVECTORCACHE_SRHT_ROUNDS=3
 
 Allowed values: `1`, `2`, or `3`. Reconfigure and rebuild after changing; there is no runtime flag.
 
+### Bits per dimension (runtime)
+
+TurboQuantMSE uses `n` bits per SRHT coordinate (`2^n` Lloyd-Max centroids). Default is `1`. Pass `--bits` on CLI tools or `BITS=` to `make compute` (allowed: 1–8).
+
+```bash
+./query-bench --dataset glove --bits 2
+make compute DATASET=glove BITS=2 RECALL=1
+```
+
 ## CLI tools
 
 ### fetch-datasets
@@ -114,7 +123,7 @@ Ingest vectors and optionally report variance:
 ```bash
 ./ingest-sample --npy data/.cache/glove-sample-100.npy
 ./ingest-sample --dataset glove --limit 100 --variance
-./ingest-sample --dataset glove --limit 100 --variance --show-index 0
+./ingest-sample --dataset glove --limit 100 --bits 2 --show-index 0
 ```
 
 Environment variables:
@@ -127,17 +136,17 @@ Profile ingestion stage hot paths into an in-memory `VectorStore`:
 
 ```bash
 ./ingest-bench --dataset glove
-./ingest-bench --dataset glove --limit 50000
+./ingest-bench --dataset glove --limit 50000 --bits 2
 ./ingest-bench --npy data/openai-1536.npy --limit 50000
 ```
 
 ### query-bench
 
-Ingest into RAM, then flat-scan L0 scores:
+Ingest into RAM, then flat-scan asymmetric IP scores:
 
 ```bash
 ./query-bench --dataset glove
-./query-bench --dataset glove --k 10
+./query-bench --dataset glove --k 10 --bits 2
 ```
 
 Environment variables:

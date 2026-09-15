@@ -15,30 +15,35 @@ namespace vectorcache::ingest {
 
 IngestionEngine::IngestionEngine(VectorStore store, std::optional<transform::SrhtRotation> rotation,
                                  bool quantize_only, std::size_t input_dim, std::size_t srht_dim,
-                                 std::size_t l0_words_per_vec)
+                                 std::size_t l0_words_per_vec, quantize::LloydMaxCodebook codebook)
     : store_(std::move(store)),
       rotation_(std::move(rotation)),
       quantize_only_(quantize_only),
       input_dim_(input_dim),
       srht_dim_(srht_dim),
-      l0_words_per_vec_(l0_words_per_vec) {}
+      l0_words_per_vec_(l0_words_per_vec),
+      codebook_(std::move(codebook)) {}
 
-IngestionEngine IngestionEngine::from_rotated(std::size_t srht_dim) {
-  const std::size_t l0_words = quantize::l0_words_per_vector(srht_dim);
-  return IngestionEngine(VectorStore(l0_words, srht_dim, srht_dim), std::nullopt, true, srht_dim,
-                         srht_dim, l0_words);
+IngestionEngine IngestionEngine::from_rotated(std::size_t srht_dim, std::size_t bits_per_dim) {
+  quantize::LloydMaxCodebook codebook(srht_dim, bits_per_dim);
+  const std::size_t l0_words = quantize::l0_words_per_vector(srht_dim, bits_per_dim);
+  return IngestionEngine(VectorStore(l0_words, srht_dim, srht_dim, bits_per_dim), std::nullopt, true,
+                         srht_dim, srht_dim, l0_words, std::move(codebook));
 }
 
-IngestionEngine IngestionEngine::with_rotation(std::size_t original_dim, std::uint64_t seed) {
+IngestionEngine IngestionEngine::with_rotation(std::size_t original_dim, std::uint64_t seed,
+                                               std::size_t bits_per_dim) {
   transform::SrhtRotation rotation(original_dim, seed);
   const std::size_t srht = rotation.srht_dim();
-  const std::size_t l0_words = quantize::l0_words_per_vector(srht);
-  return IngestionEngine(VectorStore(l0_words, original_dim, srht), std::move(rotation), false,
-                         original_dim, srht, l0_words);
+  quantize::LloydMaxCodebook codebook(srht, bits_per_dim);
+  const std::size_t l0_words = quantize::l0_words_per_vector(srht, bits_per_dim);
+  return IngestionEngine(VectorStore(l0_words, original_dim, srht, bits_per_dim), std::move(rotation),
+                         false, original_dim, srht, l0_words, std::move(codebook));
 }
 
 void IngestionEngine::reserve_vectors(std::size_t count) {
-  store_ = VectorStore::with_capacity(l0_words_per_vec_, input_dim_, srht_dim_, count);
+  store_ = VectorStore::with_capacity(l0_words_per_vec_, input_dim_, srht_dim_, count,
+                                      codebook_.bits());
   ensure_batch_capacity(std::min(INGEST_BATCH_SIZE, std::max(count, std::size_t{1})));
 }
 
@@ -75,6 +80,7 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
   const transform::SrhtRotation* rotation = has_rotation ? &(*rotation_) : nullptr;
   const std::size_t input_dim = input_dim_;
   const std::size_t srht_dim = srht_dim_;
+  const quantize::LloydMaxCodebook* codebook = &codebook_;
 
 #if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
 #pragma omp parallel for schedule(static)
@@ -87,7 +93,7 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       }
       rotation->apply_in_place(work.buf);
     }
-    quantize::quantize_1dim_to_1bit_into(work.buf, work.l0);
+    quantize::quantize_1dim_to_nbit_into(work.buf, *codebook, work.l0);
   }
 #else
   for (std::size_t i = 0; i < batch_len; ++i) {
@@ -99,7 +105,7 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       }
       rotation->apply_in_place(work.buf);
     }
-    quantize::quantize_1dim_to_1bit_into(work.buf, work.l0);
+    quantize::quantize_1dim_to_nbit_into(work.buf, *codebook, work.l0);
   }
 #endif
 }
