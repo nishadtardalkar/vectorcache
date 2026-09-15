@@ -38,6 +38,8 @@ Asymmetric inner product in rotated space:
 
 Higher is better. Same path for all `n` (including `n = 1`, where centroids are `±√(2/(π·d))`).
 
+For byte-aligned widths (`n ∈ {1,2,4,8}`), search builds exact float query LUTs (one 256-entry table per packed byte-group). For `n = 1`, scoring uses an AVX-512 mask-add kernel over per-dim deltas (`score = base + Σ_{bit i set} Δ_i`) with 4-way row interleave. Other byte-aligned widths use vector-major LUT lookup. Odd widths fall back to scalar unpack + MAC. The math is unchanged.
+
 ## Query knobs (`QueryParams`)
 
 | Field | Default | Meaning |

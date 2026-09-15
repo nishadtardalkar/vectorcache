@@ -16,7 +16,7 @@ namespace vectorcache::query {
 namespace {
 
 constexpr std::size_t kHeapTopKThreshold = 32;
-constexpr std::size_t kScoreChunk = 64;
+constexpr std::size_t kScoreChunk = 512;
 
 class TopKHits {
  public:
@@ -155,12 +155,15 @@ void search_flat(const ingest::VectorStore& store, const PreparedQuery& query,
   const auto codes = store.l0_codes();
   const auto ids = store.ids();
 
+  QueryLut lut;
+  build_query_lut(query.rotated, codebook, lut);
+
   alignas(64) float score_buf[kScoreChunk];
   float threshold = topk.reject_threshold();
   for (std::size_t base = 0; base < n; base += kScoreChunk) {
     const std::size_t chunk = std::min(kScoreChunk, n - base);
-    asymmetric_ip_batch(query.rotated, codes.subspan(base * words, chunk * words), words, chunk,
-                        codebook, std::span<float>(score_buf, chunk));
+    asymmetric_ip_batch_lut(lut, codes.subspan(base * words, chunk * words), words, chunk, codebook,
+                            query.rotated, std::span<float>(score_buf, chunk));
     for (std::size_t i = 0; i < chunk; ++i) {
       if (score_buf[i] < threshold) {
         continue;

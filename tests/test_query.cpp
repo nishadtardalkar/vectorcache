@@ -85,6 +85,104 @@ TEST(QueryDistanceTest, AsymmetricIpPrefersMatchingCodes) {
             query::asymmetric_ip_score(q, bad, codebook));
 }
 
+float reference_asymmetric_ip(std::span<const float> query,
+                              std::span<const std::uint64_t> words,
+                              const quantize::LloydMaxCodebook& codebook) {
+  float score = 0.0f;
+  for (std::size_t d = 0; d < codebook.srht_dim(); ++d) {
+    const auto code = quantize::unpack_code(words, d, codebook.bits());
+    score += query[d] * codebook.centroid_at(code);
+  }
+  return score;
+}
+
+TEST(QueryDistanceTest, LutMatchesScalarForByteAlignedBits) {
+  const std::size_t dims[] = {32, 64, 256};
+  const std::size_t bit_widths[] = {1, 2, 4, 8};
+  for (std::size_t dim : dims) {
+    for (std::size_t bits : bit_widths) {
+      quantize::LloydMaxCodebook codebook(dim, bits);
+      std::vector<float> q(dim);
+      for (std::size_t i = 0; i < dim; ++i) {
+        q[i] = static_cast<float>(static_cast<int>(i % 7) - 3) * 0.07f;
+      }
+      const auto [words, _] = quantize::quantize_1dim_to_nbit(q, codebook);
+      const float ref = reference_asymmetric_ip(q, words, codebook);
+
+      ASSERT_TRUE(query::lut_bits_supported(bits));
+      query::QueryLut lut;
+      query::build_query_lut(q, codebook, lut);
+      ASSERT_FALSE(lut.empty()) << "dim=" << dim << " bits=" << bits;
+
+      EXPECT_NEAR(query::asymmetric_ip_score_lut(lut, words), ref, 1e-5f)
+          << "dim=" << dim << " bits=" << bits;
+      EXPECT_NEAR(query::asymmetric_ip_score(q, words, codebook), ref, 1e-5f)
+          << "dim=" << dim << " bits=" << bits;
+
+      std::vector<float> batch_scores(1);
+      query::asymmetric_ip_batch_lut(lut, words, words.size(), 1, codebook, q, batch_scores);
+      EXPECT_NEAR(batch_scores[0], ref, 1e-5f) << "dim=" << dim << " bits=" << bits;
+    }
+  }
+}
+
+TEST(QueryDistanceTest, LutBatchMatchesScalarAcrossAvxWidth) {
+  constexpr std::size_t dim = 64;
+  constexpr std::size_t bits = 1;
+  constexpr std::size_t n = 20;  // covers 16-wide AVX path + scalar tail
+  quantize::LloydMaxCodebook codebook(dim, bits);
+
+  std::vector<float> q(dim);
+  for (std::size_t i = 0; i < dim; ++i) {
+    q[i] = (i % 2 == 0) ? 0.11f : -0.09f;
+  }
+
+  const std::size_t words_per = quantize::l0_words_per_vector(dim, bits);
+  std::vector<std::uint64_t> all_words(n * words_per);
+  std::vector<float> refs(n);
+  for (std::size_t v = 0; v < n; ++v) {
+    std::vector<float> row(dim);
+    for (std::size_t d = 0; d < dim; ++d) {
+      row[d] = static_cast<float>(v + 1) * 0.02f + static_cast<float>(d) * 0.01f - 0.4f;
+    }
+    auto span = std::span<std::uint64_t>(all_words.data() + v * words_per, words_per);
+    quantize::quantize_1dim_to_nbit_into(row, codebook, span);
+    refs[v] = reference_asymmetric_ip(q, span, codebook);
+  }
+
+  query::QueryLut lut;
+  query::build_query_lut(q, codebook, lut);
+  ASSERT_FALSE(lut.empty());
+
+  std::vector<float> scores(n);
+  query::asymmetric_ip_batch_lut(lut, all_words, words_per, n, codebook, q, scores);
+  for (std::size_t v = 0; v < n; ++v) {
+    EXPECT_NEAR(scores[v], refs[v], 1e-5f) << "vector " << v;
+  }
+}
+
+TEST(QueryDistanceTest, OddBitsUsesScalarFallback) {
+  constexpr std::size_t dim = 64;
+  constexpr std::size_t bits = 3;
+  quantize::LloydMaxCodebook codebook(dim, bits);
+  std::vector<float> q(dim, 0.2f);
+  for (std::size_t i = 0; i < dim; i += 2) {
+    q[i] = -0.15f;
+  }
+  const auto [words, _] = quantize::quantize_1dim_to_nbit(q, codebook);
+  const float ref = reference_asymmetric_ip(q, words, codebook);
+
+  EXPECT_FALSE(query::lut_bits_supported(bits));
+  query::QueryLut lut;
+  query::build_query_lut(q, codebook, lut);
+  EXPECT_TRUE(lut.empty());
+
+  EXPECT_NEAR(query::asymmetric_ip_score(q, words, codebook), ref, 1e-5f);
+  std::vector<float> scores(1);
+  query::asymmetric_ip_batch(q, words, words.size(), 1, codebook, scores);
+  EXPECT_NEAR(scores[0], ref, 1e-5f);
+}
+
 TEST(QueryEngineTest, SelfSimilarityTopHit) {
   const std::size_t dim = 64;
   const auto vectors = make_vectors(8, dim);
