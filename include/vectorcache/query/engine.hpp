@@ -22,8 +22,6 @@ struct QueryParams {
   std::size_t k = 10;
   /// Max support-key Hamming distance to probe (0, 2, 4, ...). Default HD<=2.
   std::uint8_t max_hd = 2;
-  /// Stop probing after this many L0 rows have been scored.
-  std::size_t max_l0_candidates = 4096;
 };
 
 struct PreparedQuery {

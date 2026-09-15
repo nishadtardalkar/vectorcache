@@ -148,11 +148,11 @@ class TopKHits {
   std::vector<HeapHit> heap_;
 };
 
-std::size_t search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
-                         std::size_t l0_bits, TopKHits& topk, std::size_t max_rows) {
-  const std::size_t n = std::min(group.size(), max_rows);
+void search_group(const ingest::ParentGroup& group, const PreparedQuery& query,
+                  std::size_t l0_bits, TopKHits& topk) {
+  const std::size_t n = group.size();
   if (n == 0) {
-    return 0;
+    return;
   }
 
   const std::size_t words = query.l0.size();
@@ -179,30 +179,22 @@ std::size_t search_group(const ingest::ParentGroup& group, const PreparedQuery& 
     // Refresh once per chunk; next chunk sees the tightened reject bound.
     threshold = topk.reject_threshold();
   }
-  return n;
 }
 
 void search_with_probe(const ingest::ParentStore& store, const PreparedQuery& query,
                        const QueryParams& params, TopKHits& topk) {
   const std::size_t l0_bits = quantize::l0_bits_per_vector(store.srht_dim());
-  std::size_t scored = 0;
-  const std::size_t budget = params.max_l0_candidates;
 
   auto scan_group = [&](const ingest::ParentGroup* group) {
-    if (scored >= budget) {
-      return false;
-    }
     if (group == nullptr || group->empty()) {
       return true;
     }
     _mm_prefetch(reinterpret_cast<const char*>(group->l0_codes().data()), _MM_HINT_T0);
-    scored += search_group(*group, query, l0_bits, topk, budget - scored);
-    return scored < budget;
+    search_group(*group, query, l0_bits, topk);
+    return true;
   };
 
-  if (!scan_group(store.find(query.support_key))) {
-    return;
-  }
+  scan_group(store.find(query.support_key));
   if (params.max_hd < 2) {
     return;
   }
@@ -215,7 +207,7 @@ void search_with_probe(const ingest::ParentStore& store, const PreparedQuery& qu
                           return scan_group(&store.group_at(key_idx));
                         });
 
-  if (params.max_hd < 4 || scored >= budget) {
+  if (params.max_hd < 4) {
     return;
   }
 

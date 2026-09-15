@@ -289,7 +289,6 @@ int main(int argc, char** argv) {
   std::size_t k = 10;
   std::size_t top_d = vectorcache::quantize::kDefaultSupportDepth;
   std::uint8_t max_hd = 2;
-  std::size_t max_l0_candidates = 4096;
   bool calibrate = false;
   bool recall = false;
 
@@ -305,7 +304,6 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_option("--top-d", top_d, "Support-key top-d (dim selection depth)");
   app.add_option("--max-hd", max_hd, "Max support-key Hamming distance to probe (0, 2, or 4)");
-  app.add_option("--max-l0-candidates", max_l0_candidates, "Cap on L0 rows scored per query");
   app.add_flag("--calibrate", calibrate, "Print parent-key probe stats for the first query");
   app.add_flag("--recall", recall,
                "Measure mean recall@k vs exact cosine top-k on original full-dim vectors");
@@ -359,7 +357,6 @@ int main(int argc, char** argv) {
     vectorcache::query::QueryParams params;
     params.k = k;
     params.max_hd = max_hd;
-    params.max_l0_candidates = max_l0_candidates;
 
     std::vector<std::uint64_t> prep_ns;
     std::vector<std::uint64_t> search_ns;

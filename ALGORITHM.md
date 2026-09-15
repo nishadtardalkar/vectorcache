@@ -48,8 +48,7 @@ Padding exists **only** so FWHT can run at power-of-two length. Support keys nev
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `k` | 10 | top-k |
-| `max_hd` | 2 | probe HD 0, then 2 (4 if set ≥ 4) |
-| `max_l0_candidates` | 4096 | stop after this many L0 rows scored |
+| `max_hd` | 2 | probe HD 0, then 2 (4 if set ≥ 4); every L0 row in probed buckets is scored |
 
 ## Primary sources
 
