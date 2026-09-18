@@ -66,10 +66,31 @@ target_compile_features(vectorcache PUBLIC cxx_std_20)
 target_compile_definitions(vectorcache PUBLIC VECTORCACHE_SRHT_ROUNDS=${VECTORCACHE_SRHT_ROUNDS})
 
 if(VECTORCACHE_OPENMP)
+  # FindOpenMP may cache an absolute libgomp under CMAKE_PREFIX_PATH (e.g. env/).
+  # If that file disappears between login/compute, Make dies with "No rule to make
+  # target '.../libgomp.so'". Drop the stale cache entry and prefer -fopenmp so
+  # the compiler driver resolves libgomp instead of baking a Make dependency.
+  if(DEFINED OpenMP_gomp_LIBRARY AND OpenMP_gomp_LIBRARY AND
+     NOT EXISTS "${OpenMP_gomp_LIBRARY}")
+    message(STATUS "Clearing stale OpenMP_gomp_LIBRARY=${OpenMP_gomp_LIBRARY}")
+    unset(OpenMP_gomp_LIBRARY CACHE)
+    unset(OpenMP_omp_LIBRARY CACHE)
+    unset(OpenMP_CXX_FOUND CACHE)
+    unset(OpenMP_C_FOUND CACHE)
+    unset(OpenMP_FOUND CACHE)
+  endif()
   find_package(OpenMP)
   if(OpenMP_CXX_FOUND)
-    target_link_libraries(vectorcache PUBLIC OpenMP::OpenMP_CXX)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      separate_arguments(_vc_omp_flags NATIVE_COMMAND "${OpenMP_CXX_FLAGS}")
+      target_compile_options(vectorcache PUBLIC ${_vc_omp_flags})
+      target_link_options(vectorcache PUBLIC ${_vc_omp_flags})
+    else()
+      target_link_libraries(vectorcache PUBLIC OpenMP::OpenMP_CXX)
+    endif()
     target_compile_definitions(vectorcache PUBLIC VECTORCACHE_OPENMP=1)
+  else()
+    message(WARNING "VECTORCACHE_OPENMP=ON but OpenMP was not found; building without OpenMP")
   endif()
 endif()
 
