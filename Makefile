@@ -17,11 +17,13 @@ LIMIT         ?=
 SEED          ?=
 BITS          ?=
 BLOCK_DIMS    ?=
-TOP_D         ?=
+NUM_PROJECTIONS ?=
+BIN_WIDTH     ?=
+PROBE_RADIUS  ?=
+BUCKET_SEED   ?=
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
 K             ?=
-N_BUCKETS     ?=
 CALIBRATE     ?=
 RECALL        ?=
 FORCE         ?=
@@ -73,6 +75,10 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_SPLIT,query-split) \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
+	$(call opt_arg,NUM_PROJECTIONS,num-projections) \
+	$(call opt_arg,BIN_WIDTH,bin-width) \
+	$(call opt_arg,PROBE_RADIUS,probe-radius) \
+	$(call opt_arg,BUCKET_SEED,bucket-seed) \
 	$(call flag_arg,CALIBRATE,calibrate) \
 	$(call flag_arg,RECALL,recall)
 
@@ -101,6 +107,10 @@ help:
 	@echo "  SEED            --seed"
 	@echo "  BITS            --bits (TurboQuantMSE bits/block, 1-8)"
 	@echo "  BLOCK_DIMS      --block-dims (dims per codebook block, 1-16; default 1)"
+	@echo "  NUM_PROJECTIONS --num-projections (RP bucket R; query-bench)"
+	@echo "  BIN_WIDTH       --bin-width (RP bin width w; query-bench)"
+	@echo "  PROBE_RADIUS    --probe-radius (multi-probe P; query-bench)"
+	@echo "  BUCKET_SEED     --bucket-seed (RP seed; query-bench)"
 	@echo "  QUERY_SPLIT     --query-split (query-bench only)"
 	@echo "  QUERY_LIMIT     --query-limit (query-bench only)"
 	@echo "  K               --k (query-bench only)"
@@ -114,6 +124,7 @@ help:
 	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make compute DATASET=glove BITS=2 RECALL=1"
 	@echo "Example: make compute DATASET=glove BITS=1 BLOCK_DIMS=2"
+	@echo "Example: make compute DATASET=glove NUM_PROJECTIONS=2 BIN_WIDTH=0.1 PROBE_RADIUS=1"
 
 login: $(LOGIN_READY)
 

@@ -2,14 +2,17 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
 #include "vectorcache/aligned.hpp"
+#include "vectorcache/index/rp_buckets.hpp"
 
 namespace vectorcache::ingest {
 
 /// Flat in-RAM index: contiguous L0 codes + parallel ids + per-vector IP scales.
+/// After `finalize_buckets`, rows are sorted by RP cell key for contiguous range scans.
 class VectorStore {
  public:
   VectorStore(std::size_t l0_words_per_vec, std::size_t input_dim, std::size_t srht_dim,
@@ -37,6 +40,16 @@ class VectorStore {
   void push(std::size_t id, std::span<const std::uint64_t> l0, float scale = 1.0f);
   void reserve(std::size_t n);
 
+  /// Permute rows by `order` (must be a permutation of [0, size())).
+  void permute(std::span<const std::size_t> order);
+
+  /// Argsort by cell keys, permute store, build CSR bucket index.
+  void finalize_buckets(std::span<const std::uint64_t> cell_keys, index::ProjectionMatrix matrix,
+                        index::BinCodec codec);
+
+  bool has_buckets() const { return buckets_.has_value() && !buckets_->empty(); }
+  const index::BucketIndex& buckets() const;
+
  private:
   std::size_t l0_words_per_vec_;
   std::size_t bits_per_dim_;
@@ -46,6 +59,7 @@ class VectorStore {
   AlignedVector<std::uint64_t> codes_;
   std::vector<std::size_t> ids_;
   std::vector<float> scales_;
+  std::optional<index::BucketIndex> buckets_;
 };
 
 }  // namespace vectorcache::ingest

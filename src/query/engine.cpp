@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "vectorcache/error.hpp"
+#include "vectorcache/index/rp_buckets.hpp"
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/query/distance.hpp"
 #include "vectorcache/query/fastscan.hpp"
@@ -21,7 +22,7 @@ namespace vectorcache::query {
 namespace {
 
 constexpr std::size_t kHeapTopKThreshold = 32;
-/// Parallelize when corpus has at least this many FastScan blocks (~32K vectors).
+/// Parallelize when a single cell covers at least this many FastScan blocks.
 constexpr std::size_t kParallelMinBlocks = 1024;
 
 class TopKHits {
@@ -161,45 +162,70 @@ class TopKHits {
   std::vector<HeapHit> heap_;
 };
 
-void score_block_into_topk(const BlockedCodes& blocked, const QueryLut& lut,
-                           const ingest::VectorStore& store, std::size_t block, TopKHits& topk) {
+void score_block_range_into_topk(const BlockedCodes& blocked, const QueryLut& lut,
+                                 const ingest::VectorStore& store, std::size_t block,
+                                 std::size_t range_lo, std::size_t range_hi, TopKHits& topk) {
   const std::size_t count = blocked.block_count(block);
   if (count == 0) {
     return;
   }
+  const std::size_t base = block * BlockedCodes::kBlock;
+  const std::size_t block_hi = base + count;
+  if (block_hi <= range_lo || base >= range_hi) {
+    return;
+  }
+
   alignas(64) float score_buf[BlockedCodes::kBlock];
   score_blocked_batch(lut, blocked, block, std::span<float>(score_buf, count));
 
   const auto ids = store.ids();
   const auto scales = store.scales();
-  const std::size_t base = block * BlockedCodes::kBlock;
+  const std::size_t begin = std::max(range_lo, base);
+  const std::size_t end = std::min(range_hi, block_hi);
   float threshold = topk.reject_threshold();
-  for (std::size_t i = 0; i < count; ++i) {
-    const float score = score_buf[i] * scales[base + i];
+  for (std::size_t idx = begin; idx < end; ++idx) {
+    const std::size_t i = idx - base;
+    const float score = score_buf[i] * scales[idx];
     if (score < threshold) {
       continue;
     }
-    topk.push(ids[base + i], score);
+    topk.push(ids[idx], score);
     threshold = topk.reject_threshold();
   }
 }
 
-void search_flat_vector_major(const ingest::VectorStore& store, const PreparedQuery& query,
-                              const quantize::LloydMaxCodebook& codebook, TopKHits& topk) {
+void score_store_range_fastscan(const BlockedCodes& blocked, const QueryLut& lut,
+                                const ingest::VectorStore& store, std::size_t lo, std::size_t hi,
+                                TopKHits& topk) {
+  if (lo >= hi) {
+    return;
+  }
+  const std::size_t block_begin = lo / BlockedCodes::kBlock;
+  const std::size_t block_end = (hi + BlockedCodes::kBlock - 1) / BlockedCodes::kBlock;
+  for (std::size_t block = block_begin; block < block_end; ++block) {
+    score_block_range_into_topk(blocked, lut, store, block, lo, hi, topk);
+  }
+}
+
+void score_store_range_vector_major(const ingest::VectorStore& store, const PreparedQuery& query,
+                                    const quantize::LloydMaxCodebook& codebook, std::size_t lo,
+                                    std::size_t hi, TopKHits& topk) {
+  if (lo >= hi) {
+    return;
+  }
   constexpr std::size_t kScoreChunk = 512;
-  const std::size_t n = store.size();
   const std::size_t words = store.l0_words_per_vec();
   const auto codes = store.l0_codes();
   const auto ids = store.ids();
+  const auto scales = store.scales();
 
   QueryLut lut;
   build_query_lut(query.rotated, codebook, lut);
 
-  const auto scales = store.scales();
   alignas(64) float score_buf[kScoreChunk];
   float threshold = topk.reject_threshold();
-  for (std::size_t base = 0; base < n; base += kScoreChunk) {
-    const std::size_t chunk = std::min(kScoreChunk, n - base);
+  for (std::size_t base = lo; base < hi; base += kScoreChunk) {
+    const std::size_t chunk = std::min(kScoreChunk, hi - base);
     asymmetric_ip_batch_lut(lut, codes.subspan(base * words, chunk * words), words, chunk, codebook,
                             query.rotated, std::span<float>(score_buf, chunk));
     for (std::size_t i = 0; i < chunk; ++i) {
@@ -285,8 +311,29 @@ PreparedQuery QueryEngine::prepare(std::span<const float> query) const {
 }
 
 std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared,
-                                                   const QueryParams& params) const {
+                                                   const QueryParams& params,
+                                                   SearchStats* stats) const {
+  if (!store_.has_buckets()) {
+    throw Error("QueryEngine::search requires VectorStore::finalize_buckets");
+  }
+
   TopKHits topk(params.k);
+  const index::BucketIndex& buckets = store_.buckets();
+  index::validate_probe_grid(buckets.num_projections(), params.probe_radius);
+
+  alignas(64) std::int32_t bins[index::kMaxProjections];
+  index::project_to_bins(buckets.matrix(), prepared.rotated, buckets.bin_width(),
+                         std::span<std::int32_t>(bins, buckets.num_projections()));
+
+  std::size_t candidates = 0;
+  const std::vector<index::BucketRange> ranges =
+      buckets.probe(std::span<const std::int32_t>(bins, buckets.num_projections()),
+                    params.probe_radius, &candidates);
+  if (stats != nullptr) {
+    stats->candidates = candidates;
+    stats->cells_probed = ranges.size();
+  }
+
   const BlockedCodes& blocked = blocked_codes();
   const std::size_t m = store_.srht_dim() / store_.block_dims();
   const bool byte_aligned =
@@ -296,10 +343,11 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
     QueryLut lut;
     build_query_lut(prepared.rotated, codebook_, lut);
     if (!lut.empty()) {
-      const std::size_t n_blocks = blocked.n_blocks();
 #if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
+      // Parallelize across probed cells when many cells or large total candidates.
       const bool prefer_parallel =
-          n_blocks >= kParallelMinBlocks && omp_get_max_threads() > 1;
+          ranges.size() >= 8 && candidates >= kParallelMinBlocks * BlockedCodes::kBlock &&
+          omp_get_max_threads() > 1;
       if (prefer_parallel) {
         const int nthreads = omp_get_max_threads();
         std::vector<TopKHits> locals;
@@ -311,9 +359,11 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
         {
           const int tid = omp_get_thread_num();
           TopKHits& local = locals[static_cast<std::size_t>(tid)];
-#pragma omp for schedule(static) nowait
-          for (int b = 0; b < static_cast<int>(n_blocks); ++b) {
-            score_block_into_topk(blocked, lut, store_, static_cast<std::size_t>(b), local);
+#pragma omp for schedule(dynamic) nowait
+          for (int r = 0; r < static_cast<int>(ranges.size()); ++r) {
+            const auto& range = ranges[static_cast<std::size_t>(r)];
+            score_store_range_fastscan(blocked, lut, store_, range.start,
+                                       range.start + range.length, local);
           }
         }
         for (auto& local : locals) {
@@ -322,21 +372,26 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
         return topk.finalize();
       }
 #endif
-      for (std::size_t block = 0; block < n_blocks; ++block) {
-        score_block_into_topk(blocked, lut, store_, block, topk);
+      for (const auto& range : ranges) {
+        score_store_range_fastscan(blocked, lut, store_, range.start, range.start + range.length,
+                                   topk);
       }
       return topk.finalize();
     }
   }
-  search_flat_vector_major(store_, prepared, codebook_, topk);
+
+  for (const auto& range : ranges) {
+    score_store_range_vector_major(store_, prepared, codebook_, range.start,
+                                   range.start + range.length, topk);
+  }
   return topk.finalize();
 }
 
-std::vector<QueryHit> QueryEngine::search(std::span<const float> query,
-                                          const QueryParams& params) const {
+std::vector<QueryHit> QueryEngine::search(std::span<const float> query, const QueryParams& params,
+                                          SearchStats* stats) const {
   PreparedQuery prepared;
   prepare_into(prepared, query);
-  return search_prepared(prepared, params);
+  return search_prepared(prepared, params, stats);
 }
 
 }  // namespace vectorcache::query

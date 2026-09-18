@@ -19,6 +19,7 @@
 #include "vectorcache/datasets/npy.hpp"
 #include "vectorcache/datasets/sample.hpp"
 #include "vectorcache/error.hpp"
+#include "vectorcache/index/rp_buckets.hpp"
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/query/engine.hpp"
@@ -72,9 +73,15 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
                                                   std::size_t dim, std::uint64_t seed,
                                                   std::size_t limit, std::size_t bits,
-                                                  std::size_t block_dims) {
+                                                  std::size_t block_dims, std::size_t num_projections,
+                                                  float bin_width, std::uint64_t bucket_seed) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
-  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits, block_dims);
+  vectorcache::ingest::BucketParams buckets;
+  buckets.num_projections = num_projections;
+  buckets.bin_width = bin_width;
+  buckets.bucket_seed = bucket_seed;
+  auto engine =
+      vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits, block_dims, buckets);
   engine.reserve_vectors(limit);
   const auto report = engine.ingest(limited);
   if (report.vectors_ingested != limit) {
@@ -289,6 +296,10 @@ int main(int argc, char** argv) {
   std::size_t k = 10;
   std::size_t bits = 1;
   std::size_t block_dims = 1;
+  std::size_t num_projections = 1;
+  float bin_width = 0.1f;
+  std::size_t probe_radius = 1;
+  std::uint64_t bucket_seed = 0;
   bool calibrate = false;
   bool recall = false;
 
@@ -304,6 +315,10 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
   app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
+  app.add_option("--num-projections", num_projections, "RP bucket projections R (1-8)");
+  app.add_option("--bin-width", bin_width, "RP bucket bin width w");
+  app.add_option("--probe-radius", probe_radius, "Multi-probe L_inf radius P");
+  app.add_option("--bucket-seed", bucket_seed, "RP projection seed (0 = derive from --seed)");
   app.add_flag("--calibrate", calibrate, "Print L0 probe stats for the first query");
   app.add_flag("--recall", recall,
                "Measure Recall@1@k (exact NN in approx top-k; TurboVec-compatible) and "
@@ -317,6 +332,13 @@ int main(int argc, char** argv) {
     }
     vectorcache::quantize::validate_bits_per_dim(bits);
     vectorcache::quantize::validate_block_dims(block_dims);
+    if (num_projections == 0 || num_projections > vectorcache::index::kMaxProjections) {
+      throw vectorcache::Error("num-projections must be in 1..kMaxProjections");
+    }
+    if (!(bin_width > 0.0f)) {
+      throw vectorcache::Error("bin-width must be > 0");
+    }
+    vectorcache::index::validate_probe_grid(num_projections, probe_radius);
 
     if (query_split.empty()) {
       query_split = (dataset == "glove") ? "test" : "holdout";
@@ -335,15 +357,18 @@ int main(int argc, char** argv) {
     std::cout << "Query bench: index=" << source_label << " dim=" << meta.dim
               << " srht_dim=" << meta.dim << " index_n=" << actual_index
               << " query_n=" << query_limit << " query_split=" << query_split
-              << " bits=" << bits << " block_dims=" << block_dims << '\n';
+              << " bits=" << bits << " block_dims=" << block_dims
+              << " R=" << num_projections << " w=" << bin_width << " P=" << probe_radius << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
     }
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto ingest_engine =
-        ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims);
-    std::cout << "  stored_vectors=" << ingest_engine.store().size() << '\n';
+        ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims, num_projections,
+                     bin_width, bucket_seed);
+    std::cout << "  stored_vectors=" << ingest_engine.store().size()
+              << " bucket_cells=" << ingest_engine.store().buckets().num_cells() << '\n';
 
     auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);
     const auto queries =
@@ -355,6 +380,7 @@ int main(int argc, char** argv) {
 
     vectorcache::query::QueryParams params;
     params.k = k;
+    params.probe_radius = probe_radius;
 
     std::vector<std::uint64_t> prep_ns;
     std::vector<std::uint64_t> search_ns;
@@ -369,25 +395,31 @@ int main(int argc, char** argv) {
     double sum_top1 = 0.0;
     double sum_topk_mean = 0.0;
     std::size_t scored_queries = 0;
+    std::uint64_t sum_candidates = 0;
+    std::uint64_t sum_cells = 0;
 
     // Warm up + reuse PreparedQuery buffers so prep latency excludes allocation.
     vectorcache::query::PreparedQuery prepared;
     if (!queries.empty()) {
       query_engine.prepare_into(prepared, queries.front());
-      (void)query_engine.search_prepared(prepared, params);
+      vectorcache::query::SearchStats warm_stats;
+      (void)query_engine.search_prepared(prepared, params, &warm_stats);
     }
 
     for (const auto& q : queries) {
       const auto t0 = Clock::now();
       query_engine.prepare_into(prepared, q);
       const auto t1 = Clock::now();
-      const auto hits = query_engine.search_prepared(prepared, params);
+      vectorcache::query::SearchStats stats;
+      const auto hits = query_engine.search_prepared(prepared, params, &stats);
       const auto t2 = Clock::now();
 
       prep_ns.push_back(static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
       search_ns.push_back(static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
+      sum_candidates += stats.candidates;
+      sum_cells += stats.cells_probed;
 
       if (recall) {
         std::vector<std::size_t> ids;
@@ -411,6 +443,15 @@ int main(int argc, char** argv) {
 
     print_latency_stats(prep_ns, search_ns);
     print_score_stats(sum_top1, sum_topk_mean, scored_queries, k);
+    if (!queries.empty()) {
+      std::cout << std::fixed << std::setprecision(1);
+      std::cout << "Bucket prune:\n";
+      std::cout << "  avg candidates/query: "
+                << (static_cast<double>(sum_candidates) / static_cast<double>(queries.size()))
+                << " / " << actual_index << '\n';
+      std::cout << "  avg cells probed: "
+                << (static_cast<double>(sum_cells) / static_cast<double>(queries.size())) << '\n';
+    }
 
     if (recall) {
       std::cout << "Computing exact top-" << k

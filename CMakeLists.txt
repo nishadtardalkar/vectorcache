@@ -45,6 +45,7 @@ set(VECTORCACHE_SOURCES
   src/transform/normalize.cpp
   src/transform/srht.cpp
   src/quantize/quantize.cpp
+  src/index/rp_buckets.cpp
   src/ingest/store.cpp
   src/ingest/timing.cpp
   src/ingest/engine.cpp
@@ -169,6 +170,7 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_store.cpp
     tests/test_engine.cpp
     tests/test_query.cpp
+    tests/test_rp_buckets.cpp
     tests/test_fastscan.cpp
     tests/test_sample.cpp
     tests/test_npy.cpp

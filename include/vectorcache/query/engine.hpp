@@ -21,6 +21,13 @@ struct QueryHit {
 
 struct QueryParams {
   std::size_t k = 10;
+  /// Multi-probe L_∞ radius in bin units (cells with max |o_i| <= probe_radius).
+  std::size_t probe_radius = 1;
+};
+
+struct SearchStats {
+  std::size_t candidates = 0;
+  std::size_t cells_probed = 0;
 };
 
 struct PreparedQuery {
@@ -35,9 +42,10 @@ class QueryEngine {
 
   PreparedQuery prepare(std::span<const float> query) const;
   void prepare_into(PreparedQuery& out, std::span<const float> query) const;
-  std::vector<QueryHit> search(std::span<const float> query, const QueryParams& params) const;
-  std::vector<QueryHit> search_prepared(const PreparedQuery& prepared,
-                                        const QueryParams& params) const;
+  std::vector<QueryHit> search(std::span<const float> query, const QueryParams& params,
+                               SearchStats* stats = nullptr) const;
+  std::vector<QueryHit> search_prepared(const PreparedQuery& prepared, const QueryParams& params,
+                                        SearchStats* stats = nullptr) const;
 
   const quantize::LloydMaxCodebook& codebook() const { return codebook_; }
 
