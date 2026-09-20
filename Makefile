@@ -10,20 +10,20 @@ BUILD_TYPE    ?= Release
 JOBS          ?= $(shell nproc 2>/dev/null || echo 4)
 DATA_DIR      ?= data
 DATASETS      ?= all
-DATASET       ?=
+DATASET       ?= glove
 NPY           ?=
 SPLIT         ?=
 LIMIT         ?=
 SEED          ?=
-BITS          ?=
-BLOCK_DIMS    ?=
-NUM_PROJECTIONS ?=
-BIN_WIDTH     ?=
-PROBE_RADIUS  ?=
+BITS          ?= 1
+BLOCK_DIMS    ?= 1
+NUM_PROJECTIONS ?= 1
+BIN_WIDTH     ?= 0.1
+PROBE_RADIUS  ?= 1
 BUCKET_SEED   ?=
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
-K             ?=
+K             ?= 10
 CALIBRATE     ?=
 RECALL        ?=
 FORCE         ?=
@@ -100,31 +100,32 @@ help:
 	@echo "  VECTORCACHE_SRHT_ROUNDS (cmake cache, default 1): set to 2 or 3 for multi-round SRHT"
 	@echo ""
 	@echo "Bench variables (map to ingest-bench / query-bench CLI):"
-	@echo "  DATASET / NPY   --dataset or --npy (one required for compute)"
-	@echo "  DATA_DIR        --data-dir"
+	@echo "  DATASET / NPY   --dataset or --npy (default DATASET=$(DATASET); pass NPY= to use a file)"
+	@echo "  DATA_DIR        --data-dir (default $(DATA_DIR))"
 	@echo "  SPLIT           --split"
 	@echo "  LIMIT           --limit"
 	@echo "  SEED            --seed"
-	@echo "  BITS            --bits (TurboQuantMSE bits/block, 1-8)"
-	@echo "  BLOCK_DIMS      --block-dims (dims per codebook block, 1-16; default 1)"
-	@echo "  NUM_PROJECTIONS --num-projections (RP bucket R; query-bench)"
-	@echo "  BIN_WIDTH       --bin-width (RP bin width w; query-bench)"
-	@echo "  PROBE_RADIUS    --probe-radius (multi-probe P; query-bench)"
+	@echo "  BITS            --bits (default $(BITS); TurboQuantMSE bits/block, 1-8)"
+	@echo "  BLOCK_DIMS      --block-dims (default $(BLOCK_DIMS); dims per codebook block, 1-16)"
+	@echo "  NUM_PROJECTIONS --num-projections (default $(NUM_PROJECTIONS); RP bucket R; query-bench)"
+	@echo "  BIN_WIDTH       --bin-width (default $(BIN_WIDTH); RP bin width w; query-bench)"
+	@echo "  PROBE_RADIUS    --probe-radius (default $(PROBE_RADIUS); multi-probe P; query-bench)"
 	@echo "  BUCKET_SEED     --bucket-seed (RP seed; query-bench)"
 	@echo "  QUERY_SPLIT     --query-split (query-bench only)"
 	@echo "  QUERY_LIMIT     --query-limit (query-bench only)"
-	@echo "  K               --k (query-bench only)"
+	@echo "  K               --k (default $(K); query-bench only)"
 	@echo "  CALIBRATE=1     --calibrate (query-bench only)"
 	@echo "  RECALL=1        --recall (query-bench: Recall@1@k + Recall@k)"
 	@echo "  BENCH_EXTRA_ARGS  appended to both benches as-is"
 	@echo ""
-	@echo "For native SIMD on compute nodes: make compute DATASET=glove CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
-	@echo "For 3-round SRHT at compile time: make compute DATASET=glove CMAKE_OPTS='-DVECTORCACHE_SRHT_ROUNDS=3'"
+	@echo "For native SIMD on compute nodes: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
+	@echo "For 3-round SRHT at compile time: make compute CMAKE_OPTS='-DVECTORCACHE_SRHT_ROUNDS=3'"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
-	@echo "Example: make compute DATASET=glove BITS=2 RECALL=1"
-	@echo "Example: make compute DATASET=glove BITS=1 BLOCK_DIMS=2"
-	@echo "Example: make compute DATASET=glove NUM_PROJECTIONS=2 BIN_WIDTH=0.1 PROBE_RADIUS=1"
+	@echo "Example: make compute"
+	@echo "Example: make compute BITS=2 RECALL=1"
+	@echo "Example: make compute BITS=1 BLOCK_DIMS=2"
+	@echo "Example: make compute NUM_PROJECTIONS=2 BIN_WIDTH=0.1 PROBE_RADIUS=1"
 
 login: $(LOGIN_READY)
 
@@ -143,10 +144,10 @@ compute:
 		exit 1; \
 	fi
 	@if [ -z "$(strip $(DATASET)$(NPY))" ]; then \
-		echo "DATASET or NPY is required, e.g. make compute DATASET=glove"; \
+		echo "DATASET or NPY is required, e.g. make compute"; \
 		exit 1; \
 	fi
-	@if [ -n "$(strip $(DATASET))" ] && [ -n "$(strip $(NPY))" ]; then \
+	@if [ -n "$(strip $(NPY))" ] && [ -n "$(strip $(DATASET))" ] && [ "$(origin DATASET)" = "command line" ]; then \
 		echo "Pass only one of DATASET or NPY, not both."; \
 		exit 1; \
 	fi

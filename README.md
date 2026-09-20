@@ -46,14 +46,15 @@ Use the root `Makefile` to split internet-dependent work (login node) from offli
 # On login node (internet):
 make login
 
-# On compute node (no internet):
-make compute DATASET=glove
+# On compute node (no internet); defaults to DATASET=glove:
+make compute
 
-# Optional debug caps (smaller in-RAM index):
-make compute DATASET=glove BENCH_EXTRA_ARGS="--limit 50000"
+# Optional overrides:
+make compute DATASET=openai-1536 BITS=2 RECALL=1
+make compute BENCH_EXTRA_ARGS="--limit 50000"
 ```
 
-`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` against the required `DATASET` (e.g. `glove`, `openai-1536`, `openai-3072`). Indexes live entirely in `VectorStore` (RAM); queries flat-scan packed TurboQuantMSE codes in memory.
+`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` (default `DATASET=glove`; override with `DATASET=` / `NPY=`). Indexes live entirely in `VectorStore` (RAM); queries score probed RP-bucket ranges of packed TurboQuantMSE codes in memory.
 
 ## Build
 
@@ -105,8 +106,8 @@ TurboQuant uses `n` bits per codebook block of `d` rotated coordinates (`2^n` Ll
 ```bash
 ./query-bench --dataset glove --bits 2
 ./query-bench --dataset glove --bits 1 --block-dims 2
-make compute DATASET=glove BITS=2 RECALL=1
-make compute DATASET=glove BITS=1 BLOCK_DIMS=2
+make compute BITS=2 RECALL=1
+make compute BITS=1 BLOCK_DIMS=2
 ```
 
 With `RECALL=1` / `--recall`, query-bench prints **Recall@1@k** (exact NN in approx top-k; TurboVec-compatible) then set-overlap **Recall@k**.
@@ -240,7 +241,7 @@ If Arrow or HDF5 are unavailable on your cluster:
 
 1. Request them from your cluster admin, or
 2. Copy pre-downloaded `data/` from a machine that already has the datasets, or
-3. Use GloVe only: `make login DATASETS=glove` / `make compute DATASET=glove`
+3. Use GloVe only: `make login DATASETS=glove` / `make compute`
 
 To build without dataset fetching (library + tests only):
 
