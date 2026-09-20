@@ -77,6 +77,9 @@ class BucketIndex {
   const ProjectionMatrix& matrix() const { return matrix_; }
   const BinCodec& codec() const { return codec_; }
 
+  /// Contiguous store range for cell index `i` in key order (0 .. num_cells()-1).
+  BucketRange cell(std::size_t i) const;
+
   /// Find contiguous range for an exact cell key; length 0 if missing.
   BucketRange find(std::uint64_t key) const;
 

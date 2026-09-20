@@ -67,6 +67,14 @@ void VectorStore::reserve(std::size_t n) {
   scales_.reserve(n);
 }
 
+VectorStore VectorStore::clone() const {
+  VectorStore out(l0_words_per_vec_, input_dim_, srht_dim_, bits_per_dim_, block_dims_);
+  out.codes_ = codes_;
+  out.ids_ = ids_;
+  out.scales_ = scales_;
+  return out;
+}
+
 void VectorStore::push(std::size_t id, std::span<const std::uint64_t> l0, float scale) {
   if (l0.size() != l0_words_per_vec_) {
     throw Error("L0 word count mismatch: expected " + std::to_string(l0_words_per_vec_) + ", got " +

@@ -170,6 +170,7 @@ if(VECTORCACHE_BUILD_TOOLS)
   add_vectorcache_tool(ingest-sample)
   add_vectorcache_tool(ingest-bench)
   add_vectorcache_tool(query-bench)
+  add_vectorcache_tool(query-bench-tune)
 endif()
 
 if(VECTORCACHE_BUILD_TESTS)

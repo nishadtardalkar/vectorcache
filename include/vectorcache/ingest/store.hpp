@@ -40,6 +40,9 @@ class VectorStore {
   void push(std::size_t id, std::span<const std::uint64_t> l0, float scale = 1.0f);
   void reserve(std::size_t n);
 
+  /// Deep copy of codes/ids/scales/dims without bucket index (ingest order preserved).
+  VectorStore clone() const;
+
   /// Permute rows by `order` (must be a permutation of [0, size())).
   void permute(std::span<const std::size_t> order);
 

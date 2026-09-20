@@ -158,11 +158,12 @@ void IngestionEngine::finalize_bucket_index(std::span<const std::uint64_t> cell_
   store_.finalize_buckets(cell_keys, projection_, bin_codec_);
 }
 
-IngestReport IngestionEngine::ingest(datasets::DatasetReader& reader) {
-  return ingest_with_hook(reader, nullptr);
+IngestReport IngestionEngine::ingest(datasets::DatasetReader& reader, bool finalize_buckets) {
+  return ingest_with_hook(reader, nullptr, finalize_buckets);
 }
 
-IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, VectorHook* hook) {
+IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, VectorHook* hook,
+                                               bool finalize_buckets) {
   const std::size_t meta_count = reader.meta().count;
   if (meta_count > 0) {
     reserve_vectors(meta_count);
@@ -172,7 +173,7 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
 
   std::uint64_t global_id = 0;
   std::vector<std::uint64_t> cell_keys;
-  if (meta_count > 0) {
+  if (finalize_buckets && meta_count > 0) {
     cell_keys.reserve(meta_count);
   }
 
@@ -190,7 +191,9 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
         hook->on_vector(global_id, work.buf);
       }
       store_.push(static_cast<std::size_t>(global_id), work.l0, work.alpha);
-      cell_keys.push_back(work.cell_key);
+      if (finalize_buckets) {
+        cell_keys.push_back(work.cell_key);
+      }
       ++global_id;
     }
   }
@@ -198,7 +201,9 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
   if (global_id == 0) {
     return IngestReport{0};
   }
-  finalize_bucket_index(cell_keys);
+  if (finalize_buckets) {
+    finalize_bucket_index(cell_keys);
+  }
   return IngestReport{global_id};
 }
 

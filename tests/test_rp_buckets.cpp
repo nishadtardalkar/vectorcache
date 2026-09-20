@@ -146,6 +146,8 @@ TEST(StoreBucketsTest, FinalizeBuildsBuckets) {
   store.finalize_buckets(keys, std::move(matrix), codec);
   ASSERT_TRUE(store.has_buckets());
   EXPECT_EQ(store.buckets().num_cells(), 2u);
+  EXPECT_EQ(store.buckets().cell(0).length, 1u);  // key 1
+  EXPECT_EQ(store.buckets().cell(1).length, 2u);  // key 5
   // After sort by key: key1, key5, key5 → ids 1, 0, 2
   EXPECT_EQ(store.id_at(0), 1u);
   EXPECT_EQ(store.id_at(1), 0u);

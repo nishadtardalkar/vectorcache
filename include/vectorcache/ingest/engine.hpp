@@ -39,8 +39,10 @@ class IngestionEngine {
                                        BucketParams buckets = BucketParams{});
 
   void reserve_vectors(std::size_t count);
-  IngestReport ingest(datasets::DatasetReader& reader);
-  IngestReport ingest_with_hook(datasets::DatasetReader& reader, VectorHook* hook);
+  /// When `finalize_buckets` is false, codes are stored but RP CSR is not built.
+  IngestReport ingest(datasets::DatasetReader& reader, bool finalize_buckets = true);
+  IngestReport ingest_with_hook(datasets::DatasetReader& reader, VectorHook* hook,
+                                bool finalize_buckets = true);
   const VectorStore& store() const { return store_; }
   const quantize::LloydMaxCodebook& codebook() const { return codebook_; }
   std::size_t bits_per_dim() const { return codebook_.bits(); }

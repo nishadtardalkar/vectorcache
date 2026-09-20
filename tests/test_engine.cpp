@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "vectorcache/datasets/reader.hpp"
+#include "vectorcache/index/rp_buckets.hpp"
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/quantize/quantize.hpp"
@@ -138,4 +139,39 @@ TEST(EngineTest, MultiBitIngest) {
   EXPECT_EQ(engine.bits_per_dim(), 2u);
   EXPECT_EQ(engine.store().l0_words_per_vec(), quantize::l0_words_per_vector(dim, 2));
   EXPECT_EQ(engine.store().size(), 1u);
+}
+
+TEST(EngineTest, IngestWithoutFinalizeThenFinalizeBuckets) {
+  const std::size_t dim = 16;
+  const std::size_t n = 8;
+  std::vector<std::vector<float>> vectors;
+  for (std::size_t i = 0; i < n; ++i) {
+    std::vector<float> v(dim);
+    for (std::size_t j = 0; j < dim; ++j) {
+      v[j] = static_cast<float>(i + j + 1);
+    }
+    vectors.push_back(std::move(v));
+  }
+
+  MockReader reader(std::move(vectors), dim);
+  auto engine = ingest::IngestionEngine::with_rotation(dim, 42);
+  const auto report = engine.ingest(reader, false);
+  EXPECT_EQ(report.vectors_ingested, n);
+  EXPECT_EQ(engine.store().size(), n);
+  EXPECT_FALSE(engine.store().has_buckets());
+
+  auto work = engine.store().clone();
+  EXPECT_FALSE(work.has_buckets());
+  EXPECT_EQ(work.size(), n);
+
+  index::ProjectionMatrix matrix(1, work.srht_dim(), 123);
+  const auto codec = index::make_bin_codec(1, 0.5f);
+  const std::int32_t zero_bin = 0;
+  const std::uint64_t key0 =
+      index::pack_cell_key(std::span<const std::int32_t>(&zero_bin, 1), codec);
+  std::vector<std::uint64_t> keys(n, key0);
+  work.finalize_buckets(keys, std::move(matrix), codec);
+  EXPECT_TRUE(work.has_buckets());
+  EXPECT_GE(work.buckets().num_cells(), 1u);
+  EXPECT_EQ(work.size(), n);
 }

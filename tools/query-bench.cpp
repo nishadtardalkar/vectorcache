@@ -367,8 +367,22 @@ int main(int argc, char** argv) {
     auto ingest_engine =
         ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims, num_projections,
                      bin_width, bucket_seed);
-    std::cout << "  stored_vectors=" << ingest_engine.store().size()
-              << " bucket_cells=" << ingest_engine.store().buckets().num_cells() << '\n';
+    {
+      const auto& buckets = ingest_engine.store().buckets();
+      std::cout << "  stored_vectors=" << ingest_engine.store().size()
+                << " bucket_cells=" << buckets.num_cells() << '\n';
+      std::vector<std::size_t> sizes;
+      sizes.reserve(buckets.num_cells());
+      for (std::size_t i = 0; i < buckets.num_cells(); ++i) {
+        sizes.push_back(buckets.cell(i).length);
+      }
+      std::sort(sizes.begin(), sizes.end(), std::greater<>());
+      std::cout << "  bucket_sizes (desc):";
+      for (const std::size_t n : sizes) {
+        std::cout << ' ' << n;
+      }
+      std::cout << '\n';
+    }
 
     auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);
     const auto queries =

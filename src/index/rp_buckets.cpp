@@ -288,6 +288,15 @@ BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys, Proje
   return idx;
 }
 
+BucketRange BucketIndex::cell(std::size_t i) const {
+  if (i >= keys_.size()) {
+    throw Error("BucketIndex::cell: index out of range");
+  }
+  const std::size_t start = offsets_[i];
+  const std::size_t end = offsets_[i + 1];
+  return {start, end - start};
+}
+
 BucketRange BucketIndex::find(std::uint64_t key) const {
   const auto it = std::lower_bound(keys_.begin(), keys_.end(), key);
   if (it == keys_.end() || *it != key) {
