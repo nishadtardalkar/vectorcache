@@ -49,6 +49,15 @@ void fill_group_lut(float* table, std::span<const float> query_slice,
   }
 }
 
+/// bits=8, block_dims==1: table[k] = q0 * c[k].
+void fill_group_lut_bits8_d1(float* table, float q0, const float* centroids) {
+  const __m512 vq = _mm512_set1_ps(q0);
+  for (std::size_t k = 0; k < QueryLut::kEntries; k += 16) {
+    const __m512 c = _mm512_loadu_ps(centroids + k);
+    _mm512_storeu_ps(table + k, _mm512_mul_ps(vq, c));
+  }
+}
+
 /// bits=8, block_dims==2: table[k] = q0*c[k,0] + q1*c[k,1] via AVX-512 FMA.
 void fill_group_lut_bits8_d2(float* table, float q0, float q1, const float* centroids) {
   const __m512 vq0 = _mm512_set1_ps(q0);
@@ -61,6 +70,18 @@ void fill_group_lut_bits8_d2(float* table, float q0, float q1, const float* cent
     const __m512 ys = _mm512_permutexvar_ps(pr_y, xy);
     const __m512 dots = _mm512_fmadd_ps(vq0, xs, _mm512_mul_ps(vq1, ys));
     _mm256_storeu_ps(table + k, _mm512_castps512_ps256(dots));
+  }
+}
+
+/// bits=4, block_dims==1: table[b] = q0*c[lo] + q1*c[hi].
+void fill_group_lut_bits4_d1(float* table, float q0, float q1, const float* centroids) {
+  alignas(64) float lo_dots[16];
+  alignas(64) float hi_dots[16];
+  const __m512 c = _mm512_loadu_ps(centroids);
+  _mm512_store_ps(lo_dots, _mm512_mul_ps(_mm512_set1_ps(q0), c));
+  _mm512_store_ps(hi_dots, _mm512_mul_ps(_mm512_set1_ps(q1), c));
+  for (std::size_t b = 0; b < QueryLut::kEntries; ++b) {
+    table[b] = lo_dots[b & 0x0Fu] + hi_dots[b >> 4];
   }
 }
 
@@ -108,14 +129,14 @@ float score_bit1_one(const float* delta, float base, const std::uint64_t* words,
     {
       const __mmask16 m0 = static_cast<__mmask16>(w & 0xFFFFu);
       const __mmask16 m1 = static_cast<__mmask16>((w >> 16) & 0xFFFFu);
-      acc0 = _mm512_mask_add_ps(acc0, m0, acc0, _mm512_loadu_ps(delta + d));
-      acc1 = _mm512_mask_add_ps(acc1, m1, acc1, _mm512_loadu_ps(delta + d + 16));
+      acc0 = _mm512_mask_add_ps(acc0, m0, acc0, _mm512_load_ps(delta + d));
+      acc1 = _mm512_mask_add_ps(acc1, m1, acc1, _mm512_load_ps(delta + d + 16));
     }
     {
       const __mmask16 m2 = static_cast<__mmask16>((w >> 32) & 0xFFFFu);
       const __mmask16 m3 = static_cast<__mmask16>((w >> 48) & 0xFFFFu);
-      acc0 = _mm512_mask_add_ps(acc0, m2, acc0, _mm512_loadu_ps(delta + d + 32));
-      acc1 = _mm512_mask_add_ps(acc1, m3, acc1, _mm512_loadu_ps(delta + d + 48));
+      acc0 = _mm512_mask_add_ps(acc0, m2, acc0, _mm512_load_ps(delta + d + 32));
+      acc1 = _mm512_mask_add_ps(acc1, m3, acc1, _mm512_load_ps(delta + d + 48));
     }
   }
   float score = base + _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
@@ -150,10 +171,10 @@ void score_bit1_four(const float* delta, float base, const std::uint64_t* r0,
     const std::uint64_t w1 = r1[word_i];
     const std::uint64_t w2 = r2[word_i];
     const std::uint64_t w3 = r3[word_i];
-    const __m512 v0 = _mm512_loadu_ps(delta + off);
-    const __m512 v1 = _mm512_loadu_ps(delta + off + 16);
-    const __m512 v2 = _mm512_loadu_ps(delta + off + 32);
-    const __m512 v3 = _mm512_loadu_ps(delta + off + 48);
+    const __m512 v0 = _mm512_load_ps(delta + off);
+    const __m512 v1 = _mm512_load_ps(delta + off + 16);
+    const __m512 v2 = _mm512_load_ps(delta + off + 32);
+    const __m512 v3 = _mm512_load_ps(delta + off + 48);
 
     a0 = _mm512_mask_add_ps(a0, static_cast<__mmask16>(w0 & 0xFFFFu), a0, v0);
     b0 = _mm512_mask_add_ps(b0, static_cast<__mmask16>(w1 & 0xFFFFu), b0, v0);
@@ -252,8 +273,12 @@ void build_query_lut(std::span<const float> query_rotated,
   for (std::size_t g = 0; g < num_groups; ++g) {
     const std::size_t q_off = g * codes_per_group * block_dims;
     const auto q_slice = query_rotated.subspan(q_off, codes_per_group * block_dims);
-    if (bits == 8 && block_dims == 2) {
+    if (bits == 8 && block_dims == 1) {
+      fill_group_lut_bits8_d1(out.table(g), q_slice[0], centroids.data());
+    } else if (bits == 8 && block_dims == 2) {
       fill_group_lut_bits8_d2(out.table(g), q_slice[0], q_slice[1], centroids.data());
+    } else if (bits == 4 && block_dims == 1) {
+      fill_group_lut_bits4_d1(out.table(g), q_slice[0], q_slice[1], centroids.data());
     } else {
       fill_group_lut(out.table(g), q_slice, centroids, bits, codes_per_group, block_dims);
     }
@@ -389,15 +414,15 @@ void score_blocked_bit1(const QueryLut& lut, const BlockedCodes& blocked, std::s
 
     std::size_t off = 0;
     for (std::size_t word_i = 0; word_i < words && off + 64 <= num_codes; ++word_i, off += 64) {
-      const std::uint64_t* col = blocked.bit1_word_column(block, word_i);
+      const std::uint64_t* col = blocked.bit1_word_column_unchecked(block, word_i);
       const std::uint64_t w0 = col[vin + 0];
       const std::uint64_t w1 = col[vin + 1];
       const std::uint64_t w2 = col[vin + 2];
       const std::uint64_t w3 = col[vin + 3];
-      const __m512 v0 = _mm512_loadu_ps(delta + off);
-      const __m512 v1 = _mm512_loadu_ps(delta + off + 16);
-      const __m512 v2 = _mm512_loadu_ps(delta + off + 32);
-      const __m512 v3 = _mm512_loadu_ps(delta + off + 48);
+      const __m512 v0 = _mm512_load_ps(delta + off);
+      const __m512 v1 = _mm512_load_ps(delta + off + 16);
+      const __m512 v2 = _mm512_load_ps(delta + off + 32);
+      const __m512 v3 = _mm512_load_ps(delta + off + 48);
 
       a0 = _mm512_mask_add_ps(a0, static_cast<__mmask16>(w0 & 0xFFFFu), a0, v0);
       b0 = _mm512_mask_add_ps(b0, static_cast<__mmask16>(w1 & 0xFFFFu), b0, v0);
@@ -430,11 +455,11 @@ void score_blocked_bit1(const QueryLut& lut, const BlockedCodes& blocked, std::s
     __m512 a1 = _mm512_setzero_ps();
     std::size_t off = 0;
     for (std::size_t word_i = 0; word_i < words && off + 64 <= num_codes; ++word_i, off += 64) {
-      const std::uint64_t w = blocked.bit1_word_column(block, word_i)[vin];
-      const __m512 v0 = _mm512_loadu_ps(delta + off);
-      const __m512 v1 = _mm512_loadu_ps(delta + off + 16);
-      const __m512 v2 = _mm512_loadu_ps(delta + off + 32);
-      const __m512 v3 = _mm512_loadu_ps(delta + off + 48);
+      const std::uint64_t w = blocked.bit1_word_column_unchecked(block, word_i)[vin];
+      const __m512 v0 = _mm512_load_ps(delta + off);
+      const __m512 v1 = _mm512_load_ps(delta + off + 16);
+      const __m512 v2 = _mm512_load_ps(delta + off + 32);
+      const __m512 v3 = _mm512_load_ps(delta + off + 48);
       a0 = _mm512_mask_add_ps(a0, static_cast<__mmask16>(w & 0xFFFFu), a0, v0);
       a1 = _mm512_mask_add_ps(a1, static_cast<__mmask16>((w >> 16) & 0xFFFFu), a1, v1);
       a0 = _mm512_mask_add_ps(a0, static_cast<__mmask16>((w >> 32) & 0xFFFFu), a0, v2);
@@ -452,23 +477,25 @@ void score_blocked_float_lut(const QueryLut& lut, const BlockedCodes& blocked, s
   alignas(64) float acc[BlockedCodes::kBlock] = {};
 
   for (std::size_t g = 0; g < groups; ++g) {
-    const std::uint8_t* codes = blocked.group_bytes(block, g);
+    const std::uint8_t* codes = blocked.group_bytes_unchecked(block, g);
     const float* table = lut.table(g);
 #if defined(_MSC_VER)
     if (g + 1 < groups) {
-      _mm_prefetch(reinterpret_cast<const char*>(blocked.group_bytes(block, g + 1)), _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(blocked.group_bytes_unchecked(block, g + 1)),
+                   _MM_HINT_T0);
     }
 #else
     if (g + 1 < groups) {
-      __builtin_prefetch(blocked.group_bytes(block, g + 1), 0, 3);
+      __builtin_prefetch(blocked.group_bytes_unchecked(block, g + 1), 0, 3);
     }
 #endif
     std::size_t v = 0;
-    for (; v + 4 <= count; v += 4) {
-      acc[v + 0] += table[codes[v + 0]];
-      acc[v + 1] += table[codes[v + 1]];
-      acc[v + 2] += table[codes[v + 2]];
-      acc[v + 3] += table[codes[v + 3]];
+    for (; v + 16 <= count; v += 16) {
+      const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes + v));
+      const __m512i idx = _mm512_cvtepu8_epi32(bytes);
+      const __m512 vals = _mm512_i32gather_ps(idx, table, 4);
+      const __m512 vacc = _mm512_loadu_ps(acc + v);
+      _mm512_storeu_ps(acc + v, _mm512_add_ps(vacc, vals));
     }
     for (; v < count; ++v) {
       acc[v] += table[codes[v]];
@@ -496,24 +523,20 @@ void score_blocked_nibble4(const QueryLut& lut, const BlockedCodes& blocked, std
   alignas(64) float acc[BlockedCodes::kBlock] = {};
   alignas(64) float lo[16];
   alignas(64) float hi[16];
+  const __m512i nibble_mask = _mm512_set1_epi32(0x0f);
 
   for (std::size_t g = 0; g < groups; ++g) {
     peel_nibble4_tables(lut.table(g), lo, hi);
-    const std::uint8_t* codes = blocked.group_bytes(block, g);
+    const std::uint8_t* codes = blocked.group_bytes_unchecked(block, g);
     const __m512 lut_lo = _mm512_load_ps(lo);
     const __m512 lut_hi = _mm512_load_ps(hi);
 
     std::size_t v = 0;
     for (; v + 16 <= count; v += 16) {
-      alignas(64) std::uint32_t idx_lo[16];
-      alignas(64) std::uint32_t idx_hi[16];
-      for (std::size_t i = 0; i < 16; ++i) {
-        const std::uint8_t b = codes[v + i];
-        idx_lo[i] = b & 0x0Fu;
-        idx_hi[i] = b >> 4;
-      }
-      const __m512i ilo = _mm512_load_si512(idx_lo);
-      const __m512i ihi = _mm512_load_si512(idx_hi);
+      const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes + v));
+      const __m512i b32 = _mm512_cvtepu8_epi32(bytes);
+      const __m512i ilo = _mm512_and_si512(b32, nibble_mask);
+      const __m512i ihi = _mm512_srli_epi32(b32, 4);
       const __m512 vlo = _mm512_permutexvar_ps(ilo, lut_lo);
       const __m512 vhi = _mm512_permutexvar_ps(ihi, lut_hi);
       __m512 vacc = _mm512_loadu_ps(acc + v);
@@ -542,15 +565,16 @@ void score_blocked_bits8(const QueryLut& lut, const BlockedCodes& blocked, std::
   alignas(64) float acc[BlockedCodes::kBlock] = {};
 
   for (std::size_t g = 0; g < groups; ++g) {
-    const std::uint8_t* codes = blocked.group_bytes(block, g);
+    const std::uint8_t* codes = blocked.group_bytes_unchecked(block, g);
     const float* table = lut.table(g);
 #if defined(_MSC_VER)
     if (g + 1 < groups) {
-      _mm_prefetch(reinterpret_cast<const char*>(blocked.group_bytes(block, g + 1)), _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(blocked.group_bytes_unchecked(block, g + 1)),
+                   _MM_HINT_T0);
     }
 #else
     if (g + 1 < groups) {
-      __builtin_prefetch(blocked.group_bytes(block, g + 1), 0, 3);
+      __builtin_prefetch(blocked.group_bytes_unchecked(block, g + 1), 0, 3);
     }
 #endif
     std::size_t v = 0;

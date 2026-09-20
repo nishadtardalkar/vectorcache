@@ -11,6 +11,7 @@
 #include "vectorcache/query/distance.hpp"
 #include "vectorcache/query/fastscan.hpp"
 #include "vectorcache/quantize/quantize.hpp"
+#include "vectorcache/simd.hpp"
 #include "vectorcache/transform/normalize.hpp"
 
 #if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
@@ -38,6 +39,13 @@ class TopKHits {
     if (use_heap_) {
       heap_.reserve(k);
     }
+  }
+
+  void clear() {
+    size_ = 0;
+    min_score_ = 0.0f;
+    min_idx_ = 0;
+    heap_.clear();
   }
 
   float reject_threshold() const {
@@ -95,15 +103,30 @@ class TopKHits {
   std::vector<QueryHit> finalize() const {
     std::vector<QueryHit> out;
     if (use_heap_) {
-      out.reserve(heap_.size());
-      for (const auto& hit : heap_) {
+      std::vector<HeapHit> sorted = heap_;
+      if (!sorted.empty()) {
+        std::sort_heap(sorted.begin(), sorted.end(), heap_worse);
+        std::reverse(sorted.begin(), sorted.end());
+        // sort_heap+reverse flips id order within equal-score runs; restore ascending id.
+        for (std::size_t i = 0; i < sorted.size();) {
+          std::size_t j = i + 1;
+          while (j < sorted.size() && sorted[j].score == sorted[i].score) {
+            ++j;
+          }
+          std::reverse(sorted.begin() + static_cast<std::ptrdiff_t>(i),
+                       sorted.begin() + static_cast<std::ptrdiff_t>(j));
+          i = j;
+        }
+      }
+      out.reserve(sorted.size());
+      for (const auto& hit : sorted) {
         out.push_back({hit.id, hit.score});
       }
-    } else {
-      out.reserve(size_);
-      for (std::size_t i = 0; i < size_; ++i) {
-        out.push_back({ids_[i], scores_[i]});
-      }
+      return out;
+    }
+    out.reserve(size_);
+    for (std::size_t i = 0; i < size_; ++i) {
+      out.push_back({ids_[i], scores_[i]});
     }
     std::sort(out.begin(), out.end(), [](const QueryHit& a, const QueryHit& b) {
       if (a.score != b.score) {
@@ -162,6 +185,39 @@ class TopKHits {
   std::vector<HeapHit> heap_;
 };
 
+#if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
+std::vector<TopKHits>& omp_topk_scratch(std::size_t k, int nthreads) {
+  static std::vector<TopKHits> locals;
+  static std::size_t locals_k = 0;
+  if (locals.size() != static_cast<std::size_t>(nthreads) || locals_k != k) {
+    locals.clear();
+    locals.reserve(static_cast<std::size_t>(nthreads));
+    for (int t = 0; t < nthreads; ++t) {
+      locals.emplace_back(k);
+    }
+    locals_k = k;
+  } else {
+    for (auto& local : locals) {
+      local.clear();
+    }
+  }
+  return locals;
+}
+#endif
+
+void apply_scales(std::span<float> scores, std::span<const float> scales, std::size_t base,
+                  std::size_t count) {
+  std::size_t i = 0;
+  for (; i + simd::kWidth <= count; i += simd::kWidth) {
+    const __m512 s = _mm512_loadu_ps(scores.data() + i);
+    const __m512 a = _mm512_loadu_ps(scales.data() + base + i);
+    _mm512_storeu_ps(scores.data() + i, _mm512_mul_ps(s, a));
+  }
+  for (; i < count; ++i) {
+    scores[i] *= scales[base + i];
+  }
+}
+
 void score_block_range_into_topk(const BlockedCodes& blocked, const QueryLut& lut,
                                  const ingest::VectorStore& store, std::size_t block,
                                  std::size_t range_lo, std::size_t range_hi, TopKHits& topk) {
@@ -180,13 +236,14 @@ void score_block_range_into_topk(const BlockedCodes& blocked, const QueryLut& lu
 
   const auto ids = store.ids();
   const auto scales = store.scales();
+  apply_scales(std::span<float>(score_buf, count), scales, base, count);
+
   const std::size_t begin = std::max(range_lo, base);
   const std::size_t end = std::min(range_hi, block_hi);
   float threshold = topk.reject_threshold();
   for (std::size_t idx = begin; idx < end; ++idx) {
-    const std::size_t i = idx - base;
-    const float score = score_buf[i] * scales[idx];
-    if (score < threshold) {
+    const float score = score_buf[idx - base];
+    if (score < threshold) [[likely]] {
       continue;
     }
     topk.push(ids[idx], score);
@@ -207,7 +264,8 @@ void score_store_range_fastscan(const BlockedCodes& blocked, const QueryLut& lut
   }
 }
 
-void score_store_range_vector_major(const ingest::VectorStore& store, const PreparedQuery& query,
+void score_store_range_vector_major(const ingest::VectorStore& store, const QueryLut& lut,
+                                    const PreparedQuery& query,
                                     const quantize::LloydMaxCodebook& codebook, std::size_t lo,
                                     std::size_t hi, TopKHits& topk) {
   if (lo >= hi) {
@@ -219,18 +277,16 @@ void score_store_range_vector_major(const ingest::VectorStore& store, const Prep
   const auto ids = store.ids();
   const auto scales = store.scales();
 
-  QueryLut lut;
-  build_query_lut(query.rotated, codebook, lut);
-
   alignas(64) float score_buf[kScoreChunk];
   float threshold = topk.reject_threshold();
   for (std::size_t base = lo; base < hi; base += kScoreChunk) {
     const std::size_t chunk = std::min(kScoreChunk, hi - base);
     asymmetric_ip_batch_lut(lut, codes.subspan(base * words, chunk * words), words, chunk, codebook,
                             query.rotated, std::span<float>(score_buf, chunk));
+    apply_scales(std::span<float>(score_buf, chunk), scales, base, chunk);
     for (std::size_t i = 0; i < chunk; ++i) {
-      const float score = score_buf[i] * scales[base + i];
-      if (score < threshold) {
+      const float score = score_buf[i];
+      if (score < threshold) [[likely]] {
         continue;
       }
       topk.push(ids[base + i], score);
@@ -339,49 +395,43 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
   const bool byte_aligned =
       lut_bits_supported(store_.bits_per_dim()) && (m * store_.bits_per_dim()) % 8 == 0;
 
-  if (!blocked.empty() && byte_aligned) {
-    QueryLut lut;
-    build_query_lut(prepared.rotated, codebook_, lut);
-    if (!lut.empty()) {
+  build_query_lut(prepared.rotated, codebook_, lut_cache_);
+
+  if (!blocked.empty() && byte_aligned && !lut_cache_.empty()) {
 #if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
-      // Parallelize across probed cells when many cells or large total candidates.
-      const bool prefer_parallel =
-          ranges.size() >= 8 && candidates >= kParallelMinBlocks * BlockedCodes::kBlock &&
-          omp_get_max_threads() > 1;
-      if (prefer_parallel) {
-        const int nthreads = omp_get_max_threads();
-        std::vector<TopKHits> locals;
-        locals.reserve(static_cast<std::size_t>(nthreads));
-        for (int t = 0; t < nthreads; ++t) {
-          locals.emplace_back(params.k);
-        }
+    // Parallelize across probed cells when many cells or large total candidates.
+    const bool prefer_parallel =
+        ranges.size() >= 8 && candidates >= kParallelMinBlocks * BlockedCodes::kBlock &&
+        omp_get_max_threads() > 1;
+    if (prefer_parallel) {
+      const int nthreads = omp_get_max_threads();
+      std::vector<TopKHits>& locals = omp_topk_scratch(params.k, nthreads);
 #pragma omp parallel
-        {
-          const int tid = omp_get_thread_num();
-          TopKHits& local = locals[static_cast<std::size_t>(tid)];
+      {
+        const int tid = omp_get_thread_num();
+        TopKHits& local = locals[static_cast<std::size_t>(tid)];
 #pragma omp for schedule(dynamic) nowait
-          for (int r = 0; r < static_cast<int>(ranges.size()); ++r) {
-            const auto& range = ranges[static_cast<std::size_t>(r)];
-            score_store_range_fastscan(blocked, lut, store_, range.start,
-                                       range.start + range.length, local);
-          }
+        for (int r = 0; r < static_cast<int>(ranges.size()); ++r) {
+          const auto& range = ranges[static_cast<std::size_t>(r)];
+          score_store_range_fastscan(blocked, lut_cache_, store_, range.start,
+                                     range.start + range.length, local);
         }
-        for (auto& local : locals) {
-          topk.merge_from(local);
-        }
-        return topk.finalize();
       }
-#endif
-      for (const auto& range : ranges) {
-        score_store_range_fastscan(blocked, lut, store_, range.start, range.start + range.length,
-                                   topk);
+      for (auto& local : locals) {
+        topk.merge_from(local);
       }
       return topk.finalize();
     }
+#endif
+    for (const auto& range : ranges) {
+      score_store_range_fastscan(blocked, lut_cache_, store_, range.start,
+                                 range.start + range.length, topk);
+    }
+    return topk.finalize();
   }
 
   for (const auto& range : ranges) {
-    score_store_range_vector_major(store_, prepared, codebook_, range.start,
+    score_store_range_vector_major(store_, lut_cache_, prepared, codebook_, range.start,
                                    range.start + range.length, topk);
   }
   return topk.finalize();

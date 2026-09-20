@@ -44,8 +44,18 @@ class BlockedCodes {
   /// Pointer to kBlock bytes for (block, group).
   const std::uint8_t* group_bytes(std::size_t block, std::size_t group) const;
 
+  /// Unchecked: caller must ensure block/group in range (hot path).
+  const std::uint8_t* group_bytes_unchecked(std::size_t block, std::size_t group) const {
+    return bytes_.data() + (block * num_groups_ + group) * kBlock;
+  }
+
   /// Pointer to kBlock u64 words for (block, word_index); bits=1 only.
   const std::uint64_t* bit1_word_column(std::size_t block, std::size_t word) const;
+
+  /// Unchecked: caller must ensure bit1 layout and block/word in range (hot path).
+  const std::uint64_t* bit1_word_column_unchecked(std::size_t block, std::size_t word) const {
+    return bit1_words_.data() + (block * words_per_vec_ + word) * kBlock;
+  }
 
   /// Valid vector count in a block (last block may be partial).
   std::size_t block_count(std::size_t block) const;

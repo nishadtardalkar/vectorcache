@@ -9,6 +9,7 @@
 #include "vectorcache/aligned.hpp"
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/quantize/quantize.hpp"
+#include "vectorcache/query/distance.hpp"
 #include "vectorcache/query/fastscan.hpp"
 #include "vectorcache/transform/srht.hpp"
 
@@ -65,6 +66,7 @@ class QueryEngine {
   quantize::LloydMaxCodebook codebook_;
   mutable BlockedCodes blocked_;
   mutable std::size_t blocked_n_ = 0;
+  mutable QueryLut lut_cache_;
 };
 
 }  // namespace vectorcache::query

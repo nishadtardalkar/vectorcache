@@ -444,11 +444,14 @@ int main(int argc, char** argv) {
     print_latency_stats(prep_ns, search_ns);
     print_score_stats(sum_top1, sum_topk_mean, scored_queries, k);
     if (!queries.empty()) {
+      const double avg_scored =
+          static_cast<double>(sum_candidates) / static_cast<double>(queries.size());
+      const double pct_scored =
+          actual_index > 0 ? (100.0 * avg_scored / static_cast<double>(actual_index)) : 0.0;
       std::cout << std::fixed << std::setprecision(1);
       std::cout << "Bucket prune:\n";
-      std::cout << "  avg candidates/query: "
-                << (static_cast<double>(sum_candidates) / static_cast<double>(queries.size()))
-                << " / " << actual_index << '\n';
+      std::cout << "  avg vectors scored: " << avg_scored << " / " << actual_index << " ("
+                << pct_scored << "% of index)\n";
       std::cout << "  avg cells probed: "
                 << (static_cast<double>(sum_cells) / static_cast<double>(queries.size())) << '\n';
     }

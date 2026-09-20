@@ -49,6 +49,8 @@ void project_to_bins(const ProjectionMatrix& matrix, std::span<const float> x, f
 BinCodec make_bin_codec(std::size_t num_projections, float bin_width);
 
 std::uint64_t pack_cell_key(std::span<const std::int32_t> bins, const BinCodec& codec);
+/// Same packing as pack_cell_key without range checks (bins must be in codec range).
+std::uint64_t pack_cell_key_unchecked(std::span<const std::int32_t> bins, const BinCodec& codec);
 void unpack_cell_key(std::uint64_t key, const BinCodec& codec, std::span<std::int32_t> bins);
 
 /// Validate probe grid size (2P+1)^R <= kMaxProbeCells.

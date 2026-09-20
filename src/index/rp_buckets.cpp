@@ -17,8 +17,12 @@ float dot_avx(std::span<const float> a, std::span<const float> b) {
   const std::size_t n = a.size();
   std::size_t i = 0;
   __m512 acc = _mm512_setzero_ps();
+  // Row starts are 64B-aligned when dim is a multiple of 16 (AlignedVector base).
+  const bool a_aligned =
+      (reinterpret_cast<std::uintptr_t>(a.data()) & 63u) == 0;
   for (; i + simd::kWidth <= n; i += simd::kWidth) {
-    const __m512 va = _mm512_loadu_ps(a.data() + i);
+    const __m512 va =
+        a_aligned ? _mm512_load_ps(a.data() + i) : _mm512_loadu_ps(a.data() + i);
     const __m512 vb = _mm512_loadu_ps(b.data() + i);
     acc = _mm512_fmadd_ps(va, vb, acc);
   }
@@ -81,6 +85,22 @@ void enumerate_offsets(std::size_t R, std::size_t P, std::vector<ProbeOffset>& o
     }
     return false;
   });
+}
+
+const std::vector<ProbeOffset>& cached_probe_offsets(std::size_t R, std::size_t P) {
+  struct Entry {
+    std::size_t R = 0;
+    std::size_t P = 0;
+    std::vector<ProbeOffset> offsets;
+  };
+  static Entry cache;
+  if (cache.R == R && cache.P == P && !cache.offsets.empty()) {
+    return cache.offsets;
+  }
+  cache.R = R;
+  cache.P = P;
+  enumerate_offsets(R, P, cache.offsets);
+  return cache.offsets;
 }
 
 }  // namespace
@@ -170,6 +190,18 @@ BinCodec make_bin_codec(std::size_t num_projections, float bin_width) {
   codec.bits_per_axis = bits;
   codec.num_projections = num_projections;
   return codec;
+}
+
+std::uint64_t pack_cell_key_unchecked(std::span<const std::int32_t> bins, const BinCodec& codec) {
+  const std::uint64_t mask =
+      codec.bits_per_axis == 64 ? ~0ull : ((1ull << codec.bits_per_axis) - 1ull);
+  std::uint64_t key = 0;
+  for (std::size_t i = 0; i < codec.num_projections; ++i) {
+    const std::uint64_t shifted =
+        static_cast<std::uint64_t>(static_cast<std::int64_t>(bins[i]) - codec.bin_lo);
+    key = (key << codec.bits_per_axis) | (shifted & mask);
+  }
+  return key;
 }
 
 std::uint64_t pack_cell_key(std::span<const std::int32_t> bins, const BinCodec& codec) {
@@ -278,8 +310,8 @@ std::vector<BucketRange> BucketIndex::probe(std::span<const std::int32_t> query_
   }
   validate_probe_grid(codec_.num_projections, probe_radius);
 
-  std::vector<ProbeOffset> offsets;
-  enumerate_offsets(codec_.num_projections, probe_radius, offsets);
+  const std::vector<ProbeOffset>& offsets =
+      cached_probe_offsets(codec_.num_projections, probe_radius);
 
   std::vector<BucketRange> ranges;
   ranges.reserve(offsets.size());
@@ -290,8 +322,8 @@ std::vector<BucketRange> BucketIndex::probe(std::span<const std::int32_t> query_
     for (std::size_t i = 0; i < codec_.num_projections; ++i) {
       bins[i] = query_bins[i] + po.o[i];
     }
-    const std::uint64_t key =
-        pack_cell_key(std::span<const std::int32_t>(bins, codec_.num_projections), codec_);
+    const std::uint64_t key = pack_cell_key_unchecked(
+        std::span<const std::int32_t>(bins, codec_.num_projections), codec_);
     const BucketRange range = find(key);
     if (range.length == 0) {
       continue;

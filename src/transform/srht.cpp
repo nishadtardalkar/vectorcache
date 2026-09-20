@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "vectorcache/error.hpp"
+#include "vectorcache/simd.hpp"
 #include "vectorcache/transform/fwht.hpp"
 
 namespace vectorcache::transform {
@@ -44,7 +45,15 @@ AlignedVector<float> rademacher_f(std::mt19937_64& rng, std::size_t n) {
 
 void permute_gather_signed(std::span<const float> src, std::span<const std::uint32_t> perm,
                            std::span<const float> signs, std::span<float> dst) {
-  for (std::size_t i = 0; i < dst.size(); ++i) {
+  const std::size_t n = dst.size();
+  std::size_t i = 0;
+  for (; i + simd::kWidth <= n; i += simd::kWidth) {
+    const __m512i idx = _mm512_loadu_si512(perm.data() + i);
+    const __m512 vals = _mm512_i32gather_ps(idx, src.data(), 4);
+    const __m512 sgn = _mm512_load_ps(signs.data() + i);
+    _mm512_storeu_ps(dst.data() + i, _mm512_mul_ps(vals, sgn));
+  }
+  for (; i < n; ++i) {
     dst[i] = src[perm[i]] * signs[i];
   }
 }

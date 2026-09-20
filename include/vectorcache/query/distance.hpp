@@ -59,7 +59,10 @@ class QueryLut {
     dim_ = dim;
     block_dims_ = block_dims;
     num_codes_ = num_codes;
-    tables_.assign(num_groups * kEntries, 0.0f);
+    const std::size_t need = num_groups * kEntries;
+    if (tables_.size() != need) {
+      tables_.resize(need);  // caller fills every entry; skip zero-fill on reuse
+    }
     delta_.clear();
     bit1_base_ = 0.0f;
   }
