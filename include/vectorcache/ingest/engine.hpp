@@ -23,10 +23,9 @@ struct IngestReport {
 };
 
 struct BucketParams {
-  std::size_t num_pair_dirs = 8;
-  float bin_width = 0.1f;
-  /// Ridge δ for pair-hash fold; 0 => auto 1/srht_dim.
-  float fold_ridge = 0.0f;
+  std::size_t num_buckets = 256;
+  /// Rebalance every N vectors during ingest; 0 => only at finalize.
+  std::size_t rebalance_every = 10000;
   std::uint64_t bucket_seed = 0;  // 0 => derive from rotation seed when available
 };
 
@@ -41,12 +40,13 @@ class IngestionEngine {
                                        BucketParams buckets = BucketParams{});
 
   void reserve_vectors(std::size_t count);
-  /// When `finalize_buckets` is false, codes are stored but pair-hash CSR is not built.
+  /// When `finalize_buckets` is false, codes are stored but cluster CSR is not built.
   IngestReport ingest(datasets::DatasetReader& reader, bool finalize_buckets = true);
   IngestReport ingest_with_hook(datasets::DatasetReader& reader, VectorHook* hook,
                                 bool finalize_buckets = true);
   const VectorStore& store() const { return store_; }
   const quantize::LloydMaxCodebook& codebook() const { return codebook_; }
+  const index::ClusterCentroids& centroids() const { return centroids_; }
   std::size_t bits_per_dim() const { return codebook_.bits(); }
   std::size_t block_dims() const { return codebook_.block_dims(); }
 
@@ -55,7 +55,6 @@ class IngestionEngine {
     AlignedVector<float> buf;  // length srht_dim_
     AlignedVector<std::uint64_t> l0;
     float alpha = 1.0f;
-    std::uint64_t cell_key = 0;
   };
 
   IngestionEngine(VectorStore store, std::optional<transform::SrhtRotation> rotation,
@@ -66,7 +65,8 @@ class IngestionEngine {
   void ensure_batch_capacity(std::size_t batch_cap);
   std::size_t read_batch(datasets::DatasetReader& reader);
   void process_batch(std::size_t batch_len);
-  void finalize_bucket_index(std::span<const std::uint64_t> all_keys);
+  void maybe_rebalance(std::vector<std::uint64_t>& cell_keys, bool force);
+  void finalize_bucket_index(std::vector<std::uint64_t>& cell_keys);
 
   VectorStore store_;
   std::optional<transform::SrhtRotation> rotation_;
@@ -77,7 +77,9 @@ class IngestionEngine {
   quantize::LloydMaxCodebook codebook_;
   BucketParams bucket_params_;
   std::uint64_t bucket_seed_;
-  index::PairHash pair_hash_;
+  index::ClusterCentroids centroids_;
+  /// Row-major post-SRHT floats retained until finalize (N * srht_dim).
+  AlignedVector<float> rotated_all_;
   std::vector<VectorWork> batch_work_;
 };
 

@@ -3,108 +3,179 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <numeric>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include "vectorcache/error.hpp"
 
 namespace vectorcache::index {
+namespace {
 
-PairHash::PairHash(std::size_t num_pair_dirs, std::uint64_t seed, float ridge_delta)
-    : num_pair_dirs_(num_pair_dirs), ridge_delta_(ridge_delta) {
-  if (num_pair_dirs_ == 0 || num_pair_dirs_ > kMaxPairDirs) {
-    throw Error("PairHash: num_pair_dirs must be in 1..kMaxPairDirs");
-  }
-  if (!(ridge_delta_ > 0.0f) || !std::isfinite(ridge_delta_)) {
-    throw Error("PairHash: ridge_delta must be finite and > 0");
-  }
-  dirs_.assign(num_pair_dirs_ * 2, 0.0f);
+void fill_random_unit_rows(AlignedVector<float>& out, std::size_t rows, std::size_t dim,
+                           std::uint64_t seed) {
+  out.assign(rows * dim, 0.0f);
   std::mt19937_64 rng(seed);
   std::normal_distribution<float> gauss(0.0f, 1.0f);
-  for (std::size_t i = 0; i < num_pair_dirs_; ++i) {
-    float r0 = gauss(rng);
-    float r1 = gauss(rng);
-    const double energy =
-        static_cast<double>(r0) * static_cast<double>(r0) +
-        static_cast<double>(r1) * static_cast<double>(r1);
+  for (std::size_t j = 0; j < rows; ++j) {
+    float* row = out.data() + j * dim;
+    double energy = 0.0;
+    for (std::size_t d = 0; d < dim; ++d) {
+      row[d] = gauss(rng);
+      energy += static_cast<double>(row[d]) * static_cast<double>(row[d]);
+    }
     if (energy <= 0.0) {
-      r0 = 1.0f;
-      r1 = 0.0f;
+      row[0] = 1.0f;
+      for (std::size_t d = 1; d < dim; ++d) {
+        row[d] = 0.0f;
+      }
     } else {
       const float inv = static_cast<float>(1.0 / std::sqrt(energy));
-      r0 *= inv;
-      r1 *= inv;
+      for (std::size_t d = 0; d < dim; ++d) {
+        row[d] *= inv;
+      }
     }
-    dirs_[2 * i] = r0;
-    dirs_[2 * i + 1] = r1;
   }
 }
 
-float PairHash::fold(std::span<const float> x) const {
-  if (empty()) {
-    throw Error("PairHash::fold: empty hash");
+float dot(std::span<const float> a, std::span<const float> b) {
+  double sum = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    sum += static_cast<double>(a[i]) * static_cast<double>(b[i]);
   }
-  if (x.empty()) {
-    throw Error("PairHash::fold: empty input");
-  }
-
-  std::vector<float> cur(x.begin(), x.end());
-  std::vector<float> next;
-  next.reserve((cur.size() + 1) / 2);
-  std::size_t cursor = 0;
-
-  while (cur.size() > 1) {
-    next.clear();
-    const std::size_t n = cur.size();
-    const std::size_t pairs = n / 2;
-    for (std::size_t i = 0; i < pairs; ++i) {
-      const float a = cur[2 * i];
-      const float b = cur[2 * i + 1];
-      const float n2 = a * a + b * b;
-      const std::size_t di = cursor % num_pair_dirs_;
-      const float out =
-          (a * dirs_[2 * di] + b * dirs_[2 * di + 1]) / std::sqrt(n2 + ridge_delta_);
-      ++cursor;
-      next.push_back(out);
-    }
-    if ((n & 1u) != 0) {
-      next.push_back(cur[n - 1]);
-    }
-    cur.swap(next);
-  }
-  return std::clamp(cur[0], -1.0f, 1.0f);
+  return static_cast<float>(sum);
 }
 
-std::int32_t fold_to_bin(const PairHash& hash, std::span<const float> x, float bin_width) {
-  if (bin_width <= 0.0f || !std::isfinite(bin_width)) {
-    throw Error("bin_width must be finite and > 0");
-  }
-  const float s = std::clamp(hash.fold(x), -1.0f, 1.0f);
-  const float u = 0.5f * (s + 1.0f);
-  return static_cast<std::int32_t>(std::floor(static_cast<double>(u) / bin_width));
-}
-
-std::uint64_t pack_bin(std::int32_t bin) {
-  return static_cast<std::uint64_t>(static_cast<std::int64_t>(bin));
-}
+}  // namespace
 
 void validate_probe_radius(std::size_t probe_radius) {
-  const std::size_t cells = 2 * probe_radius + 1;
-  if (cells > kMaxProbeCells) {
-    throw Error("probe radius: 2P+1 exceeds kMaxProbeCells");
+  if (probe_radius == 0 || probe_radius > kMaxProbeCells) {
+    throw Error("probe_radius (nprobe) must be in 1..kMaxProbeCells");
   }
 }
 
-BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys, PairHash hash,
-                               float bin_width) {
+ClusterCentroids::ClusterCentroids(std::size_t num_buckets, std::size_t dim, std::uint64_t seed)
+    : num_buckets_(num_buckets), dim_(dim) {
+  if (num_buckets_ == 0 || num_buckets_ > kMaxBuckets) {
+    throw Error("ClusterCentroids: num_buckets must be in 1..kMaxBuckets");
+  }
+  if (dim_ == 0) {
+    throw Error("ClusterCentroids: dim must be > 0");
+  }
+  fill_random_unit_rows(centroids_, num_buckets_, dim_, seed);
+  sums_.assign(num_buckets_ * dim_, 0.0f);
+  counts_.assign(num_buckets_, 0);
+}
+
+std::span<const float> ClusterCentroids::centroid(std::size_t j) const {
+  if (j >= num_buckets_) {
+    throw Error("ClusterCentroids::centroid: index out of range");
+  }
+  return {centroids_.data() + j * dim_, dim_};
+}
+
+std::size_t ClusterCentroids::count(std::size_t j) const {
+  if (j >= num_buckets_) {
+    throw Error("ClusterCentroids::count: index out of range");
+  }
+  return counts_[j];
+}
+
+float ClusterCentroids::ip_centroid(std::size_t j, std::span<const float> x) const {
+  return dot(centroid(j), x);
+}
+
+void ClusterCentroids::normalize_centroid(std::size_t j) {
+  float* c = centroids_.data() + j * dim_;
+  const float* s = sums_.data() + j * dim_;
+  double energy = 0.0;
+  for (std::size_t d = 0; d < dim_; ++d) {
+    energy += static_cast<double>(s[d]) * static_cast<double>(s[d]);
+  }
+  if (energy <= 0.0) {
+    // Keep previous ĉ (empty / degenerate sum).
+    return;
+  }
+  const float inv = static_cast<float>(1.0 / std::sqrt(energy));
+  for (std::size_t d = 0; d < dim_; ++d) {
+    c[d] = s[d] * inv;
+  }
+}
+
+std::uint64_t ClusterCentroids::nearest(std::span<const float> x) const {
+  if (empty()) {
+    throw Error("ClusterCentroids::nearest: empty");
+  }
+  if (x.size() != dim_) {
+    throw Error("ClusterCentroids::nearest: dim mismatch");
+  }
+  std::size_t best = 0;
+  float best_ip = ip_centroid(0, x);
+  for (std::size_t j = 1; j < num_buckets_; ++j) {
+    const float ip = ip_centroid(j, x);
+    if (ip > best_ip) {
+      best_ip = ip;
+      best = j;
+    }
+  }
+  return static_cast<std::uint64_t>(best);
+}
+
+std::uint64_t ClusterCentroids::assign_and_update(std::span<const float> x) {
+  const std::uint64_t key = nearest(x);
+  const std::size_t j = static_cast<std::size_t>(key);
+  float* s = sums_.data() + j * dim_;
+  for (std::size_t d = 0; d < dim_; ++d) {
+    s[d] += x[d];
+  }
+  ++counts_[j];
+  normalize_centroid(j);
+  return key;
+}
+
+void ClusterCentroids::rebalance(std::span<const float> vectors, std::span<std::uint64_t> cell_keys) {
+  if (empty()) {
+    throw Error("ClusterCentroids::rebalance: empty");
+  }
+  if (cell_keys.empty()) {
+    return;
+  }
+  if (vectors.size() != cell_keys.size() * dim_) {
+    throw Error("ClusterCentroids::rebalance: vectors size mismatch");
+  }
+
+  // Keep current ĉ for assignment; clear sums/counts then rebuild.
+  sums_.assign(num_buckets_ * dim_, 0.0f);
+  counts_.assign(num_buckets_, 0);
+
+  for (std::size_t i = 0; i < cell_keys.size(); ++i) {
+    const std::span<const float> x(vectors.data() + i * dim_, dim_);
+    const std::uint64_t key = nearest(x);
+    const std::size_t j = static_cast<std::size_t>(key);
+    cell_keys[i] = key;
+    float* s = sums_.data() + j * dim_;
+    for (std::size_t d = 0; d < dim_; ++d) {
+      s[d] += x[d];
+    }
+    ++counts_[j];
+  }
+
+  for (std::size_t j = 0; j < num_buckets_; ++j) {
+    if (counts_[j] > 0) {
+      normalize_centroid(j);
+    }
+    // Empty buckets: keep prior ĉ (already in centroids_).
+  }
+}
+
+BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys,
+                               ClusterCentroids centroids) {
   if (sorted_keys.empty()) {
     throw Error("BucketIndex::build: empty keys");
   }
-  if (hash.empty()) {
-    throw Error("BucketIndex::build: empty PairHash");
-  }
-  if (bin_width <= 0.0f || !std::isfinite(bin_width)) {
-    throw Error("BucketIndex::build: bin_width must be finite and > 0");
+  if (centroids.empty()) {
+    throw Error("BucketIndex::build: empty ClusterCentroids");
   }
   for (std::size_t i = 1; i < sorted_keys.size(); ++i) {
     if (sorted_keys[i] < sorted_keys[i - 1]) {
@@ -113,8 +184,9 @@ BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys, PairH
   }
 
   BucketIndex idx;
-  idx.hash_ = std::move(hash);
-  idx.bin_width_ = bin_width;
+  idx.num_buckets_ = centroids.num_buckets();
+  idx.dim_ = centroids.dim();
+  idx.centroids_.assign(centroids.centroids().begin(), centroids.centroids().end());
   idx.keys_.reserve(sorted_keys.size());
   idx.offsets_.reserve(sorted_keys.size() + 1);
   idx.offsets_.push_back(0);
@@ -130,6 +202,13 @@ BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys, PairH
   }
   idx.offsets_.push_back(sorted_keys.size());
   return idx;
+}
+
+std::span<const float> BucketIndex::centroid(std::size_t j) const {
+  if (j >= num_buckets_) {
+    throw Error("BucketIndex::centroid: index out of range");
+  }
+  return {centroids_.data() + j * dim_, dim_};
 }
 
 BucketRange BucketIndex::cell(std::size_t i) const {
@@ -152,28 +231,33 @@ BucketRange BucketIndex::find(std::uint64_t key) const {
   return {start, end - start};
 }
 
-std::vector<BucketRange> BucketIndex::probe(std::int32_t query_bin, std::size_t probe_radius,
+std::vector<BucketRange> BucketIndex::probe(std::span<const float> query, std::size_t probe_radius,
                                             std::size_t* out_candidates) const {
   if (empty()) {
     throw Error("BucketIndex::probe: empty index");
   }
-  validate_probe_radius(probe_radius);
-
-  // Order by |offset| then signed offset: 0, -1, +1, -2, +2, ...
-  std::vector<std::int32_t> offsets;
-  offsets.reserve(2 * probe_radius + 1);
-  offsets.push_back(0);
-  for (std::size_t d = 1; d <= probe_radius; ++d) {
-    offsets.push_back(-static_cast<std::int32_t>(d));
-    offsets.push_back(static_cast<std::int32_t>(d));
+  if (query.size() != dim_) {
+    throw Error("BucketIndex::probe: query dim mismatch");
   }
+  validate_probe_radius(probe_radius);
+  const std::size_t nprobe = std::min(probe_radius, num_buckets_);
+
+  std::vector<std::pair<float, std::uint64_t>> scored;
+  scored.reserve(num_buckets_);
+  for (std::size_t j = 0; j < num_buckets_; ++j) {
+    const float ip = dot(centroid(j), query);
+    scored.emplace_back(ip, static_cast<std::uint64_t>(j));
+  }
+  const std::size_t sort_n = nprobe;
+  std::partial_sort(scored.begin(), scored.begin() + static_cast<std::ptrdiff_t>(sort_n),
+                    scored.end(),
+                    [](const auto& a, const auto& b) { return a.first > b.first; });
 
   std::vector<BucketRange> ranges;
-  ranges.reserve(offsets.size());
+  ranges.reserve(nprobe);
   std::size_t candidates = 0;
-  for (const std::int32_t o : offsets) {
-    const std::int32_t bin = query_bin + o;
-    const BucketRange range = find(pack_bin(bin));
+  for (std::size_t i = 0; i < nprobe; ++i) {
+    const BucketRange range = find(scored[i].second);
     if (range.length == 0) {
       continue;
     }

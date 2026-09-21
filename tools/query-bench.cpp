@@ -78,14 +78,13 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
                                                   std::size_t dim, std::uint64_t seed,
                                                   std::size_t limit, std::size_t bits,
-                                                  std::size_t block_dims, std::size_t num_pair_dirs,
-                                                  float bin_width, float fold_ridge,
+                                                  std::size_t block_dims, std::size_t num_buckets,
+                                                  std::size_t rebalance_every,
                                                   std::uint64_t bucket_seed) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
   vectorcache::ingest::BucketParams buckets;
-  buckets.num_pair_dirs = num_pair_dirs;
-  buckets.bin_width = bin_width;
-  buckets.fold_ridge = fold_ridge;
+  buckets.num_buckets = num_buckets;
+  buckets.rebalance_every = rebalance_every;
   buckets.bucket_seed = bucket_seed;
   auto engine =
       vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits, block_dims, buckets);
@@ -499,10 +498,9 @@ int main(int argc, char** argv) {
   std::size_t k = 10;
   std::size_t bits = 1;
   std::size_t block_dims = 1;
-  std::size_t num_pair_dirs = 8;
-  float bin_width = 0.1f;
-  float fold_ridge = 0.0f;
-  std::size_t probe_radius = 1;
+  std::size_t num_buckets = 256;
+  std::size_t rebalance_every = 10000;
+  std::size_t probe_radius = 8;
   std::uint64_t bucket_seed = 0;
   bool calibrate = false;
   bool recall = false;
@@ -519,12 +517,11 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
   app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
-  app.add_option("--num-pair-dirs", num_pair_dirs, "Pair-hash random 2D directions L (1-64)");
-  app.add_option("--bin-width", bin_width,
-                 "Pair-hash bin width w on uniform u=(s+1)/2 in [0,1]");
-  app.add_option("--fold-ridge", fold_ridge, "Pair-hash ridge δ (0 = auto 1/srht_dim)");
-  app.add_option("--probe-radius", probe_radius, "1D multi-probe radius P");
-  app.add_option("--bucket-seed", bucket_seed, "Pair-hash seed (0 = derive from --seed)");
+  app.add_option("--num-buckets", num_buckets, "Cluster IVF bucket count B");
+  app.add_option("--rebalance-every", rebalance_every,
+                 "Lloyd rebalance every N vectors (0 = finalize only)");
+  app.add_option("--probe-radius", probe_radius, "nprobe: top cluster lists by centroid IP");
+  app.add_option("--bucket-seed", bucket_seed, "Cluster centroid seed (0 = derive from --seed)");
   app.add_flag("--calibrate", calibrate,
                "Print rotated_dim / bits / hit count for the first query");
   app.add_flag("--recall", recall,
@@ -539,14 +536,8 @@ int main(int argc, char** argv) {
     }
     vectorcache::quantize::validate_bits_per_dim(bits);
     vectorcache::quantize::validate_block_dims(block_dims);
-    if (num_pair_dirs == 0 || num_pair_dirs > vectorcache::index::kMaxPairDirs) {
-      throw vectorcache::Error("num-pair-dirs must be in 1..kMaxPairDirs");
-    }
-    if (!(bin_width > 0.0f)) {
-      throw vectorcache::Error("bin-width must be > 0");
-    }
-    if (fold_ridge != 0.0f && (!(fold_ridge > 0.0f) || !std::isfinite(fold_ridge))) {
-      throw vectorcache::Error("fold-ridge must be 0 (auto) or finite and > 0");
+    if (num_buckets == 0 || num_buckets > vectorcache::index::kMaxBuckets) {
+      throw vectorcache::Error("num-buckets must be in 1..kMaxBuckets");
     }
     vectorcache::index::validate_probe_radius(probe_radius);
 
@@ -568,15 +559,16 @@ int main(int argc, char** argv) {
               << " srht_dim=" << meta.dim << " index_n=" << actual_index
               << " query_n=" << query_limit << " query_split=" << query_split
               << " bits=" << bits << " block_dims=" << block_dims
-              << " L=" << num_pair_dirs << " w=" << bin_width << " P=" << probe_radius << '\n';
+              << " B=" << num_buckets << " rebalance_every=" << rebalance_every
+              << " nprobe=" << probe_radius << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
     }
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto ingest_engine =
-        ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims, num_pair_dirs,
-                     bin_width, fold_ridge, bucket_seed);
+        ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims, num_buckets,
+                     rebalance_every, bucket_seed);
     {
       const auto& store = ingest_engine.store();
       std::cout << "  stored_vectors=" << store.size()

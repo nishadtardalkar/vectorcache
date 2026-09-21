@@ -1,15 +1,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "vectorcache/datasets/reader.hpp"
 #include "vectorcache/error.hpp"
 #include "vectorcache/index/rp_buckets.hpp"
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/store.hpp"
-#include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/query/engine.hpp"
 #include "vectorcache/transform/normalize.hpp"
 #include "vectorcache/transform/srht.hpp"
@@ -23,14 +24,16 @@ class MockReader : public datasets::DatasetReader {
   MockReader(std::vector<std::vector<float>> vectors, std::size_t dim)
       : vectors_(std::move(vectors)), dim_(dim) {}
 
-  datasets::DatasetMeta meta() const override { return {dim_, vectors_.size(), "mock"}; }
+  datasets::DatasetMeta meta() const override {
+    return {dim_, vectors_.size(), "mock"};
+  }
 
   bool next_vector_into(std::span<float> out) override {
     if (index_ >= vectors_.size()) {
       return false;
     }
-    std::copy(vectors_[index_].begin(), vectors_[index_].end(), out.begin());
-    ++index_;
+    const auto& v = vectors_[index_++];
+    std::copy(v.begin(), v.end(), out.begin());
     return true;
   }
 
@@ -40,171 +43,187 @@ class MockReader : public datasets::DatasetReader {
   std::size_t index_ = 0;
 };
 
+float dot(std::span<const float> a, std::span<const float> b) {
+  double s = 0.0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    s += static_cast<double>(a[i]) * static_cast<double>(b[i]);
+  }
+  return static_cast<float>(s);
+}
+
+std::vector<float> unit_axis(std::size_t dim, std::size_t axis) {
+  std::vector<float> v(dim, 0.0f);
+  v[axis % dim] = 1.0f;
+  return v;
+}
+
 }  // namespace
 
-TEST(PairHashTest, FoldDeterministicAndCursorResets) {
-  index::PairHash hash(4, 123, 0.25f);
-  std::vector<float> x = {1.0f, 0.0f, 0.0f, 1.0f, 0.5f, -0.5f, 0.25f, 0.75f};
-  const float a = hash.fold(x);
-  const float b = hash.fold(x);
-  EXPECT_FLOAT_EQ(a, b);
+TEST(ClusterBucketsTest, InitDeterministic) {
+  index::ClusterCentroids a(8, 16, 42);
+  index::ClusterCentroids b(8, 16, 42);
+  index::ClusterCentroids c(8, 16, 43);
+  EXPECT_EQ(a.num_buckets(), 8u);
+  EXPECT_EQ(a.dim(), 16u);
+  for (std::size_t j = 0; j < 8; ++j) {
+    EXPECT_FLOAT_EQ(dot(a.centroid(j), b.centroid(j)), 1.0f);
+    EXPECT_NEAR(std::sqrt(dot(a.centroid(j), a.centroid(j))), 1.0f, 1e-5f);
+  }
+  EXPECT_LT(dot(a.centroid(0), c.centroid(0)), 0.999f);
 }
 
-TEST(PairHashTest, OddDimPassThrough) {
-  index::PairHash hash(1, 1, 0.1f);
-  std::vector<float> x = {0.0f, 0.0f, 0.42f};  // first pair → ~0, leftover 0.42
-  const float s = hash.fold(x);
-  EXPECT_TRUE(std::isfinite(s));
-  EXPECT_GE(s, -1.0f);
-  EXPECT_LE(s, 1.0f);
+TEST(ClusterBucketsTest, AssignAndUpdateMatchesBatchMean) {
+  const std::size_t dim = 8;
+  index::ClusterCentroids cc(2, dim, 7);
+
+  std::vector<float> x0 = unit_axis(dim, 0);
+  std::vector<float> x1 = unit_axis(dim, 0);
+  x1[0] = 0.8f;
+  x1[1] = 0.6f;
+
+  const std::uint64_t k0 = cc.assign_and_update(x0);
+  const std::uint64_t k1 = cc.assign_and_update(x1);
+  EXPECT_EQ(k0, k1);
+
+  const std::size_t j = static_cast<std::size_t>(k0);
+  EXPECT_EQ(cc.count(j), 2u);
+
+  std::vector<float> mean(dim, 0.0f);
+  for (std::size_t d = 0; d < dim; ++d) {
+    mean[d] = 0.5f * (x0[d] + x1[d]);
+  }
+  double energy = 0.0;
+  for (float v : mean) {
+    energy += static_cast<double>(v) * static_cast<double>(v);
+  }
+  const float inv = static_cast<float>(1.0 / std::sqrt(energy));
+  for (float& v : mean) {
+    v *= inv;
+  }
+  EXPECT_NEAR(dot(cc.centroid(j), mean), 1.0f, 1e-5f);
 }
 
-TEST(PairHashTest, FoldToBinUsesUniformMap) {
-  index::PairHash hash(2, 7, 0.25f);
-  std::vector<float> x = {1.0f, 0.0f, 0.0f, 1.0f};
-  const float s = std::clamp(hash.fold(x), -1.0f, 1.0f);
-  const float u = 0.5f * (s + 1.0f);
-  const float w = 0.25f;
-  const std::int32_t expected = static_cast<std::int32_t>(std::floor(u / w));
-  EXPECT_EQ(index::fold_to_bin(hash, x, w), expected);
+TEST(ClusterBucketsTest, RebalanceFixesStickyAssignment) {
+  const std::size_t dim = 4;
+  const std::size_t B = 2;
+  index::ClusterCentroids cc(B, dim, 99);
+
+  // Force both vectors into whatever buckets online assign gives, then shift
+  // membership via rebalance with vectors clearly on opposite axes.
+  std::vector<float> vectors;
+  auto e0 = unit_axis(dim, 0);
+  auto e1 = unit_axis(dim, 1);
+  vectors.insert(vectors.end(), e0.begin(), e0.end());
+  vectors.insert(vectors.end(), e1.begin(), e1.end());
+
+  std::vector<std::uint64_t> keys(2, 0);
+  // Pollute: assign both to same online path then rebalance.
+  (void)cc.assign_and_update(e0);
+  (void)cc.assign_and_update(e0);
+  cc.rebalance(vectors, keys);
+
+  EXPECT_NE(keys[0], keys[1]);
+  EXPECT_EQ(keys[0], cc.nearest(e0));
+  EXPECT_EQ(keys[1], cc.nearest(e1));
+  EXPECT_EQ(cc.count(static_cast<std::size_t>(keys[0])), 1u);
+  EXPECT_EQ(cc.count(static_cast<std::size_t>(keys[1])), 1u);
 }
 
-TEST(PairHashTest, RidgeFoldContinuousNearZeroPair) {
-  // Unit-normalize would send (ε,0) and (-ε,0) to opposite hemispheres; ridge keeps them close.
-  index::PairHash hash(1, 42, 1.0f);
-  const float eps = 1e-4f;
-  std::vector<float> pos = {eps, 0.0f};
-  std::vector<float> neg = {-eps, 0.0f};
-  const float s_pos = hash.fold(pos);
-  const float s_neg = hash.fold(neg);
-  EXPECT_NEAR(s_pos, 0.0f, 1e-3f);
-  EXPECT_NEAR(s_neg, 0.0f, 1e-3f);
-  EXPECT_LT(std::fabs(s_pos - s_neg), 1e-3f);
-}
+TEST(ClusterBucketsTest, ProbeOrdersByCentroidIp) {
+  const std::size_t dim = 4;
+  index::ClusterCentroids cc(4, dim, 11);
+  // Put one vector in each of two buckets by assigning distinct axes.
+  std::vector<std::uint64_t> keys;
+  for (std::size_t i = 0; i < 4; ++i) {
+    auto v = unit_axis(dim, i);
+    keys.push_back(cc.assign_and_update(v));
+  }
 
-TEST(PairHashTest, PackBinRoundTripSigned) {
-  EXPECT_EQ(static_cast<std::int32_t>(index::pack_bin(-3)), -3);
-  EXPECT_EQ(static_cast<std::int32_t>(index::pack_bin(0)), 0);
-  EXPECT_EQ(static_cast<std::int32_t>(index::pack_bin(4)), 4);
-}
+  std::vector<std::uint64_t> sorted = keys;
+  std::sort(sorted.begin(), sorted.end());
+  auto idx = index::BucketIndex::build(sorted, std::move(cc));
 
-TEST(PairHashTest, OneDProbeOrderedByAbsOffset) {
-  index::PairHash hash(1, 1, 0.1f);
-  const float w = 0.1f;
-  std::vector<std::uint64_t> sorted = {index::pack_bin(0), index::pack_bin(0), index::pack_bin(1),
-                                       index::pack_bin(2)};
-  auto idx = index::BucketIndex::build(sorted, std::move(hash), w);
-  EXPECT_EQ(idx.num_cells(), 3u);
-
+  auto q = unit_axis(dim, 0);
   std::size_t candidates = 0;
-  const auto ranges = idx.probe(1, 1, &candidates);
-  EXPECT_EQ(ranges.size(), 3u);
-  EXPECT_EQ(candidates, 4u);
+  const auto ranges = idx.probe(q, 2, &candidates);
+  EXPECT_FALSE(ranges.empty());
+  EXPECT_LE(ranges.size(), 2u);
+  EXPECT_GT(candidates, 0u);
 
-  EXPECT_THROW(index::validate_probe_radius(index::kMaxProbeCells), Error);
+  EXPECT_THROW(index::validate_probe_radius(0), Error);
+  EXPECT_THROW(index::validate_probe_radius(index::kMaxProbeCells + 1), Error);
 }
 
-TEST(PairHashTest, CsrRangesContiguous) {
-  index::PairHash hash(1, 1, 0.1f);
-  const float w = 0.5f;
-  std::vector<std::uint64_t> sorted = {index::pack_bin(0), index::pack_bin(0), index::pack_bin(1)};
-  auto idx = index::BucketIndex::build(sorted, std::move(hash), w);
-  EXPECT_EQ(idx.num_cells(), 2u);
+TEST(ClusterBucketsTest, CsrRangesContiguous) {
+  index::ClusterCentroids cc(3, 4, 1);
+  std::vector<std::uint64_t> keys = {0, 0, 1, 2, 2};
+  // Need matching centroid dim; build does not require counts.
+  auto idx = index::BucketIndex::build(keys, std::move(cc));
+  EXPECT_EQ(idx.num_cells(), 3u);
   EXPECT_EQ(idx.cell(0).start, 0u);
   EXPECT_EQ(idx.cell(0).length, 2u);
   EXPECT_EQ(idx.cell(1).start, 2u);
   EXPECT_EQ(idx.cell(1).length, 1u);
-  EXPECT_EQ(idx.find(index::pack_bin(0)).length, 2u);
-  EXPECT_EQ(idx.find(index::pack_bin(2)).length, 0u);
+  EXPECT_EQ(idx.find(1).length, 1u);
+  EXPECT_EQ(idx.find(99).length, 0u);
 }
 
-TEST(PairHashTest, FinalizeBuildsBuckets) {
-  const std::size_t dim = 4;
-  const std::size_t bits = 1;
-  const std::size_t block_dims = 1;
-  const std::size_t l0 = quantize::l0_words_per_vector(dim, bits, block_dims);
-  ingest::VectorStore store(l0, dim, dim, bits, block_dims);
-  std::vector<std::uint64_t> code(l0, 0);
-  store.push(0, code, 1.0f);
-  store.push(1, code, 1.0f);
-  store.push(2, code, 1.0f);
-
-  std::vector<std::uint64_t> keys = {index::pack_bin(5), index::pack_bin(1), index::pack_bin(5)};
-  index::PairHash hash(2, 99, index::default_fold_ridge(dim));
-  store.finalize_buckets(keys, std::move(hash), 0.1f);
-  ASSERT_TRUE(store.has_buckets());
-  EXPECT_EQ(store.buckets().num_cells(), 2u);
-  EXPECT_EQ(store.buckets().cell(0).length, 1u);  // key 1
-  EXPECT_EQ(store.buckets().cell(1).length, 2u);  // key 5
-  EXPECT_EQ(store.id_at(0), 1u);
-}
-
-TEST(PairHashTest, SelfHitWithProbeZero) {
+TEST(ClusterBucketsTest, FinalizeBuildsBuckets) {
   const std::size_t dim = 8;
+  const std::size_t words = 1;
+  ingest::VectorStore store(words, dim, dim, 1, 1);
+  std::vector<std::uint64_t> code(words, 0);
+  for (std::size_t i = 0; i < 5; ++i) {
+    store.push(i, code, 1.0f);
+  }
+  index::ClusterCentroids cc(4, dim, 99);
+  std::vector<std::uint64_t> keys = {2, 0, 2, 1, 0};
+  store.finalize_buckets(keys, std::move(cc));
+  EXPECT_TRUE(store.has_buckets());
+  EXPECT_EQ(store.buckets().num_cells(), 3u);
+  EXPECT_EQ(store.id_at(0), 1u);  // key 0 first after argsort
+}
+
+TEST(ClusterBucketsTest, SelfHitWithNprobe) {
+  const std::size_t dim = 32;
+  const std::size_t n = 32;
   std::vector<std::vector<float>> vectors;
-  for (int i = 0; i < 5; ++i) {
-    std::vector<float> v(dim, 0.0f);
-    v[static_cast<std::size_t>(i) % dim] = 3.0f + static_cast<float>(i);
-    v[(static_cast<std::size_t>(i) + 1) % dim] = 2.0f;
+  for (std::size_t i = 0; i < n; ++i) {
+    std::vector<float> v(dim);
+    for (std::size_t j = 0; j < dim; ++j) {
+      v[j] = static_cast<float>((i * 17 + j * 3) % 97) / 97.0f;
+    }
     vectors.push_back(std::move(v));
   }
+
   MockReader reader(vectors, dim);
   ingest::BucketParams bp;
-  bp.num_pair_dirs = 4;
-  bp.bin_width = 0.05f;
-  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42, 1, 1, bp);
-  ASSERT_EQ(ingest_engine.ingest(reader).vectors_ingested, 5u);
-  ASSERT_TRUE(ingest_engine.store().has_buckets());
+  bp.num_buckets = 8;
+  bp.rebalance_every = 0;
+  bp.bucket_seed = 7;
+  auto engine = ingest::IngestionEngine::with_rotation(dim, 42, 1, 1, bp);
+  ASSERT_EQ(engine.ingest(reader).vectors_ingested, n);
 
-  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
+  auto qe = query::QueryEngine::with_rotation(engine.store(), dim, 42);
   query::QueryParams params;
   params.k = 5;
-  params.probe_radius = 1;
-  const auto hits = query_engine.search(vectors[2], params);
+  params.probe_radius = 4;
+  const auto hits = qe.search(vectors[0], params);
   ASSERT_FALSE(hits.empty());
-  const bool found_self = std::any_of(hits.begin(), hits.end(), [](const query::QueryHit& h) {
-    return h.id == 2u;
-  });
-  EXPECT_TRUE(found_self);
+  EXPECT_EQ(hits.front().id, 0u);
 }
 
-TEST(PairHashTest, FarVectorExcludedWhenProbeTight) {
+TEST(ClusterBucketsTest, EmptyListsSkippedInProbe) {
   const std::size_t dim = 8;
-  std::vector<float> a(dim, 0.0f);
-  a[0] = 1.0f;
-  std::vector<float> b(dim, 0.0f);
-  b[dim - 1] = 1.0f;
-  std::vector<std::vector<float>> vectors = {a, b};
-  MockReader reader(vectors, dim);
+  index::ClusterCentroids cc(8, dim, 3);
+  // Only populate one bucket.
+  auto v = unit_axis(dim, 0);
+  const auto key = cc.assign_and_update(v);
+  std::vector<std::uint64_t> keys = {key};
+  auto idx = index::BucketIndex::build(keys, std::move(cc));
 
-  ingest::BucketParams bp;
-  bp.num_pair_dirs = 8;
-  bp.bin_width = 0.05f;
-  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 7, 1, 1, bp);
-  ASSERT_EQ(ingest_engine.ingest(reader).vectors_ingested, 2u);
-
-  // Fold must use post-SRHT coords to match ingest/query bins.
-  const auto& buckets = ingest_engine.store().buckets();
-  transform::SrhtRotation rotation(dim, 7);
-  std::vector<float> a_rot(rotation.srht_dim(), 0.0f);
-  std::copy(a.begin(), a.end(), a_rot.begin());
-  transform::l2_normalize_in_place(std::span<float>(a_rot.data(), dim));
-  rotation.apply_in_place(a_rot);
-  const std::int32_t bin_a =
-      index::fold_to_bin(buckets.hash(), a_rot, bp.bin_width);
-
-  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 7);
-  const auto prepared = query_engine.prepare(a);
-  EXPECT_EQ(prepared.query_bin, bin_a);
-
-  query::QueryParams params;
-  params.k = 2;
-  params.probe_radius = 0;
-  query::SearchStats stats;
-  const auto hits = query_engine.search(a, params, &stats);
-  ASSERT_FALSE(hits.empty());
-  EXPECT_EQ(hits[0].id, 0u);
-  if (stats.candidates == 1) {
-    EXPECT_EQ(hits.size(), 1u);
-  }
+  std::size_t candidates = 0;
+  const auto ranges = idx.probe(v, 8, &candidates);
+  EXPECT_EQ(ranges.size(), 1u);
+  EXPECT_EQ(candidates, 1u);
 }

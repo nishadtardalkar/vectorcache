@@ -164,11 +164,12 @@ TEST(EngineTest, IngestWithoutFinalizeThenFinalizeBuckets) {
   EXPECT_FALSE(work.has_buckets());
   EXPECT_EQ(work.size(), n);
 
-  index::PairHash hash(2, 123, index::default_fold_ridge(dim));
-  const std::int32_t zero_bin = 0;
-  const std::uint64_t key0 = index::pack_bin(zero_bin);
-  std::vector<std::uint64_t> keys(n, key0);
-  work.finalize_buckets(keys, std::move(hash), 0.5f);
+  index::ClusterCentroids centroids(4, work.srht_dim(), 123);
+  std::vector<std::uint64_t> keys(n, 0);
+  for (std::size_t i = 0; i < n; ++i) {
+    keys[i] = static_cast<std::uint64_t>(i % 4);
+  }
+  work.finalize_buckets(keys, std::move(centroids));
   EXPECT_TRUE(work.has_buckets());
   EXPECT_GE(work.buckets().num_cells(), 1u);
   EXPECT_EQ(work.size(), n);

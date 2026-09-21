@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -22,7 +23,7 @@ std::uint64_t resolve_bucket_seed(std::uint64_t bucket_seed, std::uint64_t rotat
     return bucket_seed;
   }
   if (has_rotation_seed) {
-    // SplitMix64-style mix so bucket directions differ from SRHT seed.
+    // SplitMix64-style mix so bucket seed differs from SRHT seed.
     std::uint64_t z = rotation_seed + 0x9e3779b97f4a7c15ULL;
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
@@ -46,15 +47,9 @@ IngestionEngine::IngestionEngine(VectorStore store, std::optional<transform::Srh
       codebook_(std::move(codebook)),
       bucket_params_(bucket_params),
       bucket_seed_(resolved_bucket_seed),
-      pair_hash_(bucket_params.num_pair_dirs, resolved_bucket_seed,
-                  bucket_params.fold_ridge > 0.0f ? bucket_params.fold_ridge
-                                                  : index::default_fold_ridge(srht_dim)) {
-  if (bucket_params.bin_width <= 0.0f || !std::isfinite(bucket_params.bin_width)) {
-    throw Error("BucketParams.bin_width must be finite and > 0");
-  }
-  if (bucket_params.fold_ridge != 0.0f &&
-      (!(bucket_params.fold_ridge > 0.0f) || !std::isfinite(bucket_params.fold_ridge))) {
-    throw Error("BucketParams.fold_ridge must be 0 (auto) or finite and > 0");
+      centroids_(bucket_params.num_buckets, srht_dim, resolved_bucket_seed) {
+  if (bucket_params.num_buckets == 0 || bucket_params.num_buckets > index::kMaxBuckets) {
+    throw Error("BucketParams.num_buckets must be in 1..kMaxBuckets");
   }
 }
 
@@ -85,6 +80,7 @@ void IngestionEngine::reserve_vectors(std::size_t count) {
   store_ = VectorStore::with_capacity(l0_words_per_vec_, input_dim_, srht_dim_, count,
                                       codebook_.bits(), codebook_.block_dims());
   ensure_batch_capacity(std::min(INGEST_BATCH_SIZE, std::max(count, std::size_t{1})));
+  rotated_all_.reserve(count * srht_dim_);
 }
 
 void IngestionEngine::ensure_batch_capacity(std::size_t batch_cap) {
@@ -99,7 +95,6 @@ void IngestionEngine::ensure_batch_capacity(std::size_t batch_cap) {
       work.l0.assign(l0_words_per_vec_, 0);
     }
     work.alpha = 1.0f;
-    work.cell_key = 0;
   }
 }
 
@@ -126,8 +121,6 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
   const std::size_t input_dim = input_dim_;
   const std::size_t srht_dim = srht_dim_;
   const quantize::LloydMaxCodebook* codebook = &codebook_;
-  const float bin_width = bucket_params_.bin_width;
-  const index::PairHash* pair_hash = &pair_hash_;
 
 #if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
 #pragma omp parallel for schedule(static)
@@ -137,10 +130,6 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       transform::l2_normalize_in_place(std::span<float>(work.buf.data(), input_dim));
       rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
     }
-    // Fold after SRHT (from_rotated buffers are already in rotated space).
-    const std::int32_t bin = index::fold_to_bin(
-        *pair_hash, std::span<const float>(work.buf.data(), srht_dim), bin_width);
-    work.cell_key = index::pack_bin(bin);
     quantize::quantize_blocks_to_nbit_into(work.buf, *codebook, work.l0);
     work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
@@ -151,21 +140,32 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       transform::l2_normalize_in_place(std::span<float>(work.buf.data(), input_dim));
       rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
     }
-    const std::int32_t bin = index::fold_to_bin(
-        *pair_hash, std::span<const float>(work.buf.data(), srht_dim), bin_width);
-    work.cell_key = index::pack_bin(bin);
     quantize::quantize_blocks_to_nbit_into(work.buf, *codebook, work.l0);
     work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
 #endif
 }
 
-void IngestionEngine::finalize_bucket_index(std::span<const std::uint64_t> all_keys) {
-  // Rebuild hash from the same seed/ridge so the store carries a matching PairHash.
-  const float ridge = bucket_params_.fold_ridge > 0.0f ? bucket_params_.fold_ridge
-                                                       : index::default_fold_ridge(srht_dim_);
-  index::PairHash hash(bucket_params_.num_pair_dirs, bucket_seed_, ridge);
-  store_.finalize_buckets(all_keys, std::move(hash), bucket_params_.bin_width);
+void IngestionEngine::maybe_rebalance(std::vector<std::uint64_t>& cell_keys, bool force) {
+  if (cell_keys.empty()) {
+    return;
+  }
+  const std::size_t n = cell_keys.size();
+  if (!force) {
+    const std::size_t every = bucket_params_.rebalance_every;
+    if (every == 0 || (n % every) != 0) {
+      return;
+    }
+  }
+  centroids_.rebalance(std::span<const float>(rotated_all_.data(), n * srht_dim_),
+                       std::span<std::uint64_t>(cell_keys.data(), n));
+}
+
+void IngestionEngine::finalize_bucket_index(std::vector<std::uint64_t>& cell_keys) {
+  maybe_rebalance(cell_keys, /*force=*/true);
+  store_.finalize_buckets(cell_keys, std::move(centroids_));
+  rotated_all_.clear();
+  rotated_all_.shrink_to_fit();
 }
 
 IngestReport IngestionEngine::ingest(datasets::DatasetReader& reader, bool finalize_buckets) {
@@ -183,7 +183,7 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
 
   std::uint64_t global_id = 0;
   std::vector<std::uint64_t> cell_keys;
-  if (finalize_buckets && meta_count > 0) {
+  if (meta_count > 0) {
     cell_keys.reserve(meta_count);
   }
 
@@ -196,15 +196,23 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
     process_batch(batch_len);
 
     for (std::size_t i = 0; i < batch_len; ++i) {
-      const auto& work = batch_work_[i];
+      auto& work = batch_work_[i];
       if (hook != nullptr) {
         hook->on_vector(global_id, work.buf);
       }
+
+      // Online cluster assign + retain post-SRHT float for rebalance.
+      const std::uint64_t cell_key = centroids_.assign_and_update(
+          std::span<const float>(work.buf.data(), srht_dim_));
+      const std::size_t off = rotated_all_.size();
+      rotated_all_.resize(off + srht_dim_);
+      std::memcpy(rotated_all_.data() + off, work.buf.data(), srht_dim_ * sizeof(float));
+      cell_keys.push_back(cell_key);
+
       store_.push(static_cast<std::size_t>(global_id), work.l0, work.alpha);
-      if (finalize_buckets) {
-        cell_keys.push_back(work.cell_key);
-      }
       ++global_id;
+
+      maybe_rebalance(cell_keys, /*force=*/false);
     }
   }
 

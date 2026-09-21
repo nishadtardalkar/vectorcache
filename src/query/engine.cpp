@@ -308,7 +308,6 @@ void prepare_query_into(const ingest::VectorStore& store,
   if (!store.has_buckets()) {
     throw Error("QueryEngine::prepare requires VectorStore::finalize_buckets");
   }
-  const index::BucketIndex& buckets = store.buckets();
 
   if (query_is_rotated) {
     if (query.size() != srht_dim) {
@@ -325,10 +324,6 @@ void prepare_query_into(const ingest::VectorStore& store,
   } else {
     throw Error("QueryEngine requires with_rotation() or from_rotated()");
   }
-  // Fold after SRHT (from_rotated queries are already in rotated space).
-  prepared.query_bin =
-      index::fold_to_bin(buckets.hash(), std::span<const float>(prepared.rotated.data(), srht_dim),
-                         buckets.bin_width());
 }
 
 }  // namespace
@@ -395,7 +390,8 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
 
   std::size_t candidates = 0;
   const std::vector<index::BucketRange> ranges =
-      buckets.probe(prepared.query_bin, params.probe_radius, &candidates);
+      buckets.probe(std::span<const float>(prepared.rotated.data(), store_.srht_dim()),
+                    params.probe_radius, &candidates);
   if (stats != nullptr) {
     stats->candidates = candidates;
     stats->cells_probed = ranges.size();

@@ -46,9 +46,9 @@ class VectorStore {
   /// Permute rows by `order` (must be a permutation of [0, size())).
   void permute(std::span<const std::size_t> order);
 
-  /// Argsort by cell keys, permute store, build contiguous CSR.
-  void finalize_buckets(std::span<const std::uint64_t> cell_keys, index::PairHash hash,
-                        float bin_width);
+  /// Argsort by cell keys, permute store, build contiguous CSR with final centroids.
+  void finalize_buckets(std::span<const std::uint64_t> cell_keys,
+                        index::ClusterCentroids centroids);
 
   bool has_buckets() const { return buckets_.has_value(); }
   const index::BucketIndex& buckets() const;

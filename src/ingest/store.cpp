@@ -124,8 +124,8 @@ void VectorStore::permute(std::span<const std::size_t> order) {
   buckets_.reset();
 }
 
-void VectorStore::finalize_buckets(std::span<const std::uint64_t> cell_keys, index::PairHash hash,
-                                   float bin_width) {
+void VectorStore::finalize_buckets(std::span<const std::uint64_t> cell_keys,
+                                   index::ClusterCentroids centroids) {
   const std::size_t n = ids_.size();
   if (cell_keys.size() != n) {
     throw Error("finalize_buckets: cell_keys size mismatch");
@@ -133,8 +133,11 @@ void VectorStore::finalize_buckets(std::span<const std::uint64_t> cell_keys, ind
   if (n == 0) {
     throw Error("finalize_buckets: empty store");
   }
-  if (hash.empty()) {
-    throw Error("finalize_buckets: empty PairHash");
+  if (centroids.empty()) {
+    throw Error("finalize_buckets: empty ClusterCentroids");
+  }
+  if (centroids.dim() != srht_dim_) {
+    throw Error("finalize_buckets: centroid dim mismatch");
   }
 
   std::vector<std::size_t> order(n);
@@ -152,7 +155,7 @@ void VectorStore::finalize_buckets(std::span<const std::uint64_t> cell_keys, ind
   }
 
   permute(order);
-  buckets_ = index::BucketIndex::build(sorted_keys, std::move(hash), bin_width);
+  buckets_ = index::BucketIndex::build(sorted_keys, std::move(centroids));
 }
 
 const index::BucketIndex& VectorStore::buckets() const {

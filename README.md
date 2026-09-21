@@ -54,7 +54,7 @@ make compute DATASET=openai-1536 BITS=2 RECALL=1
 make compute BENCH_EXTRA_ARGS="--limit 50000"
 ```
 
-`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` (default `DATASET=glove`; override with `DATASET=` / `NPY=`). Indexes live entirely in `VectorStore` (RAM); queries score probed RP-bucket ranges of packed TurboQuantMSE codes in memory.
+`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` (default `DATASET=glove`; override with `DATASET=` / `NPY=`). Indexes live entirely in `VectorStore` (RAM); queries score probed cluster-IVF ranges of packed TurboQuantMSE codes in memory.
 
 ## Build
 

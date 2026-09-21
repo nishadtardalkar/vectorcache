@@ -17,12 +17,12 @@ LIMIT         ?= 100000
 SEED          ?=
 BITS          ?= 1
 BLOCK_DIMS    ?= 1
-NUM_PAIR_DIRS ?= 8
-BIN_WIDTH     ?= 0.1
-PROBE_RADIUS  ?= 1
+NUM_BUCKETS   ?= 256
+REBALANCE_EVERY ?= 10000
+PROBE_RADIUS  ?= 8
 BUCKET_SEED   ?=
-NUM_PAIR_DIRS_LIST ?=
-BIN_WIDTHS    ?=
+NUM_BUCKETS_LIST ?=
+REBALANCE_EVERY_LIST ?=
 PROBE_RADII   ?=
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
@@ -78,8 +78,8 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_SPLIT,query-split) \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
-	$(call opt_arg,NUM_PAIR_DIRS,num-pair-dirs) \
-	$(call opt_arg,BIN_WIDTH,bin-width) \
+	$(call opt_arg,NUM_BUCKETS,num-buckets) \
+	$(call opt_arg,REBALANCE_EVERY,rebalance-every) \
 	$(call opt_arg,PROBE_RADIUS,probe-radius) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
 	$(call flag_arg,CALIBRATE,calibrate) \
@@ -91,8 +91,8 @@ QUERY_TUNE_ARGS = \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
-	$(call opt_arg,NUM_PAIR_DIRS_LIST,num-pair-dirs-list) \
-	$(call opt_arg,BIN_WIDTHS,bin-widths) \
+	$(call opt_arg,NUM_BUCKETS_LIST,num-buckets-list) \
+	$(call opt_arg,REBALANCE_EVERY_LIST,rebalance-every-list) \
 	$(call opt_arg,PROBE_RADII,probe-radii)
 
 .PHONY: help login compute tune clean
@@ -121,13 +121,13 @@ help:
 	@echo "  SEED            --seed"
 	@echo "  BITS            --bits (default $(BITS); TurboQuantMSE bits/block, 1-8)"
 	@echo "  BLOCK_DIMS      --block-dims (default $(BLOCK_DIMS); dims per codebook block, 1-16)"
-	@echo "  NUM_PAIR_DIRS   --num-pair-dirs (default $(NUM_PAIR_DIRS); pair-hash 2D dirs L; query-bench)"
-	@echo "  BIN_WIDTH       --bin-width (default $(BIN_WIDTH); bin width w on arcsine-CDF u; query-bench)"
-	@echo "  PROBE_RADIUS    --probe-radius (default $(PROBE_RADIUS); 1D multi-probe P; query-bench)"
-	@echo "  BUCKET_SEED     --bucket-seed (pair-hash seed; query-bench / query-bench-tune)"
-	@echo "  NUM_PAIR_DIRS_LIST --num-pair-dirs-list (comma L values; query-bench-tune)"
-	@echo "  BIN_WIDTHS      --bin-widths (comma w values; query-bench-tune)"
-	@echo "  PROBE_RADII     --probe-radii (comma P values; query-bench-tune)"
+	@echo "  NUM_BUCKETS     --num-buckets (default $(NUM_BUCKETS); cluster IVF B; query-bench)"
+	@echo "  REBALANCE_EVERY --rebalance-every (default $(REBALANCE_EVERY); 0=finalize only; query-bench)"
+	@echo "  PROBE_RADIUS    --probe-radius (default $(PROBE_RADIUS); nprobe top lists; query-bench)"
+	@echo "  BUCKET_SEED     --bucket-seed (cluster centroid seed; query-bench / query-bench-tune)"
+	@echo "  NUM_BUCKETS_LIST --num-buckets-list (comma B values; query-bench-tune)"
+	@echo "  REBALANCE_EVERY_LIST --rebalance-every-list (comma periods; query-bench-tune)"
+	@echo "  PROBE_RADII     --probe-radii (comma nprobe values; query-bench-tune)"
 	@echo "  QUERY_SPLIT     --query-split (query-bench / query-bench-tune)"
 	@echo "  QUERY_LIMIT     --query-limit (query-bench / query-bench-tune)"
 	@echo "  K               --k (default $(K); query-bench / query-bench-tune)"
