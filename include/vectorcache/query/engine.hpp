@@ -33,7 +33,7 @@ struct SearchStats {
 
 struct PreparedQuery {
   AlignedVector<float> rotated;
-  /// Pair-hash bin computed on L2-normalized coords before SRHT.
+  /// Pair-hash bin computed on post-SRHT coords (ridge fold + uniform bins).
   std::int32_t query_bin = 0;
 };
 

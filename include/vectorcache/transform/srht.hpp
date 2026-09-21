@@ -18,9 +18,8 @@ class SrhtRotation {
  public:
   SrhtRotation(std::size_t original_dim, std::uint64_t seed);
 
-  /// Rotation length (= original_dim). Alias kept for call-site compatibility.
+  /// Rotation length (= original_dim).
   std::size_t srht_dim() const { return dim_; }
-  std::size_t padded_dim() const { return dim_; }
   std::size_t block_size() const { return block_; }
 
   /// Copy vector and apply rotation into out (both length dim).

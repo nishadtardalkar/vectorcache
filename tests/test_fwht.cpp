@@ -8,14 +8,6 @@
 
 using namespace vectorcache::transform;
 
-TEST(FwhtTest, PaddedDimValues) {
-  EXPECT_EQ(padded_dim(200), 256u);
-  EXPECT_EQ(padded_dim(1536), 2048u);
-  EXPECT_EQ(padded_dim(3072), 4096u);
-  EXPECT_EQ(padded_dim(1), 1u);
-  EXPECT_EQ(padded_dim(4), 4u);
-}
-
 TEST(FwhtTest, OrthonormalSingleImpulse) {
   std::vector<float> buf = {1.0f, 0.0f, 0.0f, 0.0f};
   fwht_orthonormal_in_place(buf);

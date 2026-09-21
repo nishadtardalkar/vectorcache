@@ -22,13 +22,7 @@ class QueryLut {
   bool empty() const { return tables_.empty() && delta_.empty(); }
   std::size_t num_groups() const { return num_groups_; }
   std::size_t bits() const { return bits_; }
-  /// Codes packed into each LUT byte-group (8 / bits).
-  std::size_t codes_per_group() const { return codes_per_group_; }
-  /// Alias used by older call sites (codes_per_group when block_dims==1).
-  std::size_t dims_per_group() const { return codes_per_group_; }
   std::size_t bytes_per_vector() const { return num_groups_; }
-  std::size_t dim() const { return dim_; }
-  std::size_t block_dims() const { return block_dims_; }
   std::size_t num_codes() const { return num_codes_; }
 
   /// Flat layout: table for group g starts at tables_[g * kEntries].
@@ -44,20 +38,13 @@ class QueryLut {
     delta_.clear();
     num_groups_ = 0;
     bits_ = 0;
-    codes_per_group_ = 0;
-    dim_ = 0;
-    block_dims_ = 1;
     num_codes_ = 0;
     bit1_base_ = 0.0f;
   }
 
-  void resize(std::size_t num_groups, std::size_t bits, std::size_t codes_per_group, std::size_t dim,
-              std::size_t block_dims, std::size_t num_codes) {
+  void resize(std::size_t num_groups, std::size_t bits, std::size_t num_codes) {
     num_groups_ = num_groups;
     bits_ = bits;
-    codes_per_group_ = codes_per_group;
-    dim_ = dim;
-    block_dims_ = block_dims;
     num_codes_ = num_codes;
     const std::size_t need = num_groups * kEntries;
     if (tables_.size() != need) {
@@ -77,9 +64,6 @@ class QueryLut {
   AlignedVector<float> delta_;
   std::size_t num_groups_ = 0;
   std::size_t bits_ = 0;
-  std::size_t codes_per_group_ = 0;
-  std::size_t dim_ = 0;
-  std::size_t block_dims_ = 1;
   std::size_t num_codes_ = 0;
   float bit1_base_ = 0.0f;
 };

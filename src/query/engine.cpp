@@ -315,23 +315,20 @@ void prepare_query_into(const ingest::VectorStore& store,
       throw Error("rotated query dimension mismatch");
     }
     std::memcpy(prepared.rotated.data(), query.data(), srht_dim * sizeof(float));
-    // from_rotated: fold on the provided buffer as-is.
-    prepared.query_bin =
-        index::fold_to_bin(buckets.hash(), std::span<const float>(prepared.rotated.data(), input_dim),
-                           buckets.bin_width());
   } else if (rotation.has_value()) {
     if (query.size() != input_dim) {
       throw Error("query dimension mismatch");
     }
     std::memcpy(prepared.rotated.data(), query.data(), input_dim * sizeof(float));
     transform::l2_normalize_in_place(std::span<float>(prepared.rotated.data(), input_dim));
-    prepared.query_bin =
-        index::fold_to_bin(buckets.hash(), std::span<const float>(prepared.rotated.data(), input_dim),
-                           buckets.bin_width());
     rotation->apply_in_place(std::span<float>(prepared.rotated.data(), srht_dim));
   } else {
     throw Error("QueryEngine requires with_rotation() or from_rotated()");
   }
+  // Fold after SRHT (from_rotated queries are already in rotated space).
+  prepared.query_bin =
+      index::fold_to_bin(buckets.hash(), std::span<const float>(prepared.rotated.data(), srht_dim),
+                         buckets.bin_width());
 }
 
 }  // namespace

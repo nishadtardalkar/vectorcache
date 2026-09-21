@@ -6,9 +6,6 @@
 
 namespace vectorcache::transform {
 
-/// Next power of two >= dim (minimum 1 for dim > 0).
-std::size_t padded_dim(std::size_t dim);
-
 /// In-place unnormalized Walsh-Hadamard butterfly transform.
 /// buf.size() must be a power of two.
 void fwht_in_place(std::span<float> buf);

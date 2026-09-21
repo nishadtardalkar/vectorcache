@@ -111,7 +111,7 @@ help:
 	@echo "  BUILD_DIR=$(BUILD_DIR)  BUILD_TYPE=$(BUILD_TYPE)  JOBS=$(JOBS)"
 	@echo "  DATA_DIR=$(DATA_DIR)  DATASETS=$(DATASETS)  FORCE=$(FORCE)"
 	@echo "  CMAKE_OPTS=$(CMAKE_OPTS)"
-	@echo "  VECTORCACHE_SRHT_ROUNDS (cmake cache, default 1): set to 2 or 3 for multi-round SRHT"
+	@echo "  VECTORCACHE_SRHT_ROUNDS (cmake cache, default 2): set to 1 or 3 for multi-round SRHT"
 	@echo ""
 	@echo "Bench variables (map to ingest-bench / query-bench CLI):"
 	@echo "  DATASET / NPY   --dataset or --npy (default DATASET=$(DATASET); pass NPY= to use a file)"

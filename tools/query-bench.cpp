@@ -79,11 +79,13 @@ vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::Dataset
                                                   std::size_t dim, std::uint64_t seed,
                                                   std::size_t limit, std::size_t bits,
                                                   std::size_t block_dims, std::size_t num_pair_dirs,
-                                                  float bin_width, std::uint64_t bucket_seed) {
+                                                  float bin_width, float fold_ridge,
+                                                  std::uint64_t bucket_seed) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
   vectorcache::ingest::BucketParams buckets;
   buckets.num_pair_dirs = num_pair_dirs;
   buckets.bin_width = bin_width;
+  buckets.fold_ridge = fold_ridge;
   buckets.bucket_seed = bucket_seed;
   auto engine =
       vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits, block_dims, buckets);
@@ -499,6 +501,7 @@ int main(int argc, char** argv) {
   std::size_t block_dims = 1;
   std::size_t num_pair_dirs = 8;
   float bin_width = 0.1f;
+  float fold_ridge = 0.0f;
   std::size_t probe_radius = 1;
   std::uint64_t bucket_seed = 0;
   bool calibrate = false;
@@ -517,10 +520,13 @@ int main(int argc, char** argv) {
   app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
   app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
   app.add_option("--num-pair-dirs", num_pair_dirs, "Pair-hash random 2D directions L (1-64)");
-  app.add_option("--bin-width", bin_width, "Pair-hash bin width w on arcsine-CDF u in [0,1]");
+  app.add_option("--bin-width", bin_width,
+                 "Pair-hash bin width w on uniform u=(s+1)/2 in [0,1]");
+  app.add_option("--fold-ridge", fold_ridge, "Pair-hash ridge δ (0 = auto 1/srht_dim)");
   app.add_option("--probe-radius", probe_radius, "1D multi-probe radius P");
   app.add_option("--bucket-seed", bucket_seed, "Pair-hash seed (0 = derive from --seed)");
-  app.add_flag("--calibrate", calibrate, "Print L0 probe stats for the first query");
+  app.add_flag("--calibrate", calibrate,
+               "Print rotated_dim / bits / hit count for the first query");
   app.add_flag("--recall", recall,
                "Measure Recall@1@k (exact NN in approx top-k; TurboVec-compatible) and "
                "set-overlap Recall@k vs exact cosine on original full-dim vectors");
@@ -538,6 +544,9 @@ int main(int argc, char** argv) {
     }
     if (!(bin_width > 0.0f)) {
       throw vectorcache::Error("bin-width must be > 0");
+    }
+    if (fold_ridge != 0.0f && (!(fold_ridge > 0.0f) || !std::isfinite(fold_ridge))) {
+      throw vectorcache::Error("fold-ridge must be 0 (auto) or finite and > 0");
     }
     vectorcache::index::validate_probe_radius(probe_radius);
 
@@ -567,7 +576,7 @@ int main(int argc, char** argv) {
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto ingest_engine =
         ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims, num_pair_dirs,
-                     bin_width, bucket_seed);
+                     bin_width, fold_ridge, bucket_seed);
     {
       const auto& store = ingest_engine.store();
       std::cout << "  stored_vectors=" << store.size()
@@ -689,10 +698,9 @@ int main(int argc, char** argv) {
       } else {
         std::cout << "Computing exact top-" << k
                   << " for recall (original dim; may take several minutes)...\n";
-        auto [corpus_reader, corpus_label] = open_reader(npy_path, dataset, data_dir, split);
-        (void)corpus_label;
+        auto corpus_opened = open_reader(npy_path, dataset, data_dir, split);
         const std::vector<float> corpus =
-            load_normalized_corpus(*corpus_reader, meta.dim, actual_index);
+            load_normalized_corpus(*corpus_opened.first, meta.dim, actual_index);
 
         exact_ids_per_query.reserve(queries.size());
         std::vector<float> q_norm(meta.dim);

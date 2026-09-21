@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <numbers>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -12,6 +11,8 @@
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/query/engine.hpp"
+#include "vectorcache/transform/normalize.hpp"
+#include "vectorcache/transform/srht.hpp"
 
 using namespace vectorcache;
 
@@ -41,18 +42,8 @@ class MockReader : public datasets::DatasetReader {
 
 }  // namespace
 
-TEST(PairHashTest, ArcsineCdfEndpointsAndMid) {
-  EXPECT_NEAR(index::arcsine_cdf(-1.0f), 0.0f, 1e-6f);
-  EXPECT_NEAR(index::arcsine_cdf(1.0f), 1.0f, 1e-6f);
-  EXPECT_NEAR(index::arcsine_cdf(0.0f), 0.5f, 1e-6f);
-  const float s = 0.5f;
-  const float expected =
-      0.5f + std::asin(s) / static_cast<float>(std::numbers::pi);
-  EXPECT_NEAR(index::arcsine_cdf(s), expected, 1e-6f);
-}
-
 TEST(PairHashTest, FoldDeterministicAndCursorResets) {
-  index::PairHash hash(4, 123);
+  index::PairHash hash(4, 123, 0.25f);
   std::vector<float> x = {1.0f, 0.0f, 0.0f, 1.0f, 0.5f, -0.5f, 0.25f, 0.75f};
   const float a = hash.fold(x);
   const float b = hash.fold(x);
@@ -60,24 +51,35 @@ TEST(PairHashTest, FoldDeterministicAndCursorResets) {
 }
 
 TEST(PairHashTest, OddDimPassThrough) {
-  // L=1 with dir (forced via seed); odd last coord should survive first level.
-  index::PairHash hash(1, 1);
-  std::vector<float> x = {0.0f, 0.0f, 0.42f};  // first pair → 0, leftover 0.42
-  // With zero pair → 0, then fold [0, 0.42] → normalize and dot.
+  index::PairHash hash(1, 1, 0.1f);
+  std::vector<float> x = {0.0f, 0.0f, 0.42f};  // first pair → ~0, leftover 0.42
   const float s = hash.fold(x);
   EXPECT_TRUE(std::isfinite(s));
   EXPECT_GE(s, -1.0f);
   EXPECT_LE(s, 1.0f);
 }
 
-TEST(PairHashTest, FoldToBinUsesArcsine) {
-  index::PairHash hash(2, 7);
+TEST(PairHashTest, FoldToBinUsesUniformMap) {
+  index::PairHash hash(2, 7, 0.25f);
   std::vector<float> x = {1.0f, 0.0f, 0.0f, 1.0f};
-  const float s = hash.fold(x);
-  const float u = index::arcsine_cdf(s);
+  const float s = std::clamp(hash.fold(x), -1.0f, 1.0f);
+  const float u = 0.5f * (s + 1.0f);
   const float w = 0.25f;
   const std::int32_t expected = static_cast<std::int32_t>(std::floor(u / w));
   EXPECT_EQ(index::fold_to_bin(hash, x, w), expected);
+}
+
+TEST(PairHashTest, RidgeFoldContinuousNearZeroPair) {
+  // Unit-normalize would send (ε,0) and (-ε,0) to opposite hemispheres; ridge keeps them close.
+  index::PairHash hash(1, 42, 1.0f);
+  const float eps = 1e-4f;
+  std::vector<float> pos = {eps, 0.0f};
+  std::vector<float> neg = {-eps, 0.0f};
+  const float s_pos = hash.fold(pos);
+  const float s_neg = hash.fold(neg);
+  EXPECT_NEAR(s_pos, 0.0f, 1e-3f);
+  EXPECT_NEAR(s_neg, 0.0f, 1e-3f);
+  EXPECT_LT(std::fabs(s_pos - s_neg), 1e-3f);
 }
 
 TEST(PairHashTest, PackBinRoundTripSigned) {
@@ -87,9 +89,8 @@ TEST(PairHashTest, PackBinRoundTripSigned) {
 }
 
 TEST(PairHashTest, OneDProbeOrderedByAbsOffset) {
-  index::PairHash hash(1, 1);
+  index::PairHash hash(1, 1, 0.1f);
   const float w = 0.1f;
-  // Keys for bins 0,1,2 (as packed uint64).
   std::vector<std::uint64_t> sorted = {index::pack_bin(0), index::pack_bin(0), index::pack_bin(1),
                                        index::pack_bin(2)};
   auto idx = index::BucketIndex::build(sorted, std::move(hash), w);
@@ -97,7 +98,6 @@ TEST(PairHashTest, OneDProbeOrderedByAbsOffset) {
 
   std::size_t candidates = 0;
   const auto ranges = idx.probe(1, 1, &candidates);
-  // Bins 0,1,2 all nonempty near query bin 1 with P=1.
   EXPECT_EQ(ranges.size(), 3u);
   EXPECT_EQ(candidates, 4u);
 
@@ -105,7 +105,7 @@ TEST(PairHashTest, OneDProbeOrderedByAbsOffset) {
 }
 
 TEST(PairHashTest, CsrRangesContiguous) {
-  index::PairHash hash(1, 1);
+  index::PairHash hash(1, 1, 0.1f);
   const float w = 0.5f;
   std::vector<std::uint64_t> sorted = {index::pack_bin(0), index::pack_bin(0), index::pack_bin(1)};
   auto idx = index::BucketIndex::build(sorted, std::move(hash), w);
@@ -130,7 +130,7 @@ TEST(PairHashTest, FinalizeBuildsBuckets) {
   store.push(2, code, 1.0f);
 
   std::vector<std::uint64_t> keys = {index::pack_bin(5), index::pack_bin(1), index::pack_bin(5)};
-  index::PairHash hash(2, 99);
+  index::PairHash hash(2, 99, index::default_fold_ridge(dim));
   store.finalize_buckets(keys, std::move(hash), 0.1f);
   ASSERT_TRUE(store.has_buckets());
   EXPECT_EQ(store.buckets().num_cells(), 2u);
@@ -183,16 +183,20 @@ TEST(PairHashTest, FarVectorExcludedWhenProbeTight) {
   auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 7, 1, 1, bp);
   ASSERT_EQ(ingest_engine.ingest(reader).vectors_ingested, 2u);
 
-  // If they land in different bins, P=0 should exclude the other.
+  // Fold must use post-SRHT coords to match ingest/query bins.
   const auto& buckets = ingest_engine.store().buckets();
-  const std::int32_t bin_a = index::fold_to_bin(buckets.hash(), a, bp.bin_width);
-  // Need normalized a for fold match — ingest normalizes. Replicate:
-  std::vector<float> a_n = a;
-  // a is already unit along e0.
-  const std::int32_t bin_a2 = index::fold_to_bin(buckets.hash(), a_n, bp.bin_width);
-  EXPECT_EQ(bin_a, bin_a2);
+  transform::SrhtRotation rotation(dim, 7);
+  std::vector<float> a_rot(rotation.srht_dim(), 0.0f);
+  std::copy(a.begin(), a.end(), a_rot.begin());
+  transform::l2_normalize_in_place(std::span<float>(a_rot.data(), dim));
+  rotation.apply_in_place(a_rot);
+  const std::int32_t bin_a =
+      index::fold_to_bin(buckets.hash(), a_rot, bp.bin_width);
 
   auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 7);
+  const auto prepared = query_engine.prepare(a);
+  EXPECT_EQ(prepared.query_bin, bin_a);
+
   query::QueryParams params;
   params.k = 2;
   params.probe_radius = 0;
@@ -200,7 +204,6 @@ TEST(PairHashTest, FarVectorExcludedWhenProbeTight) {
   const auto hits = query_engine.search(a, params, &stats);
   ASSERT_FALSE(hits.empty());
   EXPECT_EQ(hits[0].id, 0u);
-  // With P=0 only same cell; if bins differ, candidates == 1.
   if (stats.candidates == 1) {
     EXPECT_EQ(hits.size(), 1u);
   }

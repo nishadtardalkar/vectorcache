@@ -25,6 +25,8 @@ struct IngestReport {
 struct BucketParams {
   std::size_t num_pair_dirs = 8;
   float bin_width = 0.1f;
+  /// Ridge δ for pair-hash fold; 0 => auto 1/srht_dim.
+  float fold_ridge = 0.0f;
   std::uint64_t bucket_seed = 0;  // 0 => derive from rotation seed when available
 };
 
@@ -47,8 +49,6 @@ class IngestionEngine {
   const quantize::LloydMaxCodebook& codebook() const { return codebook_; }
   std::size_t bits_per_dim() const { return codebook_.bits(); }
   std::size_t block_dims() const { return codebook_.block_dims(); }
-  const BucketParams& bucket_params() const { return bucket_params_; }
-  const index::PairHash& pair_hash() const { return pair_hash_; }
 
  private:
   struct VectorWork {

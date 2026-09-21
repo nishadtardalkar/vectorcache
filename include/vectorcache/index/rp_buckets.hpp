@@ -12,30 +12,33 @@ namespace vectorcache::index {
 inline constexpr std::size_t kMaxPairDirs = 64;
 inline constexpr std::size_t kMaxProbeCells = 4096;
 
+/// Default ridge δ = 1/dim for post-SRHT fold.
+inline float default_fold_ridge(std::size_t dim) {
+  return 1.0f / static_cast<float>(dim > 0 ? dim : 1);
+}
+
 /// Cyclic list of L random unit vectors in R^2 for recursive pairwise folding.
 class PairHash {
  public:
   PairHash() = default;
-  PairHash(std::size_t num_pair_dirs, std::uint64_t seed);
+  /// `ridge_delta` must be finite and > 0 (used as δ in ⟨(a,b),r⟩ / √(a²+b²+δ)).
+  PairHash(std::size_t num_pair_dirs, std::uint64_t seed, float ridge_delta);
 
   std::size_t num_pair_dirs() const { return num_pair_dirs_; }
+  float ridge_delta() const { return ridge_delta_; }
   bool empty() const { return num_pair_dirs_ == 0; }
 
   /// Recursive pairwise reduce to one scalar in [-1, 1]. Cursor starts at 0 each call.
   float fold(std::span<const float> x) const;
 
-  std::span<const float> dir(std::size_t i) const;
-
  private:
   std::size_t num_pair_dirs_ = 0;
+  float ridge_delta_ = 0.0f;
   /// Packed (r0, r1) pairs, length 2 * num_pair_dirs_.
   AlignedVector<float> dirs_;
 };
 
-/// Arcsine CDF: u = clamp(1/2 + asin(s)/π, 0, 1). Maps U-shaped s on [-1,1] toward Uniform[0,1].
-float arcsine_cdf(float s);
-
-/// fold → arcsine_cdf → floor(u / bin_width).
+/// fold → u = (clamp(s)+1)/2 → floor(u / bin_width). Uniform bins on s ∈ [-1,1].
 std::int32_t fold_to_bin(const PairHash& hash, std::span<const float> x, float bin_width);
 
 /// Pack a signed 1D bin into a cell key (two's-complement cast).

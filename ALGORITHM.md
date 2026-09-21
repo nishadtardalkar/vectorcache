@@ -1,13 +1,13 @@
 # VectorCache Algorithm
 
-Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation**, **TurboQuant** block codes (`n` bits per block of `d` dimensions; default `d=1`), and **recursive pairwise pre-rotation bucket prune** before quantized rescoring.
+Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation**, **TurboQuant** block codes (`n` bits per block of `d` dimensions; default `d=1`), and **recursive pairwise post-SRHT bucket prune** before quantized rescoring.
 
 1. L2-normalize on `dim`
-2. **Pair-hash buckets (prune):** with a seeded list of `L` random unit vectors in `R²`, recursively fold consecutive normalized 2D pairs by cycling through the list (cursor starts at 0 each vector, wraps with `% L`; odd leftover pass through). Map the final scalar `s ∈ [-1,1]` through the arcsine CDF `u = clamp(½ + asin(s)/π, 0, 1)`, then `bin = ⌊u / w⌋`. Argsort the store by cell key and build a CSR so each cell is a contiguous row range.
-3. Apply `K` rounds of (global Fisher–Yates permutation → ±1 signs → normalized block Walsh–Hadamard); `K` is compile-time (`VECTORCACHE_SRHT_ROUNDS`, default **2**). Block size is the largest power-of-two divisor of `dim` (no zero-pad).
+2. Apply `K` rounds of (global Fisher–Yates permutation → ±1 signs → normalized block Walsh–Hadamard); `K` is compile-time (`VECTORCACHE_SRHT_ROUNDS`, default **2**). Block size is the largest power-of-two divisor of `dim` (no zero-pad).
+3. **Pair-hash buckets (prune)** on the rotated vector: with a seeded list of `L` random unit vectors in `R²`, recursively fold consecutive 2D pairs by cycling through the list (cursor starts at 0 each vector, wraps with `% L`; odd leftover pass through). Each pair uses **ridge** projection `out = ⟨(a,b), r⟩ / √(a²+b²+δ)` with default `δ = 1/srht_dim` (`BucketParams.fold_ridge`; `0` ⇒ auto). Map the final scalar `s ∈ [-1,1]` uniformly: `u = (s+1)/2`, then `bin = ⌊u / w⌋`. Argsort the store by cell key and build a CSR so each cell is a contiguous row range.
 4. Lloyd-Max / block-VQ: each contiguous block of `d` rotated coords → one of `2^n` centroids in `R^d` for **Beta((dim−1)/2, (dim−1)/2)** (product measure when `d>1`); pack `n`-bit indices (`M = dim/d` codes)
 5. Store per-vector IP scale `α = 1 / ⟨u, x̂⟩` (unit `u`, reconstruction `x̂`) for RaBitQ-style length renormalization
-6. Query: same prep (fold+bin on normalized coords **before** SRHT; keep query float in rotated space for scoring), **multi-probe** cells with `|offset| ≤ P` (ordered by `|offset|`), score with asymmetric IP × `α`, take top-k
+6. Query: same prep (SRHT then fold+bin on rotated coords; keep query float in rotated space for scoring), **multi-probe** cells with `|offset| ≤ P` (ordered by `|offset|`), score with asymmetric IP × `α`, take top-k
 
 ```
  INGEST                              QUERY
@@ -17,14 +17,15 @@ Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation**, 
         ▼                                   ▼
  L2 normalize                        L2 normalize
         │                                   │
-        ├─ pair-hash → arcsine → bin        ├─ pair-hash → arcsine → bin
+        ▼                                   ▼
+ perm+signs+block-WH (×K)            perm+signs+block-WH (×K)
+        │                                   │
+        ├─ pair-hash (ridge) → uniform bin  ├─ pair-hash (ridge) → uniform bin
         │                                   ▼
         ▼                            multi-probe (|o| ≤ P)
- perm+signs+block-WH (×K)                   │
-        │                                   ▼
- Lloyd-Max n bits / d dims           score × α → top-k
- + store α = 1/⟨u,x̂⟩
-        │
+ Lloyd-Max n bits / d dims                  │
+ + store α = 1/⟨u,x̂⟩                        ▼
+        │                            score × α → top-k
  argsort by cell key + CSR
 ```
 
@@ -55,7 +56,7 @@ With `VECTORCACHE_OPENMP`, search parallelizes across probed cells when there ar
 | `k` | 10 | top-k |
 | `probe_radius` | 1 | 1D multi-probe radius `P` in bin units |
 
-Index-time pair-hash knobs (`BucketParams` / CLI): `num_pair_dirs` (`L`), `bin_width` (`w` on arcsine-mapped `u ∈ [0,1]`), `bucket_seed`. Probe count `2P+1` must be `≤ 4096`.
+Index-time pair-hash knobs (`BucketParams` / CLI): `num_pair_dirs` (`L`), `bin_width` (`w` on uniform `u=(s+1)/2 ∈ [0,1]`), `fold_ridge` (`δ`; `0` ⇒ `1/srht_dim`), `bucket_seed`. Probe count `2P+1` must be `≤ 4096`.
 
 Runtime bits-per-block (`bits_per_dim` field name kept for compatibility) and `block_dims` are set at ingest (`IngestionEngine` / `--bits` / `--block-dims` / `BITS` / `BLOCK_DIMS`) and stored on `VectorStore` (`bits` 1–8, `block_dims` 1–16, `srht_dim % block_dims == 0`).
 

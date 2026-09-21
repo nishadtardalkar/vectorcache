@@ -20,9 +20,7 @@
 #include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/ingest/timing.hpp"
 #include "vectorcache/quantize/quantize.hpp"
-#include "vectorcache/transform/fwht.hpp"
-#include "vectorcache/transform/normalize.hpp"
-#include "vectorcache/transform/srht.hpp"
+#include "vectorcache/transform/srht_config.hpp"
 
 namespace {
 
@@ -106,64 +104,6 @@ class LimitedReader : public vectorcache::datasets::DatasetReader {
   std::vector<double>* pre_variances_;
 };
 
-class MultiRoundReader : public vectorcache::datasets::DatasetReader {
- public:
-  MultiRoundReader(vectorcache::datasets::DatasetReader& inner, std::size_t remaining,
-                   std::vector<double>* pre_variances, std::size_t rounds, std::uint64_t seed,
-                   std::vector<std::vector<double>>* round_variances)
-      : inner_(inner),
-        remaining_(remaining),
-        pre_variances_(pre_variances),
-        rounds_(rounds),
-        seed_(seed),
-        round_variances_(round_variances) {
-    raw_.resize(inner.meta().dim);
-    output_.resize(inner.meta().dim);
-  }
-
-  vectorcache::datasets::DatasetMeta meta() const override { return inner_.meta(); }
-
-  bool next_vector_into(std::span<float> out) override {
-    if (remaining_ == 0) return false;
-    if (!inner_.next_vector_into(raw_)) {
-      throw vectorcache::Error("reader exhausted before reaching ingest limit");
-    }
-    if (pre_variances_ != nullptr) {
-      pre_variances_->push_back(variance_across_dims(raw_));
-    }
-    --remaining_;
-
-    output_ = raw_;
-    vectorcache::transform::l2_normalize_in_place(output_);
-    for (std::size_t round = 0; round < rounds_; ++round) {
-      vectorcache::transform::SrhtRotation rot(output_.size(), seed_ + round);
-      scratch_.assign(rot.srht_dim(), 0.0f);
-      rot.apply(output_, scratch_);
-      if (round_variances_ != nullptr && !round_variances_->empty()) {
-        (*round_variances_)[round].push_back(variance_across_dims(scratch_));
-      }
-      output_ = scratch_;
-    }
-
-    if (out.size() != output_.size()) {
-      throw vectorcache::Error("output buffer dimension mismatch");
-    }
-    std::copy(output_.begin(), output_.end(), out.begin());
-    return true;
-  }
-
- private:
-  vectorcache::datasets::DatasetReader& inner_;
-  std::size_t remaining_;
-  std::vector<double>* pre_variances_;
-  std::size_t rounds_;
-  std::uint64_t seed_;
-  std::vector<std::vector<double>>* round_variances_;
-  std::vector<float> raw_;
-  std::vector<float> scratch_;
-  std::vector<float> output_;
-};
-
 void print_stored_vector(std::size_t index, const vectorcache::ingest::IngestionEngine& engine) {
   const auto& store = engine.store();
   if (index >= store.size()) {
@@ -189,7 +129,6 @@ int main(int argc, char** argv) {
   std::size_t limit = 100;
   std::string split = "train";
   std::uint64_t seed = 42;
-  std::size_t rounds = 1;
   std::size_t bits = 1;
   std::size_t block_dims = 1;
   bool variance = false;
@@ -201,7 +140,6 @@ int main(int argc, char** argv) {
   app.add_option("--limit", limit, "Maximum number of vectors to ingest");
   app.add_option("--split", split, "HDF5 split for GloVe (train or test)");
   app.add_option("--seed", seed, "SRHT rotation seed");
-  app.add_option("--rounds", rounds, "Number of consecutive SRHT rounds");
   app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
   app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
   app.add_flag("--variance", variance, "Report per-vector dimension variance");
@@ -210,9 +148,6 @@ int main(int argc, char** argv) {
   CLI11_PARSE(app, argc, argv);
 
   try {
-    if (rounds == 0) {
-      throw vectorcache::Error("--rounds must be at least 1");
-    }
     vectorcache::quantize::validate_bits_per_dim(bits);
     vectorcache::quantize::validate_block_dims(block_dims);
 
@@ -248,40 +183,23 @@ int main(int argc, char** argv) {
 
     std::cout << "Dataset: " << meta.label << " (dim=" << meta.dim << ", srht_dim=" << meta.dim
               << ", available=" << meta.count << ", ingesting=" << ingest_limit
-              << ", srht_seed=" << seed << ", rounds=" << rounds << ", bits=" << bits
-              << ", block_dims=" << block_dims << ")\n";
+              << ", srht_seed=" << seed << ", srht_rounds=" << vectorcache::transform::srht_rounds()
+              << ", bits=" << bits << ", block_dims=" << block_dims << ")\n";
 
     VarianceHook variance_hook(capture_vectors);
     const auto ingest_start = std::chrono::steady_clock::now();
 
     std::vector<double> pre_variances;
-    std::vector<std::vector<double>> round_variances;
-    vectorcache::ingest::IngestReport report{};
     vectorcache::ingest::IngestionEngine engine =
         vectorcache::ingest::IngestionEngine::with_rotation(meta.dim, seed, bits, block_dims);
 
-    if (rounds == 1) {
-      LimitedReader limited(*reader_ptr, ingest_limit, variance ? &pre_variances : nullptr);
-      engine.reserve_vectors(ingest_limit);
-      if (variance) {
-        report = engine.ingest_with_hook(limited, &variance_hook);
-      } else {
-        report = engine.ingest(limited);
-      }
+    LimitedReader limited(*reader_ptr, ingest_limit, variance ? &pre_variances : nullptr);
+    engine.reserve_vectors(ingest_limit);
+    vectorcache::ingest::IngestReport report{};
+    if (variance) {
+      report = engine.ingest_with_hook(limited, &variance_hook);
     } else {
-      if (variance) {
-        round_variances.resize(rounds);
-        for (auto& rv : round_variances) rv.reserve(ingest_limit);
-      }
-      MultiRoundReader limited(*reader_ptr, ingest_limit, variance ? &pre_variances : nullptr,
-                               rounds, seed, variance ? &round_variances : nullptr);
-      engine = vectorcache::ingest::IngestionEngine::from_rotated(meta.dim, bits, block_dims);
-      engine.reserve_vectors(ingest_limit);
-      if (variance) {
-        report = engine.ingest_with_hook(limited, &variance_hook);
-      } else {
-        report = engine.ingest(limited);
-      }
+      report = engine.ingest(limited);
     }
 
     const auto elapsed_ns = static_cast<std::uint64_t>(
@@ -291,9 +209,6 @@ int main(int argc, char** argv) {
 
     if (variance) {
       print_variance_stats("Pre-ingestion (raw)", pre_variances);
-      for (std::size_t i = 0; i < round_variances.size(); ++i) {
-        print_variance_stats("After SRHT round " + std::to_string(i + 1), round_variances[i]);
-      }
       print_variance_stats("Post-ingestion (stored)", variance_hook.post_variances());
     }
 

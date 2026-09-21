@@ -3,22 +3,20 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <numbers>
 #include <random>
 #include <vector>
 
 #include "vectorcache/error.hpp"
 
 namespace vectorcache::index {
-namespace {
 
-constexpr float kNormEps = 1e-12f;
-
-}  // namespace
-
-PairHash::PairHash(std::size_t num_pair_dirs, std::uint64_t seed) : num_pair_dirs_(num_pair_dirs) {
+PairHash::PairHash(std::size_t num_pair_dirs, std::uint64_t seed, float ridge_delta)
+    : num_pair_dirs_(num_pair_dirs), ridge_delta_(ridge_delta) {
   if (num_pair_dirs_ == 0 || num_pair_dirs_ > kMaxPairDirs) {
     throw Error("PairHash: num_pair_dirs must be in 1..kMaxPairDirs");
+  }
+  if (!(ridge_delta_ > 0.0f) || !std::isfinite(ridge_delta_)) {
+    throw Error("PairHash: ridge_delta must be finite and > 0");
   }
   dirs_.assign(num_pair_dirs_ * 2, 0.0f);
   std::mt19937_64 rng(seed);
@@ -42,13 +40,6 @@ PairHash::PairHash(std::size_t num_pair_dirs, std::uint64_t seed) : num_pair_dir
   }
 }
 
-std::span<const float> PairHash::dir(std::size_t i) const {
-  if (i >= num_pair_dirs_) {
-    throw Error("PairHash::dir out of range");
-  }
-  return {dirs_.data() + 2 * i, 2};
-}
-
 float PairHash::fold(std::span<const float> x) const {
   if (empty()) {
     throw Error("PairHash::fold: empty hash");
@@ -70,14 +61,9 @@ float PairHash::fold(std::span<const float> x) const {
       const float a = cur[2 * i];
       const float b = cur[2 * i + 1];
       const float n2 = a * a + b * b;
-      float out = 0.0f;
-      if (n2 > kNormEps) {
-        const float inv = 1.0f / std::sqrt(n2);
-        const float p0 = a * inv;
-        const float p1 = b * inv;
-        const std::size_t di = cursor % num_pair_dirs_;
-        out = p0 * dirs_[2 * di] + p1 * dirs_[2 * di + 1];
-      }
+      const std::size_t di = cursor % num_pair_dirs_;
+      const float out =
+          (a * dirs_[2 * di] + b * dirs_[2 * di + 1]) / std::sqrt(n2 + ridge_delta_);
       ++cursor;
       next.push_back(out);
     }
@@ -86,21 +72,15 @@ float PairHash::fold(std::span<const float> x) const {
     }
     cur.swap(next);
   }
-  return cur[0];
-}
-
-float arcsine_cdf(float s) {
-  const float clamped_s = std::clamp(s, -1.0f, 1.0f);
-  const float u =
-      0.5f + std::asin(clamped_s) / static_cast<float>(std::numbers::pi);
-  return std::clamp(u, 0.0f, 1.0f);
+  return std::clamp(cur[0], -1.0f, 1.0f);
 }
 
 std::int32_t fold_to_bin(const PairHash& hash, std::span<const float> x, float bin_width) {
   if (bin_width <= 0.0f || !std::isfinite(bin_width)) {
     throw Error("bin_width must be finite and > 0");
   }
-  const float u = arcsine_cdf(hash.fold(x));
+  const float s = std::clamp(hash.fold(x), -1.0f, 1.0f);
+  const float u = 0.5f * (s + 1.0f);
   return static_cast<std::int32_t>(std::floor(static_cast<double>(u) / bin_width));
 }
 

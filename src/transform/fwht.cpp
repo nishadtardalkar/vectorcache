@@ -299,17 +299,6 @@ void dispatch_orthonormal(float* buf, std::size_t n, float inv_sqrt_n) {
 
 }  // namespace
 
-std::size_t padded_dim(std::size_t dim) {
-  if (dim == 0) {
-    return 1;
-  }
-  std::size_t n = 1;
-  while (n < dim) {
-    n <<= 1;
-  }
-  return n;
-}
-
 void fwht_in_place(std::span<float> buf) {
   const std::size_t n = buf.size();
   if (n == 0) {

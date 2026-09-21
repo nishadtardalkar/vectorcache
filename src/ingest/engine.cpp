@@ -46,9 +46,15 @@ IngestionEngine::IngestionEngine(VectorStore store, std::optional<transform::Srh
       codebook_(std::move(codebook)),
       bucket_params_(bucket_params),
       bucket_seed_(resolved_bucket_seed),
-      pair_hash_(bucket_params.num_pair_dirs, resolved_bucket_seed) {
+      pair_hash_(bucket_params.num_pair_dirs, resolved_bucket_seed,
+                  bucket_params.fold_ridge > 0.0f ? bucket_params.fold_ridge
+                                                  : index::default_fold_ridge(srht_dim)) {
   if (bucket_params.bin_width <= 0.0f || !std::isfinite(bucket_params.bin_width)) {
     throw Error("BucketParams.bin_width must be finite and > 0");
+  }
+  if (bucket_params.fold_ridge != 0.0f &&
+      (!(bucket_params.fold_ridge > 0.0f) || !std::isfinite(bucket_params.fold_ridge))) {
+    throw Error("BucketParams.fold_ridge must be 0 (auto) or finite and > 0");
   }
 }
 
@@ -112,9 +118,8 @@ std::size_t IngestionEngine::read_batch(datasets::DatasetReader& reader) {
 }
 
 void IngestionEngine::process_batch(std::size_t batch_len) {
-  const bool quantize_only = quantize_only_;
   const bool has_rotation = rotation_.has_value();
-  if (!has_rotation && !quantize_only) {
+  if (!has_rotation && !quantize_only_) {
     throw Error("IngestionEngine requires with_rotation() or from_rotated()");
   }
   const transform::SrhtRotation* rotation = has_rotation ? &(*rotation_) : nullptr;
@@ -130,16 +135,12 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
     auto& work = batch_work_[static_cast<std::size_t>(i)];
     if (has_rotation) {
       transform::l2_normalize_in_place(std::span<float>(work.buf.data(), input_dim));
-      const std::int32_t bin = index::fold_to_bin(
-          *pair_hash, std::span<const float>(work.buf.data(), input_dim), bin_width);
-      work.cell_key = index::pack_bin(bin);
       rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
-    } else {
-      // from_rotated: fold on the provided buffer as-is.
-      const std::int32_t bin = index::fold_to_bin(
-          *pair_hash, std::span<const float>(work.buf.data(), input_dim), bin_width);
-      work.cell_key = index::pack_bin(bin);
     }
+    // Fold after SRHT (from_rotated buffers are already in rotated space).
+    const std::int32_t bin = index::fold_to_bin(
+        *pair_hash, std::span<const float>(work.buf.data(), srht_dim), bin_width);
+    work.cell_key = index::pack_bin(bin);
     quantize::quantize_blocks_to_nbit_into(work.buf, *codebook, work.l0);
     work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
@@ -148,25 +149,22 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
     auto& work = batch_work_[i];
     if (has_rotation) {
       transform::l2_normalize_in_place(std::span<float>(work.buf.data(), input_dim));
-      const std::int32_t bin = index::fold_to_bin(
-          *pair_hash, std::span<const float>(work.buf.data(), input_dim), bin_width);
-      work.cell_key = index::pack_bin(bin);
       rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
-    } else {
-      const std::int32_t bin = index::fold_to_bin(
-          *pair_hash, std::span<const float>(work.buf.data(), input_dim), bin_width);
-      work.cell_key = index::pack_bin(bin);
     }
+    const std::int32_t bin = index::fold_to_bin(
+        *pair_hash, std::span<const float>(work.buf.data(), srht_dim), bin_width);
+    work.cell_key = index::pack_bin(bin);
     quantize::quantize_blocks_to_nbit_into(work.buf, *codebook, work.l0);
     work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
 #endif
-  (void)quantize_only;
 }
 
 void IngestionEngine::finalize_bucket_index(std::span<const std::uint64_t> all_keys) {
-  // Rebuild hash from the same seed so the engine can still expose pair_hash_ if needed.
-  index::PairHash hash(bucket_params_.num_pair_dirs, bucket_seed_);
+  // Rebuild hash from the same seed/ridge so the store carries a matching PairHash.
+  const float ridge = bucket_params_.fold_ridge > 0.0f ? bucket_params_.fold_ridge
+                                                       : index::default_fold_ridge(srht_dim_);
+  index::PairHash hash(bucket_params_.num_pair_dirs, bucket_seed_, ridge);
   store_.finalize_buckets(all_keys, std::move(hash), bucket_params_.bin_width);
 }
 

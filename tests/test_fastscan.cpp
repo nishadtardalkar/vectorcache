@@ -239,7 +239,6 @@ TEST(FastScanScore, BlockedMatchesVectorMajorBits8BlockDims2) {
   build_query_lut(query, codebook, lut);
   ASSERT_FALSE(lut.empty());
   EXPECT_EQ(lut.num_codes(), dim / block_dims);
-  EXPECT_EQ(lut.block_dims(), block_dims);
 
   std::vector<float> ref(n);
   asymmetric_ip_batch_lut(lut, codes, words, n, codebook, query, ref);

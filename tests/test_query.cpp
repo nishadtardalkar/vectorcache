@@ -248,7 +248,6 @@ TEST(QueryDistanceTest, BlockDims2Bits8LutMatchesScalar) {
   ASSERT_FALSE(lut.empty());
   EXPECT_EQ(lut.bits(), 8u);
   EXPECT_EQ(lut.num_codes(), dim / block_dims);
-  EXPECT_EQ(lut.block_dims(), block_dims);
 
   EXPECT_NEAR(query::asymmetric_ip_score(q, words, codebook), ref, 1e-5f);
   EXPECT_NEAR(query::asymmetric_ip_score_lut(lut, words), ref, 1e-5f);

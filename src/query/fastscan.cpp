@@ -10,9 +10,6 @@ namespace vectorcache::query {
 void BlockedCodes::clear() {
   n_ = 0;
   bits_ = 0;
-  dim_ = 0;
-  block_dims_ = 1;
-  num_codes_ = 0;
   num_groups_ = 0;
   words_per_vec_ = 0;
   n_blocks_ = 0;
@@ -49,9 +46,6 @@ void BlockedCodes::rebuild(std::span<const std::uint64_t> codes, std::size_t wor
 
   n_ = n;
   bits_ = bits;
-  dim_ = dim;
-  block_dims_ = block_dims;
-  num_codes_ = m;
   words_per_vec_ = words_per_vec;
   num_groups_ = (m * bits) / 8;
   n_blocks_ = (n + kBlock - 1) / kBlock;

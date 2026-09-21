@@ -164,7 +164,7 @@ TEST(EngineTest, IngestWithoutFinalizeThenFinalizeBuckets) {
   EXPECT_FALSE(work.has_buckets());
   EXPECT_EQ(work.size(), n);
 
-  index::PairHash hash(2, 123);
+  index::PairHash hash(2, 123, index::default_fold_ridge(dim));
   const std::int32_t zero_bin = 0;
   const std::uint64_t key0 = index::pack_bin(zero_bin);
   std::vector<std::uint64_t> keys(n, key0);

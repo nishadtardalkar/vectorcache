@@ -23,6 +23,7 @@
 #include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/query/engine.hpp"
 #include "vectorcache/transform/normalize.hpp"
+#include "vectorcache/transform/srht.hpp"
 
 namespace {
 
@@ -261,15 +262,23 @@ std::vector<Trial> pareto_front(std::vector<Trial> trials) {
 }
 
 std::vector<std::uint64_t> compute_cell_keys(std::span<const float> raw_row_major, std::size_t n,
-                                             std::size_t dim, std::size_t L, float bin_width,
+                                             std::size_t dim,
+                                             const vectorcache::transform::SrhtRotation& rotation,
+                                             std::size_t L, float bin_width, float fold_ridge,
                                              std::uint64_t resolved_bucket_seed) {
-  vectorcache::index::PairHash hash(L, resolved_bucket_seed);
+  const std::size_t srht_dim = rotation.srht_dim();
+  const float ridge =
+      fold_ridge > 0.0f ? fold_ridge : vectorcache::index::default_fold_ridge(srht_dim);
+  vectorcache::index::PairHash hash(L, resolved_bucket_seed, ridge);
   std::vector<std::uint64_t> keys(n);
-  std::vector<float> buf(dim);
+  std::vector<float> buf(srht_dim, 0.0f);
   for (std::size_t i = 0; i < n; ++i) {
+    std::fill(buf.begin(), buf.end(), 0.0f);
     std::copy_n(raw_row_major.data() + i * dim, dim, buf.begin());
-    vectorcache::transform::l2_normalize_in_place(buf);
-    keys[i] = vectorcache::index::pack_bin(vectorcache::index::fold_to_bin(hash, buf, bin_width));
+    vectorcache::transform::l2_normalize_in_place(std::span<float>(buf.data(), dim));
+    rotation.apply_in_place(buf);
+    keys[i] = vectorcache::index::pack_bin(
+        vectorcache::index::fold_to_bin(hash, buf, bin_width));
   }
   return keys;
 }
@@ -328,6 +337,7 @@ int main(int argc, char** argv) {
   std::size_t bits = 1;
   std::size_t block_dims = 1;
   std::uint64_t bucket_seed = 0;
+  float fold_ridge = 0.0f;
   std::string num_pair_dirs_list = "4,8,16";
   std::string bin_widths = "0.05,0.1,0.2,0.5";
   std::string probe_radii = "0,1,2,3";
@@ -345,8 +355,10 @@ int main(int argc, char** argv) {
   app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
   app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
   app.add_option("--bucket-seed", bucket_seed, "Pair-hash seed (0 = derive from --seed)");
+  app.add_option("--fold-ridge", fold_ridge, "Pair-hash ridge δ (0 = auto 1/srht_dim)");
   app.add_option("--num-pair-dirs-list", num_pair_dirs_list, "Comma-separated L values");
-  app.add_option("--bin-widths", bin_widths, "Comma-separated bin widths w on u in [0,1]");
+  app.add_option("--bin-widths", bin_widths,
+                 "Comma-separated bin widths w on uniform u=(s+1)/2 in [0,1]");
   app.add_option("--probe-radii", probe_radii, "Comma-separated probe radii P");
 
   CLI11_PARSE(app, argc, argv);
@@ -390,7 +402,7 @@ int main(int argc, char** argv) {
               << " query_split=" << query_split << " bits=" << bits << " block_dims=" << block_dims
               << " k=" << k << " grid=" << grid_total << '\n';
 
-    // Load raw index once; ingest without buckets; rebucket from pre-SRHT floats.
+    // Load raw index once; ingest without buckets; rebucket from post-SRHT floats.
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto raw = load_matrix(index_limited, meta.dim, actual_index);
     MatrixReader matrix_reader(std::move(raw), meta.dim, actual_index);
@@ -398,6 +410,7 @@ int main(int argc, char** argv) {
     vectorcache::ingest::BucketParams dummy_buckets;
     dummy_buckets.num_pair_dirs = 8;
     dummy_buckets.bin_width = 0.1f;
+    dummy_buckets.fold_ridge = fold_ridge;
     dummy_buckets.bucket_seed = bucket_seed;
     auto ingest_engine = vectorcache::ingest::IngestionEngine::with_rotation(
         meta.dim, seed, bits, block_dims, dummy_buckets);
@@ -412,6 +425,10 @@ int main(int argc, char** argv) {
 
     const auto& base_store = ingest_engine.store();
     const auto raw_span = matrix_reader.data();
+    const vectorcache::transform::SrhtRotation rotation(meta.dim, seed);
+    const float ridge = fold_ridge > 0.0f
+                            ? fold_ridge
+                            : vectorcache::index::default_fold_ridge(rotation.srht_dim());
 
     auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);
     const auto queries =
@@ -440,8 +457,10 @@ int main(int argc, char** argv) {
         }
 
         auto work = base_store.clone();
-        const auto keys = compute_cell_keys(raw_span, actual_index, meta.dim, L, w, resolved_seed);
-        auto hash = vectorcache::index::PairHash(L, resolved_seed);
+        const auto keys =
+            compute_cell_keys(raw_span, actual_index, meta.dim, rotation, L, w, fold_ridge,
+                              resolved_seed);
+        auto hash = vectorcache::index::PairHash(L, resolved_seed, ridge);
         work.finalize_buckets(keys, std::move(hash), w);
 
         auto query_engine = vectorcache::query::QueryEngine::with_rotation(work, meta.dim, seed);

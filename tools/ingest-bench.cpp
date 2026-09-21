@@ -40,11 +40,10 @@ struct StageTotals {
   std::uint64_t srht_ns = 0;
   std::uint64_t quantize_ns = 0;
   std::uint64_t store_ns = 0;
-  std::uint64_t batch_copy_ns = 0;
   std::uint64_t vectors = 0;
 
   std::uint64_t total_ns() const {
-    return read_ns + normalize_ns + srht_ns + quantize_ns + store_ns + batch_copy_ns;
+    return read_ns + normalize_ns + srht_ns + quantize_ns + store_ns;
   }
 };
 
@@ -219,7 +218,6 @@ void print_stage_report(const std::string& label, const StageTotals& stages) {
 
   const std::pair<const char*, std::uint64_t> rows[] = {
       {"read (mmap -> buffer)", stages.read_ns},
-      {"batch copy (engine-style to_vec)", stages.batch_copy_ns},
       {"L2 normalize", stages.normalize_ns},
       {kSrhtStageLabel, stages.srht_ns},
       {"L0 nbit quantize", stages.quantize_ns},
@@ -262,7 +260,6 @@ void print_wall_report(std::uint64_t wall_ns, std::size_t vectors, const StageTo
   std::cout << "\nHot paths (by sequential stage share):\n";
   std::vector<std::pair<const char*, std::uint64_t>> ranked = {
       {"SRHT / FWHT", stages.srht_ns},
-      {"batch input copy (to_vec per batch)", stages.batch_copy_ns},
       {"L0 quantize", stages.quantize_ns},
       {"read I/O", stages.read_ns},
       {"L2 normalize", stages.normalize_ns},

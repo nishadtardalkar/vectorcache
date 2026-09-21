@@ -267,7 +267,7 @@ void build_query_lut(std::span<const float> query_rotated,
 
   const std::size_t codes_per_group = 8 / bits;
   const std::size_t num_groups = m / codes_per_group;
-  out.resize(num_groups, bits, codes_per_group, dim, block_dims, m);
+  out.resize(num_groups, bits, m);
 
   const auto centroids = codebook.centroids();
   for (std::size_t g = 0; g < num_groups; ++g) {
