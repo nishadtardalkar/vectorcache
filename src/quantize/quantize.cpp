@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <limits>
-#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -138,22 +136,6 @@ double adaptive_simpson(const auto& f, double a, double b, double tol, int max_d
   return rec(rec, a, b, fa, fb, fm, whole, tol, max_depth);
 }
 
-/// Inverse CDF of Beta(a,a) on [0,1] via bisection, then map to [-1,1].
-double sample_shifted_beta(const BetaAA& beta, double u) {
-  u = std::clamp(u, 1e-12, 1.0 - 1e-12);
-  double lo = 0.0;
-  double hi = 1.0;
-  for (int i = 0; i < 64; ++i) {
-    const double mid = 0.5 * (lo + hi);
-    if (beta.cdf01(mid) < u) {
-      lo = mid;
-    } else {
-      hi = mid;
-    }
-  }
-  return 2.0 * (0.5 * (lo + hi)) - 1.0;
-}
-
 /// Lloyd-Max for Beta((dim-1)/2,(dim-1)/2) on [-1, 1] (TurboVec codebook.rs).
 std::pair<std::vector<float>, std::vector<float>> lloyd_max_beta(std::size_t bits, std::size_t dim) {
   const double a = (static_cast<double>(dim) - 1.0) / 2.0;
@@ -224,114 +206,6 @@ std::pair<std::vector<float>, std::vector<float>> lloyd_max_beta(std::size_t bit
   return {std::move(boundaries_f32), std::move(centroids_f32)};
 }
 
-float squared_dist(std::span<const float> a, std::span<const float> b) {
-  float s = 0.0f;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    const float d = a[i] - b[i];
-    s += d * d;
-  }
-  return s;
-}
-
-std::uint32_t nearest_centroid(std::span<const float> x, std::span<const float> centroids,
-                               std::size_t k, std::size_t d) {
-  std::uint32_t best = 0;
-  float best_dist = std::numeric_limits<float>::infinity();
-  for (std::size_t c = 0; c < k; ++c) {
-    const float dist = squared_dist(x, centroids.subspan(c * d, d));
-    if (dist < best_dist) {
-      best_dist = dist;
-      best = static_cast<std::uint32_t>(c);
-    }
-  }
-  return best;
-}
-
-/// Monte Carlo Lloyd-Max under product of shifted Beta((dim-1)/2,(dim-1)/2) on [-1,1]^d.
-std::vector<float> lloyd_max_beta_block(std::size_t bits, std::size_t dim, std::size_t block_dims) {
-  const double a = (static_cast<double>(dim) - 1.0) / 2.0;
-  const BetaAA beta(a);
-  const std::size_t k = std::size_t{1} << bits;
-  const std::size_t d = block_dims;
-
-  constexpr std::size_t kNumSamples = 131072;
-  constexpr int kMaxIters = 100;
-  constexpr double kTol = 1e-6;
-
-  std::mt19937_64 rng(0xC0FFEEULL ^ (static_cast<std::uint64_t>(dim) * 0x9E3779B97F4A7C15ULL) ^
-                      (static_cast<std::uint64_t>(block_dims) << 32) ^ bits);
-  std::uniform_real_distribution<double> uni(0.0, 1.0);
-
-  std::vector<float> samples(kNumSamples * d);
-  for (std::size_t i = 0; i < kNumSamples; ++i) {
-    for (std::size_t j = 0; j < d; ++j) {
-      samples[i * d + j] = static_cast<float>(sample_shifted_beta(beta, uni(rng)));
-    }
-  }
-
-  // Init: pick K distinct samples (or first K if collision).
-  std::vector<float> centroids(k * d);
-  {
-    std::uniform_int_distribution<std::size_t> pick(0, kNumSamples - 1);
-    std::vector<std::size_t> used;
-    used.reserve(k);
-    for (std::size_t c = 0; c < k; ++c) {
-      std::size_t idx = pick(rng);
-      for (int attempt = 0; attempt < 16; ++attempt) {
-        if (std::find(used.begin(), used.end(), idx) == used.end()) {
-          break;
-        }
-        idx = pick(rng);
-      }
-      used.push_back(idx);
-      for (std::size_t j = 0; j < d; ++j) {
-        centroids[c * d + j] = samples[idx * d + j];
-      }
-    }
-  }
-
-  std::vector<double> sums(k * d);
-  std::vector<std::size_t> counts(k);
-  for (int iter = 0; iter < kMaxIters; ++iter) {
-    std::fill(sums.begin(), sums.end(), 0.0);
-    std::fill(counts.begin(), counts.end(), 0);
-
-    for (std::size_t i = 0; i < kNumSamples; ++i) {
-      const auto x = std::span<const float>(samples.data() + i * d, d);
-      const std::uint32_t c = nearest_centroid(x, centroids, k, d);
-      counts[c] += 1;
-      for (std::size_t j = 0; j < d; ++j) {
-        sums[c * d + j] += static_cast<double>(x[j]);
-      }
-    }
-
-    double max_change = 0.0;
-    for (std::size_t c = 0; c < k; ++c) {
-      if (counts[c] == 0) {
-        // Re-seed empty cluster from a random sample.
-        std::uniform_int_distribution<std::size_t> pick(0, kNumSamples - 1);
-        const std::size_t idx = pick(rng);
-        for (std::size_t j = 0; j < d; ++j) {
-          const float neu = samples[idx * d + j];
-          max_change = std::max(max_change, static_cast<double>(std::abs(neu - centroids[c * d + j])));
-          centroids[c * d + j] = neu;
-        }
-        continue;
-      }
-      for (std::size_t j = 0; j < d; ++j) {
-        const float neu = static_cast<float>(sums[c * d + j] / static_cast<double>(counts[c]));
-        max_change = std::max(max_change, static_cast<double>(std::abs(neu - centroids[c * d + j])));
-        centroids[c * d + j] = neu;
-      }
-    }
-    if (max_change < kTol) {
-      break;
-    }
-  }
-
-  return centroids;
-}
-
 void pack_code(std::span<std::uint64_t> out, std::size_t bit_pos, std::size_t bits,
                std::uint64_t code) {
   const std::size_t word_i = bit_pos / 64;
@@ -354,71 +228,41 @@ void validate_bits_per_dim(std::size_t bits) {
   }
 }
 
-void validate_block_dims(std::size_t block_dims) {
-  if (block_dims < kMinBlockDims || block_dims > kMaxBlockDims) {
-    throw Error("block_dims must be in [" + std::to_string(kMinBlockDims) + ", " +
-                std::to_string(kMaxBlockDims) + "], got " + std::to_string(block_dims));
-  }
-}
-
 void validate_quant_spec(std::size_t dim, QuantSpec spec) {
   validate_bits_per_dim(spec.bits);
-  validate_block_dims(spec.block_dims);
   if (dim < 2) {
     throw Error("quantize: dim must be >= 2");
   }
-  if (dim % spec.block_dims != 0) {
-    throw Error("quantize: dim (" + std::to_string(dim) + ") must be divisible by block_dims (" +
-                std::to_string(spec.block_dims) + ")");
-  }
 }
 
-std::size_t num_blocks(std::size_t dim, std::size_t block_dims) {
-  validate_block_dims(block_dims);
-  if (dim % block_dims != 0) {
-    throw Error("num_blocks: dim must be divisible by block_dims");
-  }
-  return dim / block_dims;
-}
+std::size_t num_blocks(std::size_t dim) { return dim; }
 
-std::size_t l0_bits_per_vector(std::size_t dim, std::size_t bits, std::size_t block_dims) {
+std::size_t l0_bits_per_vector(std::size_t dim, std::size_t bits) {
   validate_bits_per_dim(bits);
-  validate_block_dims(block_dims);
-  if (dim % block_dims != 0) {
-    throw Error("l0_bits_per_vector: dim must be divisible by block_dims");
-  }
-  return (dim / block_dims) * bits;
+  return dim * bits;
 }
 
-std::size_t l0_words_per_vector(std::size_t dim, std::size_t bits, std::size_t block_dims) {
-  const std::size_t total_bits = l0_bits_per_vector(dim, bits, block_dims);
+std::size_t l0_words_per_vector(std::size_t dim, std::size_t bits) {
+  const std::size_t total_bits = l0_bits_per_vector(dim, bits);
   return (total_bits + 63) / 64;
 }
 
 LloydMaxCodebook::LloydMaxCodebook(std::size_t dim, QuantSpec spec)
-    : LloydMaxCodebook(dim, spec.bits, spec.block_dims) {}
+    : LloydMaxCodebook(dim, spec.bits) {}
 
-LloydMaxCodebook::LloydMaxCodebook(std::size_t dim, std::size_t bits, std::size_t block_dims)
-    : dim_(dim), bits_(bits), block_dims_(block_dims) {
-  validate_quant_spec(dim_, QuantSpec{block_dims_, bits_});
+LloydMaxCodebook::LloydMaxCodebook(std::size_t dim, std::size_t bits) : dim_(dim), bits_(bits) {
+  validate_quant_spec(dim_, QuantSpec{bits_});
   num_centroids_ = std::size_t{1} << bits_;
-
-  if (block_dims_ == 1) {
-    auto [boundaries, centroids] = lloyd_max_beta(bits_, dim_);
-    boundaries_ = std::move(boundaries);
-    centroids_ = std::move(centroids);
-  } else {
-    centroids_ = lloyd_max_beta_block(bits_, dim_, block_dims_);
-    boundaries_.clear();
-  }
+  auto [boundaries, centroids] = lloyd_max_beta(bits_, dim_);
+  boundaries_ = std::move(boundaries);
+  centroids_ = std::move(centroids);
 }
 
 std::span<const float> LloydMaxCodebook::centroid(std::uint32_t index) const {
   if (index >= num_centroids_) {
     throw Error("LloydMaxCodebook::centroid: index out of range");
   }
-  return std::span<const float>(centroids_.data() + static_cast<std::size_t>(index) * block_dims_,
-                                block_dims_);
+  return std::span<const float>(centroids_.data() + static_cast<std::size_t>(index), 1);
 }
 
 float LloydMaxCodebook::centroid_at(std::uint32_t index) const {
@@ -426,9 +270,6 @@ float LloydMaxCodebook::centroid_at(std::uint32_t index) const {
 }
 
 std::uint32_t LloydMaxCodebook::encode(float x) const {
-  if (block_dims_ != 1) {
-    throw Error("LloydMaxCodebook::encode(float): requires block_dims == 1");
-  }
   if (num_centroids_ == 0) {
     throw Error("LloydMaxCodebook::encode on empty codebook");
   }
@@ -437,25 +278,6 @@ std::uint32_t LloydMaxCodebook::encode(float x) const {
     ++idx;
   }
   return idx;
-}
-
-std::uint32_t LloydMaxCodebook::encode(std::span<const float> block) const {
-  if (block.size() != block_dims_) {
-    throw Error("LloydMaxCodebook::encode(block): size must equal block_dims");
-  }
-  if (num_centroids_ == 0) {
-    throw Error("LloydMaxCodebook::encode on empty codebook");
-  }
-  if (block_dims_ == 1) {
-    return encode(block[0]);
-  }
-  if (bits_ == 1 && num_centroids_ == 2) {
-    // Half-plane: nearer of two centroids.
-    const float d0 = squared_dist(block, centroid(0));
-    const float d1 = squared_dist(block, centroid(1));
-    return d1 < d0 ? 1u : 0u;
-  }
-  return nearest_centroid(block, centroids_, num_centroids_, block_dims_);
 }
 
 std::uint32_t unpack_code(std::span<const std::uint64_t> words, std::size_t block_index,
@@ -485,30 +307,26 @@ std::size_t quantize_blocks_to_nbit_into(std::span<const float> vector,
                                          std::span<std::uint64_t> out) {
   const std::size_t dim = vector.size();
   const std::size_t bits = codebook.bits();
-  const std::size_t block_dims = codebook.block_dims();
   if (dim != codebook.dim()) {
     throw Error("quantize_blocks_to_nbit_into: vector dim must match codebook dim");
   }
-  const std::size_t need_words = l0_words_per_vector(dim, bits, block_dims);
+  const std::size_t need_words = l0_words_per_vector(dim, bits);
   if (out.size() < need_words) {
     throw Error("quantize_blocks_to_nbit_into: output too small");
   }
   std::fill(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(need_words), 0);
 
   const std::uint64_t mask = (bits == 64) ? ~0ull : ((std::uint64_t{1} << bits) - 1ull);
-  const std::size_t m = dim / block_dims;
-  for (std::size_t b = 0; b < m; ++b) {
-    const auto block = vector.subspan(b * block_dims, block_dims);
-    const std::uint64_t code = static_cast<std::uint64_t>(codebook.encode(block)) & mask;
+  for (std::size_t b = 0; b < dim; ++b) {
+    const std::uint64_t code = static_cast<std::uint64_t>(codebook.encode(vector[b])) & mask;
     pack_code(out, b * bits, bits, code);
   }
-  return m * bits;
+  return dim * bits;
 }
 
 std::pair<std::vector<std::uint64_t>, std::size_t> quantize_blocks_to_nbit(
     std::span<const float> vector, const LloydMaxCodebook& codebook) {
-  const std::size_t num_words =
-      l0_words_per_vector(vector.size(), codebook.bits(), codebook.block_dims());
+  const std::size_t num_words = l0_words_per_vector(vector.size(), codebook.bits());
   std::vector<std::uint64_t> words(num_words, 0);
   const std::size_t num_bits = quantize_blocks_to_nbit_into(vector, codebook, words);
   return {std::move(words), num_bits};
@@ -528,21 +346,16 @@ float ip_scale_alpha(std::span<const float> rotated_unit, std::span<const std::u
                      const LloydMaxCodebook& codebook) {
   const std::size_t dim = codebook.dim();
   const std::size_t bits = codebook.bits();
-  const std::size_t block_dims = codebook.block_dims();
   if (rotated_unit.size() != dim) {
     throw Error("ip_scale_alpha: rotated dim mismatch");
   }
-  if (codes.size() < l0_words_per_vector(dim, bits, block_dims)) {
+  if (codes.size() < l0_words_per_vector(dim, bits)) {
     throw Error("ip_scale_alpha: codes too small");
   }
   double ip = 0.0;
-  const std::size_t m = dim / block_dims;
-  for (std::size_t b = 0; b < m; ++b) {
+  for (std::size_t b = 0; b < dim; ++b) {
     const std::uint32_t code = unpack_code(codes, b, bits);
-    const auto c = codebook.centroid(code);
-    for (std::size_t j = 0; j < block_dims; ++j) {
-      ip += static_cast<double>(rotated_unit[b * block_dims + j]) * static_cast<double>(c[j]);
-    }
+    ip += static_cast<double>(rotated_unit[b]) * static_cast<double>(codebook.centroid_at(code));
   }
   if (std::abs(ip) < 1e-12) {
     return 0.0f;

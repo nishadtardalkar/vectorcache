@@ -24,7 +24,6 @@ TEST(StoreTest, PushAndLookup) {
 
   EXPECT_EQ(store.size(), 3u);
   EXPECT_EQ(store.bits_per_dim(), bits);
-  EXPECT_EQ(store.block_dims(), 1u);
   EXPECT_EQ(store.id_at(0), 10u);
   EXPECT_EQ(store.id_at(1), 11u);
   EXPECT_EQ(store.id_at(2), 20u);
@@ -33,19 +32,6 @@ TEST(StoreTest, PushAndLookup) {
   EXPECT_EQ(store.l0_codes().size(), 3u * l0_words);
   EXPECT_EQ(store.input_dim(), dim);
   EXPECT_EQ(store.srht_dim(), dim);
-}
-
-TEST(StoreTest, WithCapacityBlockDims) {
-  constexpr std::size_t dim = 64;
-  constexpr std::size_t bits = 1;
-  constexpr std::size_t block_dims = 2;
-  const std::size_t l0_words = l0_words_per_vector(dim, bits, block_dims);
-  auto store = VectorStore::with_capacity(l0_words, dim, dim, 10, bits, block_dims);
-  EXPECT_EQ(store.block_dims(), block_dims);
-  EXPECT_EQ(store.l0_words_per_vec(), 1u);
-  std::vector<std::uint64_t> l0(l0_words, 0);
-  store.push(0, l0);
-  EXPECT_EQ(store.size(), 1u);
 }
 
 TEST(StoreTest, WithCapacityReservesMultiBit) {

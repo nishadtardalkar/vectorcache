@@ -50,7 +50,6 @@ set(VECTORCACHE_SOURCES
   src/ingest/timing.cpp
   src/ingest/engine.cpp
   src/query/distance.cpp
-  src/query/fastscan.cpp
   src/query/engine.cpp
   src/datasets/npy.cpp
   src/datasets/sample.cpp
@@ -193,7 +192,6 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_engine.cpp
     tests/test_query.cpp
     tests/test_rp_buckets.cpp
-    tests/test_fastscan.cpp
     tests/test_sample.cpp
     tests/test_npy.cpp
   )

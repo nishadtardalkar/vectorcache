@@ -130,7 +130,6 @@ int main(int argc, char** argv) {
   std::string split = "train";
   std::uint64_t seed = 42;
   std::size_t bits = 1;
-  std::size_t block_dims = 1;
   bool variance = false;
   std::optional<std::size_t> show_index;
 
@@ -140,8 +139,7 @@ int main(int argc, char** argv) {
   app.add_option("--limit", limit, "Maximum number of vectors to ingest");
   app.add_option("--split", split, "HDF5 split for GloVe (train or test)");
   app.add_option("--seed", seed, "SRHT rotation seed");
-  app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
-  app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
+  app.add_option("--bits", bits, "TurboQuantMSE bits per dim (1-8)");
   app.add_flag("--variance", variance, "Report per-vector dimension variance");
   app.add_option("--show-index", show_index, "Print stored vector at index");
 
@@ -149,7 +147,6 @@ int main(int argc, char** argv) {
 
   try {
     vectorcache::quantize::validate_bits_per_dim(bits);
-    vectorcache::quantize::validate_block_dims(block_dims);
 
     vectorcache::datasets::DatasetSplit dataset_split = vectorcache::datasets::DatasetSplit::Train;
     if (split == "test") {
@@ -184,14 +181,14 @@ int main(int argc, char** argv) {
     std::cout << "Dataset: " << meta.label << " (dim=" << meta.dim << ", srht_dim=" << meta.dim
               << ", available=" << meta.count << ", ingesting=" << ingest_limit
               << ", srht_seed=" << seed << ", srht_rounds=" << vectorcache::transform::srht_rounds()
-              << ", bits=" << bits << ", block_dims=" << block_dims << ")\n";
+              << ", bits=" << bits << ")\n";
 
     VarianceHook variance_hook(capture_vectors);
     const auto ingest_start = std::chrono::steady_clock::now();
 
     std::vector<double> pre_variances;
     vectorcache::ingest::IngestionEngine engine =
-        vectorcache::ingest::IngestionEngine::with_rotation(meta.dim, seed, bits, block_dims);
+        vectorcache::ingest::IngestionEngine::with_rotation(meta.dim, seed, bits);
 
     LimitedReader limited(*reader_ptr, ingest_limit, variance ? &pre_variances : nullptr);
     engine.reserve_vectors(ingest_limit);

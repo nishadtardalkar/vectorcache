@@ -16,7 +16,6 @@ SPLIT         ?=
 LIMIT         ?= 100000
 SEED          ?=
 BITS          ?= 1
-BLOCK_DIMS    ?= 1
 NUM_BUCKETS   ?= 256
 REBALANCE_EVERY ?= 10000
 ORTHO_ETA     ?= 0.1
@@ -69,7 +68,6 @@ BENCH_COMMON_ARGS = \
 	$(call opt_arg,LIMIT,limit) \
 	$(call opt_arg,SEED,seed) \
 	$(call opt_arg,BITS,bits) \
-	$(call opt_arg,BLOCK_DIMS,block-dims) \
 	$(BENCH_EXTRA_ARGS)
 
 QUERY_BENCH_ARGS = \
@@ -120,8 +118,7 @@ help:
 	@echo "  SPLIT           --split"
 	@echo "  LIMIT           --limit"
 	@echo "  SEED            --seed"
-	@echo "  BITS            --bits (default $(BITS); TurboQuantMSE bits/block, 1-8)"
-	@echo "  BLOCK_DIMS      --block-dims (default $(BLOCK_DIMS); dims per codebook block, 1-16)"
+	@echo "  BITS            --bits (default $(BITS); TurboQuantMSE bits/dim, 1-8)"
 	@echo "  NUM_BUCKETS     --num-buckets (default $(NUM_BUCKETS); cluster IVF B; query-bench)"
 	@echo "  REBALANCE_EVERY --rebalance-every (default $(REBALANCE_EVERY); 0=finalize only; query-bench)"
 	@echo "  ORTHO_ETA       --ortho-eta (default $(ORTHO_ETA); frame-potential step before Lloyd; 0=skip)"
@@ -143,7 +140,6 @@ help:
 	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make compute"
 	@echo "Example: make compute BITS=2 RECALL=1"
-	@echo "Example: make compute BITS=1 BLOCK_DIMS=2"
 	@echo "Example: make compute NUM_PAIR_DIRS=8 BIN_WIDTH=0.1 PROBE_RADIUS=1"
 	@echo "Example: make tune NUM_PAIR_DIRS_LIST=4,8,16 BIN_WIDTHS=0.1,0.2 PROBE_RADII=0,1,2"
 

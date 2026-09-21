@@ -281,7 +281,6 @@ int main(int argc, char** argv) {
   std::uint64_t seed = 42;
   std::size_t k = 10;
   std::size_t bits = 1;
-  std::size_t block_dims = 1;
   std::uint64_t bucket_seed = 0;
   float ortho_eta = 0.1f;
   std::string num_buckets_list = "64,256,1024";
@@ -298,8 +297,7 @@ int main(int argc, char** argv) {
   app.add_option("--query-limit", query_limit, "Query count (default: 10000 GloVe, 1000 else)");
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
-  app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
-  app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
+  app.add_option("--bits", bits, "TurboQuantMSE bits per dim (1-8)");
   app.add_option("--bucket-seed", bucket_seed, "Cluster centroid seed (0 = derive from --seed)");
   app.add_option("--ortho-eta", ortho_eta,
                  "Centroid frame-potential step size before Lloyd reassignment (0 = skip)");
@@ -315,7 +313,6 @@ int main(int argc, char** argv) {
       throw vectorcache::Error("pass --dataset or --npy");
     }
     vectorcache::quantize::validate_bits_per_dim(bits);
-    vectorcache::quantize::validate_block_dims(block_dims);
 
     const auto B_list = parse_size_list(num_buckets_list, "num-buckets");
     const auto rebal_list = parse_size_list(rebalance_every_list, "rebalance-every");
@@ -345,7 +342,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Cluster IVF tune: index=" << source_label << " dim=" << meta.dim
               << " index_n=" << actual_index << " query_n=" << query_limit
-              << " query_split=" << query_split << " bits=" << bits << " block_dims=" << block_dims
+              << " query_split=" << query_split << " bits=" << bits
               << " k=" << k << " grid=" << grid_total << '\n';
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
@@ -385,7 +382,7 @@ int main(int argc, char** argv) {
         buckets.ortho_eta = ortho_eta;
         buckets.bucket_seed = bucket_seed;
         auto ingest_engine = vectorcache::ingest::IngestionEngine::with_rotation(
-            meta.dim, seed, bits, block_dims, buckets);
+            meta.dim, seed, bits, buckets);
         const auto report = ingest_engine.ingest(matrix_reader, true);
         if (report.vectors_ingested != actual_index) {
           throw vectorcache::Error("index ingest count mismatch");
@@ -393,7 +390,6 @@ int main(int argc, char** argv) {
 
         const auto& store = ingest_engine.store();
         auto query_engine = vectorcache::query::QueryEngine::with_rotation(store, meta.dim, seed);
-        query_engine.prepare_index();
 
         std::vector<vectorcache::query::PreparedQuery> prepared;
         prepared.reserve(queries.size());

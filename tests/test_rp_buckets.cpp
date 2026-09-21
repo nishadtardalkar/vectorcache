@@ -210,7 +210,7 @@ TEST(ClusterBucketsTest, CsrRangesContiguous) {
 TEST(ClusterBucketsTest, FinalizeBuildsBuckets) {
   const std::size_t dim = 8;
   const std::size_t words = 1;
-  ingest::VectorStore store(words, dim, dim, 1, 1);
+  ingest::VectorStore store(words, dim, dim, 1);
   std::vector<std::uint64_t> code(words, 0);
   for (std::size_t i = 0; i < 5; ++i) {
     store.push(i, code, 1.0f);
@@ -240,7 +240,7 @@ TEST(ClusterBucketsTest, SelfHitWithNprobe) {
   bp.num_buckets = 8;
   bp.rebalance_every = 0;
   bp.bucket_seed = 7;
-  auto engine = ingest::IngestionEngine::with_rotation(dim, 42, 1, 1, bp);
+  auto engine = ingest::IngestionEngine::with_rotation(dim, 42, 1, bp);
   ASSERT_EQ(engine.ingest(reader).vectors_ingested, n);
 
   auto qe = query::QueryEngine::with_rotation(engine.store(), dim, 42);

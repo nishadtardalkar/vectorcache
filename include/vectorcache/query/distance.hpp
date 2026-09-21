@@ -95,11 +95,4 @@ void asymmetric_ip_batch_lut(const QueryLut& lut, std::span<const std::uint64_t>
                              const quantize::LloydMaxCodebook& codebook,
                              std::span<const float> query_rotated, std::span<float> out_scores);
 
-class BlockedCodes;
-
-/// Score one FastScan block (up to BlockedCodes::kBlock vectors) into out_scores.
-/// bits=1 mask-add, bits=4 nibble permute, bits=8 gather, else blocked float LUT.
-void score_blocked_batch(const QueryLut& lut, const BlockedCodes& blocked, std::size_t block,
-                         std::span<float> out_scores);
-
 }  // namespace vectorcache::query

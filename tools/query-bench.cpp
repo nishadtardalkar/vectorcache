@@ -78,7 +78,7 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
                                                   std::size_t dim, std::uint64_t seed,
                                                   std::size_t limit, std::size_t bits,
-                                                  std::size_t block_dims, std::size_t num_buckets,
+                                                  std::size_t num_buckets,
                                                   std::size_t rebalance_every, float ortho_eta,
                                                   std::uint64_t bucket_seed) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
@@ -87,8 +87,7 @@ vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::Dataset
   buckets.rebalance_every = rebalance_every;
   buckets.ortho_eta = ortho_eta;
   buckets.bucket_seed = bucket_seed;
-  auto engine =
-      vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits, block_dims, buckets);
+  auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits, buckets);
   engine.reserve_vectors(limit);
   const auto report = engine.ingest(limited);
   if (report.vectors_ingested != limit) {
@@ -498,7 +497,6 @@ int main(int argc, char** argv) {
   std::uint64_t seed = 42;
   std::size_t k = 10;
   std::size_t bits = 1;
-  std::size_t block_dims = 1;
   std::size_t num_buckets = 256;
   std::size_t rebalance_every = 10000;
   float ortho_eta = 0.1f;
@@ -517,8 +515,7 @@ int main(int argc, char** argv) {
   app.add_option("--query-limit", query_limit, "Query count (default: 10000 GloVe, 1000 else)");
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
-  app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
-  app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
+  app.add_option("--bits", bits, "TurboQuantMSE bits per dim (1-8)");
   app.add_option("--num-buckets", num_buckets, "Cluster IVF bucket count B");
   app.add_option("--rebalance-every", rebalance_every,
                  "Lloyd rebalance every N vectors (0 = finalize only)");
@@ -539,7 +536,6 @@ int main(int argc, char** argv) {
       throw vectorcache::Error("pass --dataset or --npy");
     }
     vectorcache::quantize::validate_bits_per_dim(bits);
-    vectorcache::quantize::validate_block_dims(block_dims);
     if (num_buckets == 0 || num_buckets > vectorcache::index::kMaxBuckets) {
       throw vectorcache::Error("num-buckets must be in 1..kMaxBuckets");
     }
@@ -562,7 +558,7 @@ int main(int argc, char** argv) {
     std::cout << "Query bench: index=" << source_label << " dim=" << meta.dim
               << " srht_dim=" << meta.dim << " index_n=" << actual_index
               << " query_n=" << query_limit << " query_split=" << query_split
-              << " bits=" << bits << " block_dims=" << block_dims
+              << " bits=" << bits
               << " B=" << num_buckets << " rebalance_every=" << rebalance_every
               << " ortho_eta=" << ortho_eta << " nprobe=" << probe_radius << '\n';
     if (limit && *limit < meta.count) {
@@ -571,7 +567,7 @@ int main(int argc, char** argv) {
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto ingest_engine =
-        ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims, num_buckets,
+        ingest_index(index_limited, meta.dim, seed, actual_index, bits, num_buckets,
                      rebalance_every, ortho_eta, bucket_seed);
     {
       const auto& store = ingest_engine.store();

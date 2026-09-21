@@ -54,31 +54,29 @@ IngestionEngine::IngestionEngine(VectorStore store, std::optional<transform::Srh
 }
 
 IngestionEngine IngestionEngine::from_rotated(std::size_t srht_dim, std::size_t bits_per_dim,
-                                              std::size_t block_dims, BucketParams buckets) {
-  quantize::LloydMaxCodebook codebook(srht_dim, bits_per_dim, block_dims);
-  const std::size_t l0_words = quantize::l0_words_per_vector(srht_dim, bits_per_dim, block_dims);
+                                              BucketParams buckets) {
+  quantize::LloydMaxCodebook codebook(srht_dim, bits_per_dim);
+  const std::size_t l0_words = quantize::l0_words_per_vector(srht_dim, bits_per_dim);
   const std::uint64_t seed = resolve_bucket_seed(buckets.bucket_seed, 0, false);
-  return IngestionEngine(VectorStore(l0_words, srht_dim, srht_dim, bits_per_dim, block_dims),
-                         std::nullopt, true, srht_dim, srht_dim, l0_words, std::move(codebook),
-                         buckets, seed);
+  return IngestionEngine(VectorStore(l0_words, srht_dim, srht_dim, bits_per_dim), std::nullopt, true,
+                         srht_dim, srht_dim, l0_words, std::move(codebook), buckets, seed);
 }
 
 IngestionEngine IngestionEngine::with_rotation(std::size_t original_dim, std::uint64_t seed,
-                                               std::size_t bits_per_dim, std::size_t block_dims,
-                                               BucketParams buckets) {
+                                               std::size_t bits_per_dim, BucketParams buckets) {
   transform::SrhtRotation rotation(original_dim, seed);
   const std::size_t srht = rotation.srht_dim();
-  quantize::LloydMaxCodebook codebook(srht, bits_per_dim, block_dims);
-  const std::size_t l0_words = quantize::l0_words_per_vector(srht, bits_per_dim, block_dims);
+  quantize::LloydMaxCodebook codebook(srht, bits_per_dim);
+  const std::size_t l0_words = quantize::l0_words_per_vector(srht, bits_per_dim);
   const std::uint64_t bucket_seed = resolve_bucket_seed(buckets.bucket_seed, seed, true);
-  return IngestionEngine(VectorStore(l0_words, original_dim, srht, bits_per_dim, block_dims),
-                         std::move(rotation), false, original_dim, srht, l0_words,
-                         std::move(codebook), buckets, bucket_seed);
+  return IngestionEngine(VectorStore(l0_words, original_dim, srht, bits_per_dim), std::move(rotation),
+                         false, original_dim, srht, l0_words, std::move(codebook), buckets,
+                         bucket_seed);
 }
 
 void IngestionEngine::reserve_vectors(std::size_t count) {
   store_ = VectorStore::with_capacity(l0_words_per_vec_, input_dim_, srht_dim_, count,
-                                      codebook_.bits(), codebook_.block_dims());
+                                      codebook_.bits());
   ensure_batch_capacity(std::min(INGEST_BATCH_SIZE, std::max(count, std::size_t{1})));
   rotated_all_.reserve(count * srht_dim_);
 }

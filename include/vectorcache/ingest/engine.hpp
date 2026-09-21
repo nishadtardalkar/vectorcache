@@ -35,10 +35,9 @@ class IngestionEngine {
  public:
   /// Already-SRHT'd vectors of length srht_dim (input_dim == srht_dim).
   static IngestionEngine from_rotated(std::size_t srht_dim, std::size_t bits_per_dim = 1,
-                                      std::size_t block_dims = 1,
                                       BucketParams buckets = BucketParams{});
   static IngestionEngine with_rotation(std::size_t original_dim, std::uint64_t seed,
-                                       std::size_t bits_per_dim = 1, std::size_t block_dims = 1,
+                                       std::size_t bits_per_dim = 1,
                                        BucketParams buckets = BucketParams{});
 
   void reserve_vectors(std::size_t count);
@@ -50,7 +49,6 @@ class IngestionEngine {
   const quantize::LloydMaxCodebook& codebook() const { return codebook_; }
   const index::ClusterCentroids& centroids() const { return centroids_; }
   std::size_t bits_per_dim() const { return codebook_.bits(); }
-  std::size_t block_dims() const { return codebook_.block_dims(); }
 
  private:
   struct VectorWork {

@@ -9,7 +9,6 @@
 #include "vectorcache/index/rp_buckets.hpp"
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/query/distance.hpp"
-#include "vectorcache/query/fastscan.hpp"
 #include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/simd.hpp"
 #include "vectorcache/transform/normalize.hpp"
@@ -23,8 +22,8 @@ namespace vectorcache::query {
 namespace {
 
 constexpr std::size_t kHeapTopKThreshold = 32;
-/// Parallelize when a single cell covers at least this many FastScan blocks.
-constexpr std::size_t kParallelMinBlocks = 1024;
+/// Parallelize when probed cells cover at least this many candidates.
+constexpr std::size_t kParallelMinCandidates = 32768;
 
 class TopKHits {
  public:
@@ -218,52 +217,6 @@ void apply_scales(std::span<float> scores, std::span<const float> scales, std::s
   }
 }
 
-void score_block_range_into_topk(const BlockedCodes& blocked, const QueryLut& lut,
-                                 const ingest::VectorStore& store, std::size_t block,
-                                 std::size_t range_lo, std::size_t range_hi, TopKHits& topk) {
-  const std::size_t count = blocked.block_count(block);
-  if (count == 0) {
-    return;
-  }
-  const std::size_t base = block * BlockedCodes::kBlock;
-  const std::size_t block_hi = base + count;
-  if (block_hi <= range_lo || base >= range_hi) {
-    return;
-  }
-
-  alignas(64) float score_buf[BlockedCodes::kBlock];
-  score_blocked_batch(lut, blocked, block, std::span<float>(score_buf, count));
-
-  const auto ids = store.ids();
-  const auto scales = store.scales();
-  apply_scales(std::span<float>(score_buf, count), scales, base, count);
-
-  const std::size_t begin = std::max(range_lo, base);
-  const std::size_t end = std::min(range_hi, block_hi);
-  float threshold = topk.reject_threshold();
-  for (std::size_t idx = begin; idx < end; ++idx) {
-    const float score = score_buf[idx - base];
-    if (score < threshold) [[likely]] {
-      continue;
-    }
-    topk.push(ids[idx], score);
-    threshold = topk.reject_threshold();
-  }
-}
-
-void score_store_range_fastscan(const BlockedCodes& blocked, const QueryLut& lut,
-                                const ingest::VectorStore& store, std::size_t lo, std::size_t hi,
-                                TopKHits& topk) {
-  if (lo >= hi) {
-    return;
-  }
-  const std::size_t block_begin = lo / BlockedCodes::kBlock;
-  const std::size_t block_end = (hi + BlockedCodes::kBlock - 1) / BlockedCodes::kBlock;
-  for (std::size_t block = block_begin; block < block_end; ++block) {
-    score_block_range_into_topk(blocked, lut, store, block, lo, hi, topk);
-  }
-}
-
 void score_store_range_vector_major(const ingest::VectorStore& store, const QueryLut& lut,
                                     const PreparedQuery& query,
                                     const quantize::LloydMaxCodebook& codebook, std::size_t lo,
@@ -339,26 +292,15 @@ QueryEngine::QueryEngine(const ingest::VectorStore& store,
 
 QueryEngine QueryEngine::with_rotation(const ingest::VectorStore& store, std::size_t input_dim,
                                        std::uint64_t seed) {
-  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim(), store.block_dims());
+  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim());
   return QueryEngine(store, transform::SrhtRotation(input_dim, seed), false, input_dim,
                      std::move(codebook));
 }
 
 QueryEngine QueryEngine::from_rotated(const ingest::VectorStore& store) {
-  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim(), store.block_dims());
+  quantize::LloydMaxCodebook codebook(store.srht_dim(), store.bits_per_dim());
   return QueryEngine(store, std::nullopt, true, store.input_dim(), std::move(codebook));
 }
-
-const BlockedCodes& QueryEngine::blocked_codes() const {
-  if (blocked_n_ != store_.size()) {
-    blocked_.rebuild(store_.l0_codes(), store_.l0_words_per_vec(), store_.size(), store_.srht_dim(),
-                     store_.bits_per_dim(), store_.block_dims());
-    blocked_n_ = store_.size();
-  }
-  return blocked_;
-}
-
-void QueryEngine::prepare_index() const { (void)blocked_codes(); }
 
 void QueryEngine::prepare_into(PreparedQuery& out, std::span<const float> query) const {
   prepare_query_into(store_, rotation_, query_is_rotated_, input_dim_, query, out);
@@ -381,12 +323,7 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
   const index::BucketIndex& buckets = store_.buckets();
   index::validate_probe_radius(params.probe_radius);
 
-  const BlockedCodes& blocked = blocked_codes();
-  const std::size_t m = store_.srht_dim() / store_.block_dims();
-  const bool byte_aligned =
-      lut_bits_supported(store_.bits_per_dim()) && (m * store_.bits_per_dim()) % 8 == 0;
   build_query_lut(prepared.rotated, codebook_, lut_cache_);
-  const bool use_fastscan = !blocked.empty() && byte_aligned && !lut_cache_.empty();
 
   std::size_t candidates = 0;
   const std::vector<index::BucketRange> ranges =
@@ -397,38 +334,29 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
     stats->cells_probed = ranges.size();
   }
 
-  if (use_fastscan) {
 #if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
-    const bool prefer_parallel =
-        ranges.size() >= 8 && candidates >= kParallelMinBlocks * BlockedCodes::kBlock &&
-        omp_get_max_threads() > 1;
-    if (prefer_parallel) {
-      const int nthreads = omp_get_max_threads();
-      std::vector<TopKHits>& locals = omp_topk_scratch(params.k, nthreads);
+  const bool prefer_parallel = ranges.size() >= 8 && candidates >= kParallelMinCandidates &&
+                               omp_get_max_threads() > 1;
+  if (prefer_parallel) {
+    const int nthreads = omp_get_max_threads();
+    std::vector<TopKHits>& locals = omp_topk_scratch(params.k, nthreads);
 #pragma omp parallel
-      {
-        const int tid = omp_get_thread_num();
-        TopKHits& local = locals[static_cast<std::size_t>(tid)];
+    {
+      const int tid = omp_get_thread_num();
+      TopKHits& local = locals[static_cast<std::size_t>(tid)];
 #pragma omp for schedule(dynamic) nowait
-        for (int r = 0; r < static_cast<int>(ranges.size()); ++r) {
-          const auto& range = ranges[static_cast<std::size_t>(r)];
-          score_store_range_fastscan(blocked, lut_cache_, store_, range.start,
-                                     range.start + range.length, local);
-        }
+      for (int r = 0; r < static_cast<int>(ranges.size()); ++r) {
+        const auto& range = ranges[static_cast<std::size_t>(r)];
+        score_store_range_vector_major(store_, lut_cache_, prepared, codebook_, range.start,
+                                       range.start + range.length, local);
       }
-      for (auto& local : locals) {
-        topk.merge_from(local);
-      }
-      return topk.finalize();
     }
-#endif
-    for (const auto& range : ranges) {
-      score_store_range_fastscan(blocked, lut_cache_, store_, range.start,
-                                 range.start + range.length, topk);
+    for (auto& local : locals) {
+      topk.merge_from(local);
     }
     return topk.finalize();
   }
-
+#endif
   for (const auto& range : ranges) {
     score_store_range_vector_major(store_, lut_cache_, prepared, codebook_, range.start,
                                    range.start + range.length, topk);

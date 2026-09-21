@@ -89,14 +89,10 @@ float reference_asymmetric_ip(std::span<const float> query,
                               std::span<const std::uint64_t> words,
                               const quantize::LloydMaxCodebook& codebook) {
   float score = 0.0f;
-  const std::size_t block_dims = codebook.block_dims();
-  const std::size_t m = codebook.srht_dim() / block_dims;
-  for (std::size_t b = 0; b < m; ++b) {
+  const std::size_t dim = codebook.srht_dim();
+  for (std::size_t b = 0; b < dim; ++b) {
     const auto code = quantize::unpack_code(words, b, codebook.bits());
-    const auto c = codebook.centroid(code);
-    for (std::size_t j = 0; j < block_dims; ++j) {
-      score += query[b * block_dims + j] * c[j];
-    }
+    score += query[b] * codebook.centroid_at(code);
   }
   return score;
 }
@@ -186,71 +182,6 @@ TEST(QueryDistanceTest, OddBitsUsesScalarFallback) {
   std::vector<float> scores(1);
   query::asymmetric_ip_batch(q, words, words.size(), 1, codebook, scores);
   EXPECT_NEAR(scores[0], ref, 1e-5f);
-}
-
-TEST(QueryDistanceTest, BlockDims2LutMatchesScalar) {
-  constexpr std::size_t dim = 64;
-  constexpr std::size_t bits = 1;
-  constexpr std::size_t block_dims = 2;
-  quantize::LloydMaxCodebook codebook(dim, bits, block_dims);
-  std::vector<float> q(dim);
-  for (std::size_t i = 0; i < dim; ++i) {
-    q[i] = static_cast<float>(static_cast<int>(i % 5) - 2) * 0.08f;
-  }
-  const auto [words, _] = quantize::quantize_blocks_to_nbit(q, codebook);
-  const float ref = reference_asymmetric_ip(q, words, codebook);
-
-  query::QueryLut lut;
-  query::build_query_lut(q, codebook, lut);
-  ASSERT_FALSE(lut.empty());
-  EXPECT_EQ(lut.num_codes(), dim / block_dims);
-  EXPECT_FALSE(lut.has_bit1_deltas());  // M=32, not multiple of 64
-
-  EXPECT_NEAR(query::asymmetric_ip_score(q, words, codebook), ref, 1e-5f);
-  EXPECT_NEAR(query::asymmetric_ip_score_lut(lut, words), ref, 1e-5f);
-}
-
-TEST(QueryDistanceTest, BlockDims2Bits1MaskAddWhenAligned) {
-  // dim=128, block_dims=2 → M=64 codes → bit1 mask-add path
-  constexpr std::size_t dim = 128;
-  constexpr std::size_t bits = 1;
-  constexpr std::size_t block_dims = 2;
-  quantize::LloydMaxCodebook codebook(dim, bits, block_dims);
-  std::vector<float> q(dim);
-  for (std::size_t i = 0; i < dim; ++i) {
-    q[i] = (i % 3 == 0) ? 0.12f : -0.07f;
-  }
-  const auto [words, _] = quantize::quantize_blocks_to_nbit(q, codebook);
-  const float ref = reference_asymmetric_ip(q, words, codebook);
-
-  query::QueryLut lut;
-  query::build_query_lut(q, codebook, lut);
-  ASSERT_FALSE(lut.empty());
-  ASSERT_TRUE(lut.has_bit1_deltas());
-  EXPECT_EQ(lut.num_codes(), 64u);
-  EXPECT_NEAR(query::asymmetric_ip_score_lut(lut, words), ref, 1e-5f);
-}
-
-TEST(QueryDistanceTest, BlockDims2Bits8LutMatchesScalar) {
-  constexpr std::size_t dim = 64;
-  constexpr std::size_t bits = 8;
-  constexpr std::size_t block_dims = 2;
-  quantize::LloydMaxCodebook codebook(dim, bits, block_dims);
-  std::vector<float> q(dim);
-  for (std::size_t i = 0; i < dim; ++i) {
-    q[i] = static_cast<float>(static_cast<int>(i % 7) - 3) * 0.06f;
-  }
-  const auto [words, _] = quantize::quantize_blocks_to_nbit(q, codebook);
-  const float ref = reference_asymmetric_ip(q, words, codebook);
-
-  query::QueryLut lut;
-  query::build_query_lut(q, codebook, lut);
-  ASSERT_FALSE(lut.empty());
-  EXPECT_EQ(lut.bits(), 8u);
-  EXPECT_EQ(lut.num_codes(), dim / block_dims);
-
-  EXPECT_NEAR(query::asymmetric_ip_score(q, words, codebook), ref, 1e-5f);
-  EXPECT_NEAR(query::asymmetric_ip_score_lut(lut, words), ref, 1e-5f);
 }
 
 TEST(QueryEngineTest, SelfSimilarityTopHit) {
