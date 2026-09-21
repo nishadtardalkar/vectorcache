@@ -145,6 +145,8 @@ TEST(StoreBucketsTest, FinalizeBuildsBuckets) {
   std::vector<std::uint64_t> keys = {5, 1, 5};
   store.finalize_buckets(keys, std::move(matrix), codec);
   ASSERT_TRUE(store.has_buckets());
+  EXPECT_EQ(store.num_tables(), 1u);
+  EXPECT_FALSE(store.buckets().has_postings());
   EXPECT_EQ(store.buckets().num_cells(), 2u);
   EXPECT_EQ(store.buckets().cell(0).length, 1u);  // key 1
   EXPECT_EQ(store.buckets().cell(1).length, 2u);  // key 5
@@ -152,6 +154,58 @@ TEST(StoreBucketsTest, FinalizeBuildsBuckets) {
   EXPECT_EQ(store.id_at(0), 1u);
   EXPECT_EQ(store.id_at(1), 0u);
   EXPECT_EQ(store.id_at(2), 2u);
+}
+
+TEST(StoreBucketsTest, MultiTablePostingsKeepIngestOrder) {
+  constexpr std::size_t dim = 16;
+  constexpr std::size_t bits = 1;
+  const std::size_t l0_words = quantize::l0_words_per_vector(dim, bits);
+  ingest::VectorStore store(l0_words, dim, dim, bits);
+  std::vector<std::uint64_t> l0(l0_words, 0);
+  store.push(0, l0);
+  store.push(1, l0);
+  store.push(2, l0);
+
+  const index::BinCodec codec = index::make_bin_codec(1, 0.1f);
+  // Table-major keys: table0 = {5,1,5}, table1 = {2,2,9}
+  std::vector<std::uint64_t> all_keys = {5, 1, 5, 2, 2, 9};
+  std::vector<index::ProjectionMatrix> matrices;
+  matrices.emplace_back(1, dim, 10);
+  matrices.emplace_back(1, dim, 11);
+  store.finalize_buckets(all_keys, std::move(matrices), codec);
+
+  ASSERT_EQ(store.num_tables(), 2u);
+  EXPECT_TRUE(store.buckets(0).has_postings());
+  EXPECT_TRUE(store.buckets(1).has_postings());
+  // Ingest order preserved.
+  EXPECT_EQ(store.id_at(0), 0u);
+  EXPECT_EQ(store.id_at(1), 1u);
+  EXPECT_EQ(store.id_at(2), 2u);
+
+  const auto r0 = store.buckets(0).find(1);
+  ASSERT_EQ(r0.length, 1u);
+  EXPECT_EQ(store.buckets(0).row_at(r0.start), 1u);
+
+  const auto r1 = store.buckets(1).find(9);
+  ASSERT_EQ(r1.length, 1u);
+  EXPECT_EQ(store.buckets(1).row_at(r1.start), 2u);
+}
+
+TEST(RpBucketsTest, BuildPostingsMapsRows) {
+  index::ProjectionMatrix matrix(1, 4, 1);
+  const index::BinCodec codec = index::make_bin_codec(1, 0.5f);
+  std::vector<std::uint64_t> keys = {5, 1, 5};
+  auto index = index::BucketIndex::build_postings(keys, std::move(matrix), codec);
+  ASSERT_TRUE(index.has_postings());
+  EXPECT_EQ(index.num_cells(), 2u);
+  const auto r = index.find(1);
+  ASSERT_EQ(r.length, 1u);
+  EXPECT_EQ(index.row_at(r.start), 1u);
+  const auto r5 = index.find(5);
+  ASSERT_EQ(r5.length, 2u);
+  auto rows = index.rows_span(r5);
+  EXPECT_EQ(rows[0], 0u);
+  EXPECT_EQ(rows[1], 2u);
 }
 
 TEST(QueryBucketTest, SelfHitWithProbeZero) {
@@ -182,6 +236,37 @@ TEST(QueryBucketTest, SelfHitWithProbeZero) {
   EXPECT_EQ(hits[0].id, 3u);
   EXPECT_GT(stats.candidates, 0u);
   EXPECT_LE(stats.candidates, ingest_engine.store().size());
+}
+
+TEST(QueryBucketTest, MultiTableOrFindsSelf) {
+  const std::size_t dim = 64;
+  std::vector<std::vector<float>> vectors;
+  for (std::size_t i = 0; i < 16; ++i) {
+    std::vector<float> v(dim, 0.0f);
+    v[i % dim] = 1.0f + 0.01f * static_cast<float>(i);
+    vectors.push_back(std::move(v));
+  }
+  MockReader reader(vectors, dim);
+
+  ingest::BucketParams bp;
+  bp.num_projections = 1;
+  bp.num_tables = 3;
+  bp.bin_width = 0.05f;
+  bp.bucket_seed = 99;
+  auto ingest_engine = ingest::IngestionEngine::with_rotation(dim, 42, 1, 1, bp);
+  ingest_engine.ingest(reader);
+  ASSERT_EQ(ingest_engine.store().num_tables(), 3u);
+  EXPECT_TRUE(ingest_engine.store().buckets(0).has_postings());
+
+  auto query_engine = query::QueryEngine::with_rotation(ingest_engine.store(), dim, 42);
+  query::QueryParams params;
+  params.k = 1;
+  params.probe_radius = 0;
+  query::SearchStats stats;
+  const auto hits = query_engine.search(vectors[5], params, &stats);
+  ASSERT_FALSE(hits.empty());
+  EXPECT_EQ(hits[0].id, 5u);
+  EXPECT_GE(stats.cells_probed, 1u);
 }
 
 TEST(QueryBucketTest, FarVectorExcludedWhenProbeTight) {

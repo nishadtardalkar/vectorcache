@@ -18,6 +18,7 @@ SEED          ?=
 BITS          ?= 1
 BLOCK_DIMS    ?= 1
 NUM_PROJECTIONS ?= 1
+NUM_TABLES    ?= 1
 BIN_WIDTH     ?= 0.1
 PROBE_RADIUS  ?= 1
 BUCKET_SEED   ?=
@@ -79,6 +80,7 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
 	$(call opt_arg,NUM_PROJECTIONS,num-projections) \
+	$(call opt_arg,NUM_TABLES,num-tables) \
 	$(call opt_arg,BIN_WIDTH,bin-width) \
 	$(call opt_arg,PROBE_RADIUS,probe-radius) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
@@ -121,7 +123,8 @@ help:
 	@echo "  SEED            --seed"
 	@echo "  BITS            --bits (default $(BITS); TurboQuantMSE bits/block, 1-8)"
 	@echo "  BLOCK_DIMS      --block-dims (default $(BLOCK_DIMS); dims per codebook block, 1-16)"
-	@echo "  NUM_PROJECTIONS --num-projections (default $(NUM_PROJECTIONS); RP bucket R; query-bench)"
+	@echo "  NUM_PROJECTIONS --num-projections (default $(NUM_PROJECTIONS); RP bucket R per table; query-bench)"
+	@echo "  NUM_TABLES      --num-tables (default $(NUM_TABLES); independent RP tables, OR candidates)"
 	@echo "  BIN_WIDTH       --bin-width (default $(BIN_WIDTH); RP bin width w; query-bench)"
 	@echo "  PROBE_RADIUS    --probe-radius (default $(PROBE_RADIUS); multi-probe P; query-bench)"
 	@echo "  BUCKET_SEED     --bucket-seed (RP seed; query-bench / query-bench-tune)"

@@ -24,6 +24,7 @@ struct IngestReport {
 
 struct BucketParams {
   std::size_t num_projections = 1;
+  std::size_t num_tables = 1;
   float bin_width = 0.1f;
   std::uint64_t bucket_seed = 0;  // 0 => derive from rotation seed when available
 };
@@ -54,7 +55,8 @@ class IngestionEngine {
     AlignedVector<float> buf;  // length srht_dim_
     AlignedVector<std::uint64_t> l0;
     float alpha = 1.0f;
-    std::uint64_t cell_key = 0;
+    /// Per-table cell keys (size num_tables).
+    std::vector<std::uint64_t> cell_keys;
   };
 
   IngestionEngine(VectorStore store, std::optional<transform::SrhtRotation> rotation,
@@ -65,7 +67,7 @@ class IngestionEngine {
   void ensure_batch_capacity(std::size_t batch_cap);
   std::size_t read_batch(datasets::DatasetReader& reader);
   void process_batch(std::size_t batch_len);
-  void finalize_bucket_index(std::span<const std::uint64_t> cell_keys);
+  void finalize_bucket_index(std::span<const std::uint64_t> all_keys);
 
   VectorStore store_;
   std::optional<transform::SrhtRotation> rotation_;
@@ -76,7 +78,7 @@ class IngestionEngine {
   quantize::LloydMaxCodebook codebook_;
   BucketParams bucket_params_;
   std::uint64_t bucket_seed_;
-  index::ProjectionMatrix projection_;
+  std::vector<index::ProjectionMatrix> projections_;
   index::BinCodec bin_codec_{};
   std::vector<VectorWork> batch_work_;
 };

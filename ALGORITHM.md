@@ -4,10 +4,10 @@ Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation**, 
 
 1. L2-normalize on `dim`
 2. Apply `K` rounds of (global Fisher–Yates permutation → ±1 signs → normalized block Walsh–Hadamard); `K` is compile-time (`VECTORCACHE_SRHT_ROUNDS`, default **2**). Block size is the largest power-of-two divisor of `dim` (no zero-pad).
-3. **RP buckets (prune):** project the rotated unit vector onto `R` independent random unit directions; bin with width `w` as `b_i = ⌊⟨x,r_i⟩ / w⌋`; pack the R-tuple into a cell key. After ingest, argsort the store by cell key and build a CSR inverted index so each cell is a contiguous row range.
+3. **RP buckets (prune):** project the rotated unit vector onto `R` independent random unit directions **per table**; bin with width `w` as `b_i = ⌊⟨x,r_i⟩ / w⌋`; pack the R-tuple into a cell key. With `T=1`, argsort the store by cell key and build a CSR so each cell is a contiguous row range. With `T>1` (multi-table), keep ingest order and build **T independent posting lists** (cell → store rows); query **ORs** probed rows across tables and scores each row at most once.
 4. Lloyd-Max / block-VQ: each contiguous block of `d` rotated coords → one of `2^n` centroids in `R^d` for **Beta((dim−1)/2, (dim−1)/2)** (product measure when `d>1`); pack `n`-bit indices (`M = dim/d` codes)
 5. Store per-vector IP scale `α = 1 / ⟨u, x̂⟩` (unit `u`, reconstruction `x̂`) for RaBitQ-style length renormalization
-6. Query: same prep (keep query float in rotated space), compute query bins, **multi-probe** all cells with L_∞ offset `≤ P` (ordered by `Σ o_i²`), score only those contiguous ranges with asymmetric IP × `α`, take top-k
+6. Query: same prep (keep query float in rotated space), for each table compute query bins and **multi-probe** cells with L_∞ offset `≤ P` (ordered by `Σ o_i²`), union candidates, score with asymmetric IP × `α`, take top-k
 
 ```
  INGEST                              QUERY
@@ -20,13 +20,13 @@ Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation**, 
         ▼                                   ▼
  perm+signs+block-WH (×K)            perm+signs+block-WH (×K)
         │                                   │
-        ├─ RP dots → bins → cell key        ├─ RP dots → bins
+        ├─ RP×T → bins → cell keys          ├─ per-table RP bins
         │                                   ▼
-        ▼                            multi-probe cells (L_∞ ≤ P)
+        ▼                            multi-probe each table (L_∞ ≤ P)
  Lloyd-Max n bits / d dims                  │
  + store α = 1/⟨u,x̂⟩                         ▼
-        │                            score probed ranges × α → top-k
- argsort by cell key + CSR
+        │                            OR unique rows → score × α → top-k
+ T=1: argsort+CSR / T>1: postings
 ```
 
 ## Ranking
@@ -37,7 +37,7 @@ Asymmetric inner product in rotated space with length renormalization:
 
 Higher is better. Same path for all `(d, n)`. Only vectors in probed RP cells are scored.
 
-For byte-aligned widths (`n ∈ {1,2,4,8}` and `(M·n) % 8 == 0`), search builds exact float query LUTs (one 256-entry table per packed **code** byte-group) and scores from a **FAISS FastScan-style blocked cache** (`BLOCK=32`: for each byte-group, 32 vectors’ bytes are contiguous). Canonical ingest storage remains vector-major packed codes (reordered by bucket); the blocked view is rebuilt lazily on search (or via `QueryEngine::prepare_index()`). Range scoring walks FastScan blocks that intersect each probed `[lo, hi)` and masks partial edge blocks.
+For byte-aligned widths (`n ∈ {1,2,4,8}` and `(M·n) % 8 == 0`), search builds exact float query LUTs (one 256-entry table per packed **code** byte-group) and scores from a **FAISS FastScan-style blocked cache** (`BLOCK=32`: for each byte-group, 32 vectors’ bytes are contiguous). Canonical ingest storage remains vector-major packed codes (`T=1` reorders by bucket for contiguous ranges; `T>1` keeps ingest order with per-table postings). The blocked view is rebuilt lazily on search (or via `QueryEngine::prepare_index()`). Range scoring walks FastScan blocks that intersect each scored `[lo, hi)` run and masks partial edge blocks.
 
 | bits | Hot path |
 |------|----------|
@@ -56,7 +56,7 @@ With `VECTORCACHE_OPENMP`, search parallelizes across probed cells when there ar
 | `k` | 10 | top-k |
 | `probe_radius` | 1 | multi-probe L_∞ radius `P` in bin units |
 
-Index-time RP knobs (`BucketParams` / CLI): `num_projections` (`R`), `bin_width` (`w`), `bucket_seed`. Probe grid size `(2P+1)^R` must be `≤ 4096`.
+Index-time RP knobs (`BucketParams` / CLI): `num_projections` (`R`), `num_tables` (`T`), `bin_width` (`w`), `bucket_seed`. Probe grid size `(2P+1)^R` must be `≤ 4096`. Multi-table uses independent projection seeds and ORs candidates across tables.
 
 Runtime bits-per-block (`bits_per_dim` field name kept for compatibility) and `block_dims` are set at ingest (`IngestionEngine` / `--bits` / `--block-dims` / `BITS` / `BLOCK_DIMS`) and stored on `VectorStore` (`bits` 1–8, `block_dims` 1–16, `srht_dim % block_dims == 0`).
 

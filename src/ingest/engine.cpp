@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "vectorcache/error.hpp"
@@ -30,6 +31,10 @@ std::uint64_t resolve_bucket_seed(std::uint64_t bucket_seed, std::uint64_t rotat
   return 0xC0FFEE5EEDULL;
 }
 
+std::uint64_t table_seed(std::uint64_t base, std::size_t table) {
+  return base + static_cast<std::uint64_t>(table) * 0x9e3779b97f4a7c15ULL;
+}
+
 }  // namespace
 
 IngestionEngine::IngestionEngine(VectorStore store, std::optional<transform::SrhtRotation> rotation,
@@ -45,10 +50,17 @@ IngestionEngine::IngestionEngine(VectorStore store, std::optional<transform::Srh
       codebook_(std::move(codebook)),
       bucket_params_(bucket_params),
       bucket_seed_(resolved_bucket_seed),
-      projection_(bucket_params.num_projections, srht_dim, resolved_bucket_seed),
       bin_codec_(index::make_bin_codec(bucket_params.num_projections, bucket_params.bin_width)) {
-  if (bucket_params.num_projections == 0) {
-    throw Error("BucketParams.num_projections must be > 0");
+  if (bucket_params.num_projections == 0 ||
+      bucket_params.num_projections > index::kMaxProjections) {
+    throw Error("BucketParams.num_projections must be in 1..kMaxProjections");
+  }
+  if (bucket_params.num_tables == 0 || bucket_params.num_tables > index::kMaxTables) {
+    throw Error("BucketParams.num_tables must be in 1..kMaxTables");
+  }
+  projections_.reserve(bucket_params.num_tables);
+  for (std::size_t t = 0; t < bucket_params.num_tables; ++t) {
+    projections_.emplace_back(bucket_params.num_projections, srht_dim, table_seed(bucket_seed_, t));
   }
 }
 
@@ -82,14 +94,19 @@ void IngestionEngine::reserve_vectors(std::size_t count) {
 }
 
 void IngestionEngine::ensure_batch_capacity(std::size_t batch_cap) {
+  const std::size_t T = bucket_params_.num_tables;
   if (batch_work_.size() < batch_cap) {
     batch_work_.resize(batch_cap);
-    for (auto& work : batch_work_) {
+  }
+  for (auto& work : batch_work_) {
+    if (work.buf.size() != srht_dim_) {
       work.buf.assign(srht_dim_, 0.0f);
-      work.l0.assign(l0_words_per_vec_, 0);
-      work.alpha = 1.0f;
-      work.cell_key = 0;
     }
+    if (work.l0.size() != l0_words_per_vec_) {
+      work.l0.assign(l0_words_per_vec_, 0);
+    }
+    work.alpha = 1.0f;
+    work.cell_keys.assign(T, 0);
   }
 }
 
@@ -117,10 +134,10 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
   const std::size_t input_dim = input_dim_;
   const std::size_t srht_dim = srht_dim_;
   const quantize::LloydMaxCodebook* codebook = &codebook_;
-  const index::ProjectionMatrix* projection = &projection_;
   const index::BinCodec codec = bin_codec_;
   const float bin_width = bucket_params_.bin_width;
   const std::size_t R = bucket_params_.num_projections;
+  const std::size_t T = projections_.size();
 
 #if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
 #pragma omp parallel for schedule(static)
@@ -131,9 +148,11 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
     }
     alignas(64) std::int32_t bins[index::kMaxProjections];
-    index::project_to_bins(*projection, work.buf, bin_width,
-                           std::span<std::int32_t>(bins, R));
-    work.cell_key = index::pack_cell_key(std::span<const std::int32_t>(bins, R), codec);
+    for (std::size_t t = 0; t < T; ++t) {
+      index::project_to_bins(projections_[t], work.buf, bin_width,
+                             std::span<std::int32_t>(bins, R));
+      work.cell_keys[t] = index::pack_cell_key(std::span<const std::int32_t>(bins, R), codec);
+    }
     quantize::quantize_blocks_to_nbit_into(work.buf, *codebook, work.l0);
     work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
@@ -145,8 +164,11 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
       rotation->apply_in_place(std::span<float>(work.buf.data(), srht_dim));
     }
     alignas(64) std::int32_t bins[index::kMaxProjections];
-    index::project_to_bins(*projection, work.buf, bin_width, std::span<std::int32_t>(bins, R));
-    work.cell_key = index::pack_cell_key(std::span<const std::int32_t>(bins, R), codec);
+    for (std::size_t t = 0; t < T; ++t) {
+      index::project_to_bins(projections_[t], work.buf, bin_width,
+                             std::span<std::int32_t>(bins, R));
+      work.cell_keys[t] = index::pack_cell_key(std::span<const std::int32_t>(bins, R), codec);
+    }
     quantize::quantize_blocks_to_nbit_into(work.buf, *codebook, work.l0);
     work.alpha = quantize::ip_scale_alpha(work.buf, work.l0, *codebook);
   }
@@ -154,8 +176,16 @@ void IngestionEngine::process_batch(std::size_t batch_len) {
   (void)quantize_only;
 }
 
-void IngestionEngine::finalize_bucket_index(std::span<const std::uint64_t> cell_keys) {
-  store_.finalize_buckets(cell_keys, projection_, bin_codec_);
+void IngestionEngine::finalize_bucket_index(std::span<const std::uint64_t> all_keys) {
+  std::vector<index::ProjectionMatrix> matrices;
+  matrices.reserve(projections_.size());
+  for (auto& proj : projections_) {
+    // ProjectionMatrix is not copyable cheaply via default - need to check if movable only.
+    // Re-create from same seeds to avoid moving engines' projections away for re-ingest.
+    matrices.push_back(std::move(proj));
+  }
+  projections_.clear();
+  store_.finalize_buckets(all_keys, std::move(matrices), bin_codec_);
 }
 
 IngestReport IngestionEngine::ingest(datasets::DatasetReader& reader, bool finalize_buckets) {
@@ -165,6 +195,7 @@ IngestReport IngestionEngine::ingest(datasets::DatasetReader& reader, bool final
 IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, VectorHook* hook,
                                                bool finalize_buckets) {
   const std::size_t meta_count = reader.meta().count;
+  const std::size_t T = bucket_params_.num_tables;
   if (meta_count > 0) {
     reserve_vectors(meta_count);
   } else {
@@ -172,9 +203,13 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
   }
 
   std::uint64_t global_id = 0;
-  std::vector<std::uint64_t> cell_keys;
+  // Table-major keys: table t occupies [t*n, (t+1)*n). Filled after we know n, or grow per-vector.
+  // Grow as vector-major then transpose, or allocate table-major with known meta_count.
+  std::vector<std::vector<std::uint64_t>> keys_per_table(T);
   if (finalize_buckets && meta_count > 0) {
-    cell_keys.reserve(meta_count);
+    for (auto& col : keys_per_table) {
+      col.reserve(meta_count);
+    }
   }
 
   while (true) {
@@ -192,7 +227,9 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
       }
       store_.push(static_cast<std::size_t>(global_id), work.l0, work.alpha);
       if (finalize_buckets) {
-        cell_keys.push_back(work.cell_key);
+        for (std::size_t t = 0; t < T; ++t) {
+          keys_per_table[t].push_back(work.cell_keys[t]);
+        }
       }
       ++global_id;
     }
@@ -202,7 +239,15 @@ IngestReport IngestionEngine::ingest_with_hook(datasets::DatasetReader& reader, 
     return IngestReport{0};
   }
   if (finalize_buckets) {
-    finalize_bucket_index(cell_keys);
+    const std::size_t n = static_cast<std::size_t>(global_id);
+    std::vector<std::uint64_t> all_keys(n * T);
+    for (std::size_t t = 0; t < T; ++t) {
+      if (keys_per_table[t].size() != n) {
+        throw Error("ingest: cell key count mismatch");
+      }
+      std::memcpy(all_keys.data() + t * n, keys_per_table[t].data(), n * sizeof(std::uint64_t));
+    }
+    finalize_bucket_index(all_keys);
   }
   return IngestReport{global_id};
 }

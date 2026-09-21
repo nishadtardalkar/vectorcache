@@ -74,10 +74,12 @@ vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::Dataset
                                                   std::size_t dim, std::uint64_t seed,
                                                   std::size_t limit, std::size_t bits,
                                                   std::size_t block_dims, std::size_t num_projections,
-                                                  float bin_width, std::uint64_t bucket_seed) {
+                                                  std::size_t num_tables, float bin_width,
+                                                  std::uint64_t bucket_seed) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
   vectorcache::ingest::BucketParams buckets;
   buckets.num_projections = num_projections;
+  buckets.num_tables = num_tables;
   buckets.bin_width = bin_width;
   buckets.bucket_seed = bucket_seed;
   auto engine =
@@ -297,6 +299,7 @@ int main(int argc, char** argv) {
   std::size_t bits = 1;
   std::size_t block_dims = 1;
   std::size_t num_projections = 1;
+  std::size_t num_tables = 1;
   float bin_width = 0.1f;
   std::size_t probe_radius = 1;
   std::uint64_t bucket_seed = 0;
@@ -315,7 +318,8 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
   app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
-  app.add_option("--num-projections", num_projections, "RP bucket projections R (1-8)");
+  app.add_option("--num-projections", num_projections, "RP bucket projections R per table (1-8)");
+  app.add_option("--num-tables", num_tables, "Independent RP tables (OR candidates; 1-16)");
   app.add_option("--bin-width", bin_width, "RP bucket bin width w");
   app.add_option("--probe-radius", probe_radius, "Multi-probe L_inf radius P");
   app.add_option("--bucket-seed", bucket_seed, "RP projection seed (0 = derive from --seed)");
@@ -334,6 +338,9 @@ int main(int argc, char** argv) {
     vectorcache::quantize::validate_block_dims(block_dims);
     if (num_projections == 0 || num_projections > vectorcache::index::kMaxProjections) {
       throw vectorcache::Error("num-projections must be in 1..kMaxProjections");
+    }
+    if (num_tables == 0 || num_tables > vectorcache::index::kMaxTables) {
+      throw vectorcache::Error("num-tables must be in 1..kMaxTables");
     }
     if (!(bin_width > 0.0f)) {
       throw vectorcache::Error("bin-width must be > 0");
@@ -358,7 +365,8 @@ int main(int argc, char** argv) {
               << " srht_dim=" << meta.dim << " index_n=" << actual_index
               << " query_n=" << query_limit << " query_split=" << query_split
               << " bits=" << bits << " block_dims=" << block_dims
-              << " R=" << num_projections << " w=" << bin_width << " P=" << probe_radius << '\n';
+              << " R=" << num_projections << " tables=" << num_tables << " w=" << bin_width
+              << " P=" << probe_radius << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
     }
@@ -366,18 +374,22 @@ int main(int argc, char** argv) {
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto ingest_engine =
         ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims, num_projections,
-                     bin_width, bucket_seed);
+                     num_tables, bin_width, bucket_seed);
     {
-      const auto& buckets = ingest_engine.store().buckets();
-      std::cout << "  stored_vectors=" << ingest_engine.store().size()
-                << " bucket_cells=" << buckets.num_cells() << '\n';
+      const auto& store = ingest_engine.store();
+      std::cout << "  stored_vectors=" << store.size() << " tables=" << store.num_tables();
+      for (std::size_t t = 0; t < store.num_tables(); ++t) {
+        std::cout << " bucket_cells[t" << t << "]=" << store.buckets(t).num_cells();
+      }
+      std::cout << '\n';
+      const auto& buckets0 = store.buckets(0);
       std::vector<std::size_t> sizes;
-      sizes.reserve(buckets.num_cells());
-      for (std::size_t i = 0; i < buckets.num_cells(); ++i) {
-        sizes.push_back(buckets.cell(i).length);
+      sizes.reserve(buckets0.num_cells());
+      for (std::size_t i = 0; i < buckets0.num_cells(); ++i) {
+        sizes.push_back(buckets0.cell(i).length);
       }
       std::sort(sizes.begin(), sizes.end(), std::greater<>());
-      std::cout << "  bucket_sizes (desc):";
+      std::cout << "  bucket_sizes table0 (desc):";
       for (const std::size_t n : sizes) {
         std::cout << ' ' << n;
       }

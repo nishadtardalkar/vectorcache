@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <string>
 
@@ -251,8 +252,8 @@ void validate_probe_grid(std::size_t num_projections, std::size_t probe_radius) 
   }
 }
 
-BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys, ProjectionMatrix matrix,
-                               BinCodec codec) {
+BucketIndex BucketIndex::build_csr(std::span<const std::uint64_t> sorted_keys,
+                                   ProjectionMatrix matrix, BinCodec codec) {
   if (sorted_keys.empty()) {
     throw Error("BucketIndex::build: empty keys");
   }
@@ -288,6 +289,35 @@ BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys, Proje
   return idx;
 }
 
+BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys, ProjectionMatrix matrix,
+                               BinCodec codec) {
+  return build_csr(sorted_keys, std::move(matrix), codec);
+}
+
+BucketIndex BucketIndex::build_postings(std::span<const std::uint64_t> cell_keys,
+                                        ProjectionMatrix matrix, BinCodec codec) {
+  const std::size_t n = cell_keys.size();
+  if (n == 0) {
+    throw Error("BucketIndex::build_postings: empty keys");
+  }
+  std::vector<std::size_t> order(n);
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    if (cell_keys[a] != cell_keys[b]) {
+      return cell_keys[a] < cell_keys[b];
+    }
+    return a < b;
+  });
+
+  std::vector<std::uint64_t> sorted_keys(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    sorted_keys[i] = cell_keys[order[i]];
+  }
+  BucketIndex idx = build_csr(sorted_keys, std::move(matrix), codec);
+  idx.rows_ = std::move(order);
+  return idx;
+}
+
 BucketRange BucketIndex::cell(std::size_t i) const {
   if (i >= keys_.size()) {
     throw Error("BucketIndex::cell: index out of range");
@@ -295,6 +325,26 @@ BucketRange BucketIndex::cell(std::size_t i) const {
   const std::size_t start = offsets_[i];
   const std::size_t end = offsets_[i + 1];
   return {start, end - start};
+}
+
+std::size_t BucketIndex::row_at(std::size_t i) const {
+  if (!has_postings() || i >= rows_.size()) {
+    throw Error("BucketIndex::row_at: invalid index or no postings");
+  }
+  return rows_[i];
+}
+
+std::span<const std::size_t> BucketIndex::rows_span(BucketRange range) const {
+  if (!has_postings()) {
+    throw Error("BucketIndex::rows_span: no postings");
+  }
+  if (range.length == 0) {
+    return {};
+  }
+  if (range.start + range.length > rows_.size()) {
+    throw Error("BucketIndex::rows_span: range out of bounds");
+  }
+  return std::span<const std::size_t>(rows_.data() + range.start, range.length);
 }
 
 BucketRange BucketIndex::find(std::uint64_t key) const {

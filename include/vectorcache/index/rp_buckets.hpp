@@ -11,6 +11,7 @@ namespace vectorcache::index {
 
 inline constexpr std::size_t kMaxProjections = 8;
 inline constexpr std::size_t kMaxProbeCells = 4096;
+inline constexpr std::size_t kMaxTables = 16;
 
 /// R independent unit vectors in R^{dim} (row-major: R * dim floats).
 class ProjectionMatrix {
@@ -61,7 +62,8 @@ struct BucketRange {
   std::size_t length = 0;
 };
 
-/// Contiguous CSR over store indices sorted by packed cell key.
+/// CSR over packed cell keys. With postings, probe ranges index into `rows_`;
+/// without postings, ranges are contiguous store slices (store was permuted by key).
 class BucketIndex {
  public:
   BucketIndex() = default;
@@ -70,15 +72,27 @@ class BucketIndex {
   static BucketIndex build(std::span<const std::uint64_t> sorted_keys, ProjectionMatrix matrix,
                            BinCodec codec);
 
+  /// Build CSR with store-row postings; does not require the store to be permuted.
+  /// `cell_keys[i]` is the key for store row i (ingest order).
+  static BucketIndex build_postings(std::span<const std::uint64_t> cell_keys,
+                                    ProjectionMatrix matrix, BinCodec codec);
+
   bool empty() const { return keys_.empty(); }
+  bool has_postings() const { return !rows_.empty(); }
   std::size_t num_cells() const { return keys_.size(); }
   std::size_t num_projections() const { return codec_.num_projections; }
   float bin_width() const { return codec_.bin_width; }
   const ProjectionMatrix& matrix() const { return matrix_; }
   const BinCodec& codec() const { return codec_; }
 
-  /// Contiguous store range for cell index `i` in key order (0 .. num_cells()-1).
+  /// Contiguous CSR range for cell index `i` in key order (0 .. num_cells()-1).
   BucketRange cell(std::size_t i) const;
+
+  /// Store row for posting slot `i` (requires has_postings()).
+  std::size_t row_at(std::size_t i) const;
+
+  /// Store rows for a probe/CSR range (requires has_postings()).
+  std::span<const std::size_t> rows_span(BucketRange range) const;
 
   /// Find contiguous range for an exact cell key; length 0 if missing.
   BucketRange find(std::uint64_t key) const;
@@ -90,8 +104,12 @@ class BucketIndex {
                                  std::size_t* out_candidates = nullptr) const;
 
  private:
+  static BucketIndex build_csr(std::span<const std::uint64_t> sorted_keys, ProjectionMatrix matrix,
+                               BinCodec codec);
+
   std::vector<std::uint64_t> keys_;
   std::vector<std::size_t> offsets_;  // size keys_+1
+  std::vector<std::size_t> rows_;     // store row indices in cell-key order (postings mode)
   ProjectionMatrix matrix_;
   BinCodec codec_;
 };

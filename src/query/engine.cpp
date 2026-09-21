@@ -374,65 +374,127 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
   }
 
   TopKHits topk(params.k);
-  const index::BucketIndex& buckets = store_.buckets();
-  index::validate_probe_grid(buckets.num_projections(), params.probe_radius);
-
-  alignas(64) std::int32_t bins[index::kMaxProjections];
-  index::project_to_bins(buckets.matrix(), prepared.rotated, buckets.bin_width(),
-                         std::span<std::int32_t>(bins, buckets.num_projections()));
-
-  std::size_t candidates = 0;
-  const std::vector<index::BucketRange> ranges =
-      buckets.probe(std::span<const std::int32_t>(bins, buckets.num_projections()),
-                    params.probe_radius, &candidates);
-  if (stats != nullptr) {
-    stats->candidates = candidates;
-    stats->cells_probed = ranges.size();
-  }
+  const std::size_t T = store_.num_tables();
+  const index::BucketIndex& table0 = store_.buckets(0);
+  index::validate_probe_grid(table0.num_projections(), params.probe_radius);
 
   const BlockedCodes& blocked = blocked_codes();
   const std::size_t m = store_.srht_dim() / store_.block_dims();
   const bool byte_aligned =
       lut_bits_supported(store_.bits_per_dim()) && (m * store_.bits_per_dim()) % 8 == 0;
-
   build_query_lut(prepared.rotated, codebook_, lut_cache_);
+  const bool use_fastscan = !blocked.empty() && byte_aligned && !lut_cache_.empty();
 
-  if (!blocked.empty() && byte_aligned && !lut_cache_.empty()) {
+  // Single-table contiguous store ranges (permute fast path).
+  if (T == 1 && !table0.has_postings()) {
+    alignas(64) std::int32_t bins[index::kMaxProjections];
+    index::project_to_bins(table0.matrix(), prepared.rotated, table0.bin_width(),
+                           std::span<std::int32_t>(bins, table0.num_projections()));
+
+    std::size_t candidates = 0;
+    const std::vector<index::BucketRange> ranges =
+        table0.probe(std::span<const std::int32_t>(bins, table0.num_projections()),
+                     params.probe_radius, &candidates);
+    if (stats != nullptr) {
+      stats->candidates = candidates;
+      stats->cells_probed = ranges.size();
+    }
+
+    if (use_fastscan) {
 #if defined(VECTORCACHE_OPENMP) && VECTORCACHE_OPENMP
-    // Parallelize across probed cells when many cells or large total candidates.
-    const bool prefer_parallel =
-        ranges.size() >= 8 && candidates >= kParallelMinBlocks * BlockedCodes::kBlock &&
-        omp_get_max_threads() > 1;
-    if (prefer_parallel) {
-      const int nthreads = omp_get_max_threads();
-      std::vector<TopKHits>& locals = omp_topk_scratch(params.k, nthreads);
+      const bool prefer_parallel =
+          ranges.size() >= 8 && candidates >= kParallelMinBlocks * BlockedCodes::kBlock &&
+          omp_get_max_threads() > 1;
+      if (prefer_parallel) {
+        const int nthreads = omp_get_max_threads();
+        std::vector<TopKHits>& locals = omp_topk_scratch(params.k, nthreads);
 #pragma omp parallel
-      {
-        const int tid = omp_get_thread_num();
-        TopKHits& local = locals[static_cast<std::size_t>(tid)];
+        {
+          const int tid = omp_get_thread_num();
+          TopKHits& local = locals[static_cast<std::size_t>(tid)];
 #pragma omp for schedule(dynamic) nowait
-        for (int r = 0; r < static_cast<int>(ranges.size()); ++r) {
-          const auto& range = ranges[static_cast<std::size_t>(r)];
-          score_store_range_fastscan(blocked, lut_cache_, store_, range.start,
-                                     range.start + range.length, local);
+          for (int r = 0; r < static_cast<int>(ranges.size()); ++r) {
+            const auto& range = ranges[static_cast<std::size_t>(r)];
+            score_store_range_fastscan(blocked, lut_cache_, store_, range.start,
+                                       range.start + range.length, local);
+          }
         }
+        for (auto& local : locals) {
+          topk.merge_from(local);
+        }
+        return topk.finalize();
       }
-      for (auto& local : locals) {
-        topk.merge_from(local);
+#endif
+      for (const auto& range : ranges) {
+        score_store_range_fastscan(blocked, lut_cache_, store_, range.start,
+                                   range.start + range.length, topk);
       }
       return topk.finalize();
     }
-#endif
+
     for (const auto& range : ranges) {
-      score_store_range_fastscan(blocked, lut_cache_, store_, range.start,
-                                 range.start + range.length, topk);
+      score_store_range_vector_major(store_, lut_cache_, prepared, codebook_, range.start,
+                                     range.start + range.length, topk);
     }
     return topk.finalize();
   }
 
-  for (const auto& range : ranges) {
-    score_store_range_vector_major(store_, lut_cache_, prepared, codebook_, range.start,
-                                   range.start + range.length, topk);
+  // Multi-table (or postings): OR unique store rows, coalesce, score once.
+  const std::size_t n = store_.size();
+  std::vector<std::uint8_t> visited(n, 0);
+  std::vector<std::size_t> uniq;
+  uniq.reserve(std::min(n, static_cast<std::size_t>(4096)));
+  std::size_t cells_probed = 0;
+
+  alignas(64) std::int32_t bins[index::kMaxProjections];
+  for (std::size_t t = 0; t < T; ++t) {
+    const index::BucketIndex& table = store_.buckets(t);
+    index::project_to_bins(table.matrix(), prepared.rotated, table.bin_width(),
+                           std::span<std::int32_t>(bins, table.num_projections()));
+    const std::vector<index::BucketRange> ranges =
+        table.probe(std::span<const std::int32_t>(bins, table.num_projections()),
+                    params.probe_radius, nullptr);
+    cells_probed += ranges.size();
+    for (const auto& range : ranges) {
+      if (table.has_postings()) {
+        for (const std::size_t row : table.rows_span(range)) {
+          if (visited[row] == 0) {
+            visited[row] = 1;
+            uniq.push_back(row);
+          }
+        }
+      } else {
+        const std::size_t hi = range.start + range.length;
+        for (std::size_t row = range.start; row < hi; ++row) {
+          if (visited[row] == 0) {
+            visited[row] = 1;
+            uniq.push_back(row);
+          }
+        }
+      }
+    }
+  }
+
+  if (stats != nullptr) {
+    stats->candidates = uniq.size();
+    stats->cells_probed = cells_probed;
+  }
+
+  std::sort(uniq.begin(), uniq.end());
+  std::size_t i = 0;
+  while (i < uniq.size()) {
+    const std::size_t lo = uniq[i];
+    std::size_t hi = lo + 1;
+    ++i;
+    while (i < uniq.size() && uniq[i] == hi) {
+      ++hi;
+      ++i;
+    }
+    if (use_fastscan) {
+      score_store_range_fastscan(blocked, lut_cache_, store_, lo, hi, topk);
+    } else {
+      score_store_range_vector_major(store_, lut_cache_, prepared, codebook_, lo, hi, topk);
+    }
   }
   return topk.finalize();
 }

@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -12,7 +11,8 @@
 namespace vectorcache::ingest {
 
 /// Flat in-RAM index: contiguous L0 codes + parallel ids + per-vector IP scales.
-/// After `finalize_buckets`, rows are sorted by RP cell key for contiguous range scans.
+/// After single-table `finalize_buckets`, rows are sorted by that table's cell key.
+/// Multi-table finalize keeps ingest order and stores per-table postings.
 class VectorStore {
  public:
   VectorStore(std::size_t l0_words_per_vec, std::size_t input_dim, std::size_t srht_dim,
@@ -46,12 +46,19 @@ class VectorStore {
   /// Permute rows by `order` (must be a permutation of [0, size())).
   void permute(std::span<const std::size_t> order);
 
-  /// Argsort by cell keys, permute store, build CSR bucket index.
+  /// Single-table: argsort by cell keys, permute store, build contiguous CSR.
   void finalize_buckets(std::span<const std::uint64_t> cell_keys, index::ProjectionMatrix matrix,
                         index::BinCodec codec);
 
-  bool has_buckets() const { return buckets_.has_value() && !buckets_->empty(); }
-  const index::BucketIndex& buckets() const;
+  /// Multi-table: `all_keys` is table-major (table t occupies [t*n, (t+1)*n)).
+  /// T==1 uses permute fast path; T>1 keeps ingest order and builds postings per table.
+  void finalize_buckets(std::span<const std::uint64_t> all_keys,
+                        std::vector<index::ProjectionMatrix> matrices, index::BinCodec codec);
+
+  bool has_buckets() const { return !tables_.empty(); }
+  std::size_t num_tables() const { return tables_.size(); }
+  const index::BucketIndex& buckets() const { return buckets(0); }
+  const index::BucketIndex& buckets(std::size_t table) const;
 
  private:
   std::size_t l0_words_per_vec_;
@@ -62,7 +69,7 @@ class VectorStore {
   AlignedVector<std::uint64_t> codes_;
   std::vector<std::size_t> ids_;
   std::vector<float> scales_;
-  std::optional<index::BucketIndex> buckets_;
+  std::vector<index::BucketIndex> tables_;
 };
 
 }  // namespace vectorcache::ingest
