@@ -17,12 +17,11 @@ LIMIT         ?= 100000
 SEED          ?=
 BITS          ?= 1
 BLOCK_DIMS    ?= 1
-NUM_PROJECTIONS ?= 1
-NUM_TABLES    ?= 1
+NUM_PAIR_DIRS ?= 8
 BIN_WIDTH     ?= 0.1
 PROBE_RADIUS  ?= 1
 BUCKET_SEED   ?=
-NUM_PROJECTIONS_LIST ?=
+NUM_PAIR_DIRS_LIST ?=
 BIN_WIDTHS    ?=
 PROBE_RADII   ?=
 QUERY_SPLIT   ?=
@@ -79,8 +78,7 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_SPLIT,query-split) \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
-	$(call opt_arg,NUM_PROJECTIONS,num-projections) \
-	$(call opt_arg,NUM_TABLES,num-tables) \
+	$(call opt_arg,NUM_PAIR_DIRS,num-pair-dirs) \
 	$(call opt_arg,BIN_WIDTH,bin-width) \
 	$(call opt_arg,PROBE_RADIUS,probe-radius) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
@@ -93,7 +91,7 @@ QUERY_TUNE_ARGS = \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
-	$(call opt_arg,NUM_PROJECTIONS_LIST,num-projections-list) \
+	$(call opt_arg,NUM_PAIR_DIRS_LIST,num-pair-dirs-list) \
 	$(call opt_arg,BIN_WIDTHS,bin-widths) \
 	$(call opt_arg,PROBE_RADII,probe-radii)
 
@@ -123,12 +121,11 @@ help:
 	@echo "  SEED            --seed"
 	@echo "  BITS            --bits (default $(BITS); TurboQuantMSE bits/block, 1-8)"
 	@echo "  BLOCK_DIMS      --block-dims (default $(BLOCK_DIMS); dims per codebook block, 1-16)"
-	@echo "  NUM_PROJECTIONS --num-projections (default $(NUM_PROJECTIONS); RP bucket R per table; query-bench)"
-	@echo "  NUM_TABLES      --num-tables (default $(NUM_TABLES); independent RP tables, OR candidates)"
-	@echo "  BIN_WIDTH       --bin-width (default $(BIN_WIDTH); RP bin width w; query-bench)"
-	@echo "  PROBE_RADIUS    --probe-radius (default $(PROBE_RADIUS); multi-probe P; query-bench)"
-	@echo "  BUCKET_SEED     --bucket-seed (RP seed; query-bench / query-bench-tune)"
-	@echo "  NUM_PROJECTIONS_LIST --num-projections-list (comma R values; query-bench-tune)"
+	@echo "  NUM_PAIR_DIRS   --num-pair-dirs (default $(NUM_PAIR_DIRS); pair-hash 2D dirs L; query-bench)"
+	@echo "  BIN_WIDTH       --bin-width (default $(BIN_WIDTH); bin width w on arcsine-CDF u; query-bench)"
+	@echo "  PROBE_RADIUS    --probe-radius (default $(PROBE_RADIUS); 1D multi-probe P; query-bench)"
+	@echo "  BUCKET_SEED     --bucket-seed (pair-hash seed; query-bench / query-bench-tune)"
+	@echo "  NUM_PAIR_DIRS_LIST --num-pair-dirs-list (comma L values; query-bench-tune)"
 	@echo "  BIN_WIDTHS      --bin-widths (comma w values; query-bench-tune)"
 	@echo "  PROBE_RADII     --probe-radii (comma P values; query-bench-tune)"
 	@echo "  QUERY_SPLIT     --query-split (query-bench / query-bench-tune)"
@@ -145,8 +142,8 @@ help:
 	@echo "Example: make compute"
 	@echo "Example: make compute BITS=2 RECALL=1"
 	@echo "Example: make compute BITS=1 BLOCK_DIMS=2"
-	@echo "Example: make compute NUM_PROJECTIONS=2 BIN_WIDTH=0.1 PROBE_RADIUS=1"
-	@echo "Example: make tune NUM_PROJECTIONS_LIST=1,2,3 BIN_WIDTHS=0.1,0.2 PROBE_RADII=0,1,2"
+	@echo "Example: make compute NUM_PAIR_DIRS=8 BIN_WIDTH=0.1 PROBE_RADIUS=1"
+	@echo "Example: make tune NUM_PAIR_DIRS_LIST=4,8,16 BIN_WIDTHS=0.1,0.2 PROBE_RADII=0,1,2"
 
 login: $(LOGIN_READY)
 

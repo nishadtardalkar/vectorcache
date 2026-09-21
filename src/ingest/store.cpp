@@ -80,7 +80,7 @@ void VectorStore::push(std::size_t id, std::span<const std::uint64_t> l0, float 
     throw Error("L0 word count mismatch: expected " + std::to_string(l0_words_per_vec_) + ", got " +
                 std::to_string(l0.size()));
   }
-  if (!tables_.empty()) {
+  if (buckets_.has_value()) {
     throw Error("VectorStore::push after finalize_buckets is not supported");
   }
   const std::size_t offset = codes_.size();
@@ -121,75 +121,45 @@ void VectorStore::permute(std::span<const std::size_t> order) {
   codes_ = std::move(new_codes);
   ids_ = std::move(new_ids);
   scales_ = std::move(new_scales);
-  tables_.clear();
+  buckets_.reset();
 }
 
-void VectorStore::finalize_buckets(std::span<const std::uint64_t> cell_keys,
-                                   index::ProjectionMatrix matrix, index::BinCodec codec) {
-  std::vector<index::ProjectionMatrix> matrices;
-  matrices.push_back(std::move(matrix));
-  finalize_buckets(cell_keys, std::move(matrices), codec);
-}
-
-void VectorStore::finalize_buckets(std::span<const std::uint64_t> all_keys,
-                                   std::vector<index::ProjectionMatrix> matrices,
-                                   index::BinCodec codec) {
+void VectorStore::finalize_buckets(std::span<const std::uint64_t> cell_keys, index::PairHash hash,
+                                   float bin_width) {
   const std::size_t n = ids_.size();
-  const std::size_t T = matrices.size();
-  if (T == 0 || T > index::kMaxTables) {
-    throw Error("finalize_buckets: num_tables must be in 1..kMaxTables");
-  }
-  if (all_keys.size() != n * T) {
+  if (cell_keys.size() != n) {
     throw Error("finalize_buckets: cell_keys size mismatch");
   }
   if (n == 0) {
     throw Error("finalize_buckets: empty store");
   }
-  for (const auto& matrix : matrices) {
-    if (matrix.dim() != srht_dim_) {
-      throw Error("finalize_buckets: projection dim must equal srht_dim");
-    }
-    if (matrix.num_projections() != codec.num_projections) {
-      throw Error("finalize_buckets: matrix/codec projection mismatch");
-    }
+  if (hash.empty()) {
+    throw Error("finalize_buckets: empty PairHash");
   }
 
-  tables_.clear();
-  tables_.reserve(T);
-
-  if (T == 1) {
-    const auto cell_keys = all_keys.subspan(0, n);
-    std::vector<std::size_t> order(n);
-    std::iota(order.begin(), order.end(), 0);
-    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-      if (cell_keys[a] != cell_keys[b]) {
-        return cell_keys[a] < cell_keys[b];
-      }
-      return a < b;
-    });
-
-    std::vector<std::uint64_t> sorted_keys(n);
-    for (std::size_t i = 0; i < n; ++i) {
-      sorted_keys[i] = cell_keys[order[i]];
+  std::vector<std::size_t> order(n);
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    if (cell_keys[a] != cell_keys[b]) {
+      return cell_keys[a] < cell_keys[b];
     }
+    return a < b;
+  });
 
-    permute(order);
-    tables_.push_back(index::BucketIndex::build(sorted_keys, std::move(matrices[0]), codec));
-    return;
+  std::vector<std::uint64_t> sorted_keys(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    sorted_keys[i] = cell_keys[order[i]];
   }
 
-  for (std::size_t t = 0; t < T; ++t) {
-    const auto cell_keys = all_keys.subspan(t * n, n);
-    tables_.push_back(
-        index::BucketIndex::build_postings(cell_keys, std::move(matrices[t]), codec));
-  }
+  permute(order);
+  buckets_ = index::BucketIndex::build(sorted_keys, std::move(hash), bin_width);
 }
 
-const index::BucketIndex& VectorStore::buckets(std::size_t table) const {
-  if (table >= tables_.size()) {
-    throw Error("VectorStore::buckets: table out of range");
+const index::BucketIndex& VectorStore::buckets() const {
+  if (!buckets_.has_value()) {
+    throw Error("VectorStore::buckets: no bucket index");
   }
-  return tables_[table];
+  return *buckets_;
 }
 
 }  // namespace vectorcache::ingest

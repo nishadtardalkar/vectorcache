@@ -22,7 +22,7 @@ struct QueryHit {
 
 struct QueryParams {
   std::size_t k = 10;
-  /// Multi-probe L_∞ radius in bin units (cells with max |o_i| <= probe_radius).
+  /// Multi-probe radius in 1D bin units (cells with |offset| <= probe_radius).
   std::size_t probe_radius = 1;
 };
 
@@ -33,6 +33,8 @@ struct SearchStats {
 
 struct PreparedQuery {
   AlignedVector<float> rotated;
+  /// Pair-hash bin computed on L2-normalized coords before SRHT.
+  std::int32_t query_bin = 0;
 };
 
 class QueryEngine {

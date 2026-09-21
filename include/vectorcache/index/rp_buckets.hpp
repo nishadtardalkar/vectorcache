@@ -9,109 +9,76 @@
 
 namespace vectorcache::index {
 
-inline constexpr std::size_t kMaxProjections = 8;
+inline constexpr std::size_t kMaxPairDirs = 64;
 inline constexpr std::size_t kMaxProbeCells = 4096;
-inline constexpr std::size_t kMaxTables = 16;
 
-/// R independent unit vectors in R^{dim} (row-major: R * dim floats).
-class ProjectionMatrix {
+/// Cyclic list of L random unit vectors in R^2 for recursive pairwise folding.
+class PairHash {
  public:
-  ProjectionMatrix() = default;
-  ProjectionMatrix(std::size_t num_projections, std::size_t dim, std::uint64_t seed);
+  PairHash() = default;
+  PairHash(std::size_t num_pair_dirs, std::uint64_t seed);
 
-  std::size_t num_projections() const { return num_projections_; }
-  std::size_t dim() const { return dim_; }
-  bool empty() const { return num_projections_ == 0; }
+  std::size_t num_pair_dirs() const { return num_pair_dirs_; }
+  bool empty() const { return num_pair_dirs_ == 0; }
 
-  /// out[r] = ⟨row_r, x⟩. out.size() == num_projections_.
-  void project(std::span<const float> x, std::span<float> out) const;
+  /// Recursive pairwise reduce to one scalar in [-1, 1]. Cursor starts at 0 each call.
+  float fold(std::span<const float> x) const;
 
-  std::span<const float> row(std::size_t r) const;
+  std::span<const float> dir(std::size_t i) const;
 
  private:
-  std::size_t num_projections_ = 0;
-  std::size_t dim_ = 0;
-  AlignedVector<float> data_;
+  std::size_t num_pair_dirs_ = 0;
+  /// Packed (r0, r1) pairs, length 2 * num_pair_dirs_.
+  AlignedVector<float> dirs_;
 };
 
-struct BinCodec {
-  float bin_width = 0.0f;
-  std::int32_t bin_lo = 0;
-  std::uint32_t bits_per_axis = 0;
-  std::size_t num_projections = 0;
+/// Arcsine CDF: u = clamp(1/2 + asin(s)/π, 0, 1). Maps U-shaped s on [-1,1] toward Uniform[0,1].
+float arcsine_cdf(float s);
 
-  bool packable() const { return bits_per_axis > 0 && bits_per_axis * num_projections <= 64; }
-};
+/// fold → arcsine_cdf → floor(u / bin_width).
+std::int32_t fold_to_bin(const PairHash& hash, std::span<const float> x, float bin_width);
 
-/// bin = floor(proj / w). For unit vectors, proj ∈ [-1, 1].
-void project_to_bins(const ProjectionMatrix& matrix, std::span<const float> x, float bin_width,
-                     std::span<std::int32_t> bins);
+/// Pack a signed 1D bin into a cell key (two's-complement cast).
+std::uint64_t pack_bin(std::int32_t bin);
 
-BinCodec make_bin_codec(std::size_t num_projections, float bin_width);
-
-std::uint64_t pack_cell_key(std::span<const std::int32_t> bins, const BinCodec& codec);
-/// Same packing as pack_cell_key without range checks (bins must be in codec range).
-std::uint64_t pack_cell_key_unchecked(std::span<const std::int32_t> bins, const BinCodec& codec);
-void unpack_cell_key(std::uint64_t key, const BinCodec& codec, std::span<std::int32_t> bins);
-
-/// Validate probe grid size (2P+1)^R <= kMaxProbeCells.
-void validate_probe_grid(std::size_t num_projections, std::size_t probe_radius);
+/// Validate 1D probe count 2P+1 <= kMaxProbeCells.
+void validate_probe_radius(std::size_t probe_radius);
 
 struct BucketRange {
   std::size_t start = 0;
   std::size_t length = 0;
 };
 
-/// CSR over packed cell keys. With postings, probe ranges index into `rows_`;
-/// without postings, ranges are contiguous store slices (store was permuted by key).
+/// CSR over packed cell keys. Ranges are contiguous store slices (store was permuted by key).
 class BucketIndex {
  public:
   BucketIndex() = default;
 
   /// `sorted_keys[i]` is the cell key of store row i after argsort-by-key permute.
-  static BucketIndex build(std::span<const std::uint64_t> sorted_keys, ProjectionMatrix matrix,
-                           BinCodec codec);
-
-  /// Build CSR with store-row postings; does not require the store to be permuted.
-  /// `cell_keys[i]` is the key for store row i (ingest order).
-  static BucketIndex build_postings(std::span<const std::uint64_t> cell_keys,
-                                    ProjectionMatrix matrix, BinCodec codec);
+  static BucketIndex build(std::span<const std::uint64_t> sorted_keys, PairHash hash,
+                           float bin_width);
 
   bool empty() const { return keys_.empty(); }
-  bool has_postings() const { return !rows_.empty(); }
   std::size_t num_cells() const { return keys_.size(); }
-  std::size_t num_projections() const { return codec_.num_projections; }
-  float bin_width() const { return codec_.bin_width; }
-  const ProjectionMatrix& matrix() const { return matrix_; }
-  const BinCodec& codec() const { return codec_; }
+  float bin_width() const { return bin_width_; }
+  const PairHash& hash() const { return hash_; }
 
   /// Contiguous CSR range for cell index `i` in key order (0 .. num_cells()-1).
   BucketRange cell(std::size_t i) const;
 
-  /// Store row for posting slot `i` (requires has_postings()).
-  std::size_t row_at(std::size_t i) const;
-
-  /// Store rows for a probe/CSR range (requires has_postings()).
-  std::span<const std::size_t> rows_span(BucketRange range) const;
-
   /// Find contiguous range for an exact cell key; length 0 if missing.
   BucketRange find(std::uint64_t key) const;
 
-  /// Multi-probe: all cells with L_∞ offset <= P, ordered by Σ o_i² then lexicographic o.
+  /// Multi-probe: cells with |offset| <= P, ordered by |offset| then signed offset.
   /// Only non-empty cells are returned. `out_candidates` sums range lengths when non-null.
-  std::vector<BucketRange> probe(std::span<const std::int32_t> query_bins,
-                                 std::size_t probe_radius,
+  std::vector<BucketRange> probe(std::int32_t query_bin, std::size_t probe_radius,
                                  std::size_t* out_candidates = nullptr) const;
 
  private:
-  static BucketIndex build_csr(std::span<const std::uint64_t> sorted_keys, ProjectionMatrix matrix,
-                               BinCodec codec);
-
   std::vector<std::uint64_t> keys_;
   std::vector<std::size_t> offsets_;  // size keys_+1
-  std::vector<std::size_t> rows_;     // store row indices in cell-key order (postings mode)
-  ProjectionMatrix matrix_;
-  BinCodec codec_;
+  PairHash hash_;
+  float bin_width_ = 0.0f;
 };
 
 }  // namespace vectorcache::index

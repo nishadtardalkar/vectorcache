@@ -20,9 +20,9 @@
 #include "vectorcache/error.hpp"
 #include "vectorcache/index/rp_buckets.hpp"
 #include "vectorcache/ingest/engine.hpp"
-#include "vectorcache/ingest/hook.hpp"
 #include "vectorcache/quantize/quantize.hpp"
 #include "vectorcache/query/engine.hpp"
+#include "vectorcache/transform/normalize.hpp"
 
 namespace {
 
@@ -102,6 +102,47 @@ std::vector<std::vector<float>> load_query_vectors(
   return queries;
 }
 
+/// In-memory row-major float matrix reader.
+class MatrixReader : public vectorcache::datasets::DatasetReader {
+ public:
+  MatrixReader(std::vector<float> data, std::size_t dim, std::size_t count)
+      : data_(std::move(data)), dim_(dim), count_(count) {}
+
+  vectorcache::datasets::DatasetMeta meta() const override {
+    return {dim_, count_, "matrix"};
+  }
+
+  bool next_vector_into(std::span<float> out) override {
+    if (index_ >= count_) {
+      return false;
+    }
+    std::copy_n(data_.data() + index_ * dim_, dim_, out.begin());
+    ++index_;
+    return true;
+  }
+
+  std::span<const float> data() const { return data_; }
+
+ private:
+  std::vector<float> data_;
+  std::size_t dim_;
+  std::size_t count_;
+  std::size_t index_ = 0;
+};
+
+std::vector<float> load_matrix(vectorcache::datasets::DatasetReader& reader, std::size_t dim,
+                               std::size_t count) {
+  std::vector<float> data(count * dim);
+  std::vector<float> buf(dim);
+  for (std::size_t i = 0; i < count; ++i) {
+    if (!reader.next_vector_into(buf)) {
+      throw vectorcache::Error("load_matrix: unexpected EOF");
+    }
+    std::copy(buf.begin(), buf.end(), data.begin() + static_cast<std::ptrdiff_t>(i * dim));
+  }
+  return data;
+}
+
 /// Same SplitMix64 mix as IngestionEngine (bucket_seed=0 derives from rotation seed).
 std::uint64_t resolve_bucket_seed(std::uint64_t bucket_seed, std::uint64_t rotation_seed) {
   if (bucket_seed != 0) {
@@ -112,25 +153,6 @@ std::uint64_t resolve_bucket_seed(std::uint64_t bucket_seed, std::uint64_t rotat
   z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
   return z ^ (z >> 31);
 }
-
-class RotatedCaptureHook : public vectorcache::ingest::VectorHook {
- public:
-  explicit RotatedCaptureHook(std::size_t srht_dim) : srht_dim_(srht_dim) {}
-
-  void on_vector(std::uint64_t, std::span<const float> vector) override {
-    if (vector.size() != srht_dim_) {
-      throw vectorcache::Error("RotatedCaptureHook: unexpected vector length");
-    }
-    data_.insert(data_.end(), vector.begin(), vector.end());
-  }
-
-  std::span<const float> data() const { return data_; }
-  std::size_t count() const { return data_.empty() ? 0 : data_.size() / srht_dim_; }
-
- private:
-  std::size_t srht_dim_;
-  std::vector<float> data_;
-};
 
 std::vector<std::size_t> parse_size_list(const std::string& s, const char* name) {
   std::vector<std::size_t> out;
@@ -180,9 +202,9 @@ std::vector<float> parse_float_list(const std::string& s, const char* name) {
   return out;
 }
 
-bool probe_grid_ok(std::size_t R, std::size_t P) {
+bool probe_radius_ok(std::size_t P) {
   try {
-    vectorcache::index::validate_probe_grid(R, P);
+    vectorcache::index::validate_probe_radius(P);
     return true;
   } catch (const vectorcache::Error&) {
     return false;
@@ -190,7 +212,7 @@ bool probe_grid_ok(std::size_t R, std::size_t P) {
 }
 
 struct Trial {
-  std::size_t R = 0;
+  std::size_t L = 0;
   float w = 0.0f;
   std::size_t P = 0;
   double avg_topk_mean = 0.0;
@@ -200,7 +222,8 @@ struct Trial {
 bool dominates(const Trial& a, const Trial& b) {
   const bool ge_score = a.avg_topk_mean >= b.avg_topk_mean;
   const bool le_vecs = a.avg_vectors_scored <= b.avg_vectors_scored;
-  const bool strict = (a.avg_topk_mean > b.avg_topk_mean) || (a.avg_vectors_scored < b.avg_vectors_scored);
+  const bool strict =
+      (a.avg_topk_mean > b.avg_topk_mean) || (a.avg_vectors_scored < b.avg_vectors_scored);
   return ge_score && le_vecs && strict;
 }
 
@@ -226,8 +249,8 @@ std::vector<Trial> pareto_front(std::vector<Trial> trials) {
     if (a.avg_vectors_scored != b.avg_vectors_scored) {
       return a.avg_vectors_scored < b.avg_vectors_scored;
     }
-    if (a.R != b.R) {
-      return a.R < b.R;
+    if (a.L != b.L) {
+      return a.L < b.L;
     }
     if (a.w != b.w) {
       return a.w < b.w;
@@ -237,24 +260,23 @@ std::vector<Trial> pareto_front(std::vector<Trial> trials) {
   return front;
 }
 
-std::vector<std::uint64_t> compute_cell_keys(std::span<const float> rotated_row_major,
-                                             std::size_t n, std::size_t srht_dim, std::size_t R,
-                                             float bin_width, std::uint64_t resolved_bucket_seed) {
-  vectorcache::index::ProjectionMatrix matrix(R, srht_dim, resolved_bucket_seed);
-  const auto codec = vectorcache::index::make_bin_codec(R, bin_width);
+std::vector<std::uint64_t> compute_cell_keys(std::span<const float> raw_row_major, std::size_t n,
+                                             std::size_t dim, std::size_t L, float bin_width,
+                                             std::uint64_t resolved_bucket_seed) {
+  vectorcache::index::PairHash hash(L, resolved_bucket_seed);
   std::vector<std::uint64_t> keys(n);
-  alignas(64) std::int32_t bins[vectorcache::index::kMaxProjections];
+  std::vector<float> buf(dim);
   for (std::size_t i = 0; i < n; ++i) {
-    const std::span<const float> row(rotated_row_major.data() + i * srht_dim, srht_dim);
-    vectorcache::index::project_to_bins(matrix, row, bin_width, std::span<std::int32_t>(bins, R));
-    keys[i] = vectorcache::index::pack_cell_key(std::span<const std::int32_t>(bins, R), codec);
+    std::copy_n(raw_row_major.data() + i * dim, dim, buf.begin());
+    vectorcache::transform::l2_normalize_in_place(buf);
+    keys[i] = vectorcache::index::pack_bin(vectorcache::index::fold_to_bin(hash, buf, bin_width));
   }
   return keys;
 }
 
 Trial run_trial(vectorcache::query::QueryEngine& engine,
                 const std::vector<vectorcache::query::PreparedQuery>& prepared, std::size_t k,
-                std::size_t R, float w, std::size_t P) {
+                std::size_t L, float w, std::size_t P) {
   vectorcache::query::QueryParams params;
   params.k = k;
   params.probe_radius = P;
@@ -278,21 +300,22 @@ Trial run_trial(vectorcache::query::QueryEngine& engine,
   }
 
   Trial t;
-  t.R = R;
+  t.L = L;
   t.w = w;
   t.P = P;
   t.avg_topk_mean =
       scored_queries > 0 ? (sum_topk_mean / static_cast<double>(scored_queries)) : 0.0;
   t.avg_vectors_scored =
-      prepared.empty() ? 0.0
-                       : (static_cast<double>(sum_candidates) / static_cast<double>(prepared.size()));
+      prepared.empty()
+          ? 0.0
+          : (static_cast<double>(sum_candidates) / static_cast<double>(prepared.size()));
   return t;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  CLI::App app{"RP bucket grid tuner (Pareto: max avg top-k mean, min avg vectors scored)"};
+  CLI::App app{"Pair-hash bucket grid tuner (Pareto: max avg top-k mean, min avg vectors scored)"};
   std::filesystem::path npy_path;
   std::string dataset;
   std::filesystem::path data_dir = "data";
@@ -305,7 +328,7 @@ int main(int argc, char** argv) {
   std::size_t bits = 1;
   std::size_t block_dims = 1;
   std::uint64_t bucket_seed = 0;
-  std::string num_projections_list = "1,2,3,4";
+  std::string num_pair_dirs_list = "4,8,16";
   std::string bin_widths = "0.05,0.1,0.2,0.5";
   std::string probe_radii = "0,1,2,3";
 
@@ -321,9 +344,9 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
   app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
-  app.add_option("--bucket-seed", bucket_seed, "RP projection seed (0 = derive from --seed)");
-  app.add_option("--num-projections-list", num_projections_list, "Comma-separated R values");
-  app.add_option("--bin-widths", bin_widths, "Comma-separated bin widths w");
+  app.add_option("--bucket-seed", bucket_seed, "Pair-hash seed (0 = derive from --seed)");
+  app.add_option("--num-pair-dirs-list", num_pair_dirs_list, "Comma-separated L values");
+  app.add_option("--bin-widths", bin_widths, "Comma-separated bin widths w on u in [0,1]");
   app.add_option("--probe-radii", probe_radii, "Comma-separated probe radii P");
 
   CLI11_PARSE(app, argc, argv);
@@ -335,13 +358,13 @@ int main(int argc, char** argv) {
     vectorcache::quantize::validate_bits_per_dim(bits);
     vectorcache::quantize::validate_block_dims(block_dims);
 
-    const auto R_list = parse_size_list(num_projections_list, "num-projections");
+    const auto L_list = parse_size_list(num_pair_dirs_list, "num-pair-dirs");
     const auto w_list = parse_float_list(bin_widths, "bin-widths");
     const auto P_list = parse_size_list(probe_radii, "probe-radii");
 
-    for (const std::size_t R : R_list) {
-      if (R == 0 || R > vectorcache::index::kMaxProjections) {
-        throw vectorcache::Error("num-projections must be in 1..kMaxProjections");
+    for (const std::size_t L : L_list) {
+      if (L == 0 || L > vectorcache::index::kMaxPairDirs) {
+        throw vectorcache::Error("num-pair-dirs must be in 1..kMaxPairDirs");
       }
     }
 
@@ -360,26 +383,27 @@ int main(int argc, char** argv) {
     }
 
     const std::uint64_t resolved_seed = resolve_bucket_seed(bucket_seed, seed);
-    const std::size_t grid_total = R_list.size() * w_list.size() * P_list.size();
+    const std::size_t grid_total = L_list.size() * w_list.size() * P_list.size();
 
-    std::cout << "RP tune: index=" << source_label << " dim=" << meta.dim
+    std::cout << "Pair-hash tune: index=" << source_label << " dim=" << meta.dim
               << " index_n=" << actual_index << " query_n=" << query_limit
               << " query_split=" << query_split << " bits=" << bits << " block_dims=" << block_dims
               << " k=" << k << " grid=" << grid_total << '\n';
 
-    // One-shot SRHT + quantize; capture rotated floats for later rebucket.
+    // Load raw index once; ingest without buckets; rebucket from pre-SRHT floats.
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
+    auto raw = load_matrix(index_limited, meta.dim, actual_index);
+    MatrixReader matrix_reader(std::move(raw), meta.dim, actual_index);
+
     vectorcache::ingest::BucketParams dummy_buckets;
-    dummy_buckets.num_projections = 1;
+    dummy_buckets.num_pair_dirs = 8;
     dummy_buckets.bin_width = 0.1f;
     dummy_buckets.bucket_seed = bucket_seed;
     auto ingest_engine = vectorcache::ingest::IngestionEngine::with_rotation(
         meta.dim, seed, bits, block_dims, dummy_buckets);
 
-    const std::size_t srht_dim = ingest_engine.store().srht_dim();
-    RotatedCaptureHook capture(srht_dim);
-    const auto report = ingest_engine.ingest_with_hook(index_limited, &capture, false);
-    if (report.vectors_ingested != actual_index || capture.count() != actual_index) {
+    const auto report = ingest_engine.ingest(matrix_reader, false);
+    if (report.vectors_ingested != actual_index) {
       throw vectorcache::Error("index ingest count mismatch");
     }
     if (ingest_engine.store().has_buckets()) {
@@ -387,7 +411,7 @@ int main(int argc, char** argv) {
     }
 
     const auto& base_store = ingest_engine.store();
-    const auto rotated = capture.data();
+    const auto raw_span = matrix_reader.data();
 
     auto [train_for_queries, _] = open_reader(npy_path, dataset, data_dir, split);
     const auto queries =
@@ -399,29 +423,28 @@ int main(int argc, char** argv) {
     std::size_t evaluated = 0;
     std::size_t skipped = 0;
 
-    for (const std::size_t R : R_list) {
+    std::vector<std::size_t> valid_P;
+    valid_P.reserve(P_list.size());
+    for (const std::size_t P : P_list) {
+      if (probe_radius_ok(P)) {
+        valid_P.push_back(P);
+      } else {
+        ++skipped;
+      }
+    }
+
+    for (const std::size_t L : L_list) {
       for (const float w : w_list) {
-        std::vector<std::size_t> valid_P;
-        valid_P.reserve(P_list.size());
-        for (const std::size_t P : P_list) {
-          if (probe_grid_ok(R, P)) {
-            valid_P.push_back(P);
-          } else {
-            ++skipped;
-          }
-        }
         if (valid_P.empty()) {
           continue;
         }
 
         auto work = base_store.clone();
-        const auto keys = compute_cell_keys(rotated, actual_index, srht_dim, R, w, resolved_seed);
-        auto matrix = vectorcache::index::ProjectionMatrix(R, srht_dim, resolved_seed);
-        const auto codec = vectorcache::index::make_bin_codec(R, w);
-        work.finalize_buckets(keys, std::move(matrix), codec);
+        const auto keys = compute_cell_keys(raw_span, actual_index, meta.dim, L, w, resolved_seed);
+        auto hash = vectorcache::index::PairHash(L, resolved_seed);
+        work.finalize_buckets(keys, std::move(hash), w);
 
-        auto query_engine =
-            vectorcache::query::QueryEngine::with_rotation(work, meta.dim, seed);
+        auto query_engine = vectorcache::query::QueryEngine::with_rotation(work, meta.dim, seed);
         query_engine.prepare_index();
 
         std::vector<vectorcache::query::PreparedQuery> prepared;
@@ -431,7 +454,7 @@ int main(int argc, char** argv) {
         }
 
         for (const std::size_t P : valid_P) {
-          trials.push_back(run_trial(query_engine, prepared, k, R, w, P));
+          trials.push_back(run_trial(query_engine, prepared, k, L, w, P));
           ++evaluated;
         }
       }
@@ -446,7 +469,7 @@ int main(int argc, char** argv) {
     } else {
       for (const auto& t : front) {
         std::cout << std::fixed << std::setprecision(2);
-        std::cout << "  R=" << t.R << " w=" << t.w << " P=" << t.P;
+        std::cout << "  L=" << t.L << " w=" << t.w << " P=" << t.P;
         std::cout << std::setprecision(4);
         std::cout << "  topk_mean=" << t.avg_topk_mean;
         std::cout << std::setprecision(1);

@@ -73,13 +73,11 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
                                                   std::size_t dim, std::uint64_t seed,
                                                   std::size_t limit, std::size_t bits,
-                                                  std::size_t block_dims, std::size_t num_projections,
-                                                  std::size_t num_tables, float bin_width,
-                                                  std::uint64_t bucket_seed) {
+                                                  std::size_t block_dims, std::size_t num_pair_dirs,
+                                                  float bin_width, std::uint64_t bucket_seed) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
   vectorcache::ingest::BucketParams buckets;
-  buckets.num_projections = num_projections;
-  buckets.num_tables = num_tables;
+  buckets.num_pair_dirs = num_pair_dirs;
   buckets.bin_width = bin_width;
   buckets.bucket_seed = bucket_seed;
   auto engine =
@@ -298,8 +296,7 @@ int main(int argc, char** argv) {
   std::size_t k = 10;
   std::size_t bits = 1;
   std::size_t block_dims = 1;
-  std::size_t num_projections = 1;
-  std::size_t num_tables = 1;
+  std::size_t num_pair_dirs = 8;
   float bin_width = 0.1f;
   std::size_t probe_radius = 1;
   std::uint64_t bucket_seed = 0;
@@ -318,11 +315,10 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_option("--bits", bits, "TurboQuantMSE bits per block (1-8; per dim when --block-dims=1)");
   app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
-  app.add_option("--num-projections", num_projections, "RP bucket projections R per table (1-8)");
-  app.add_option("--num-tables", num_tables, "Independent RP tables (OR candidates; 1-16)");
-  app.add_option("--bin-width", bin_width, "RP bucket bin width w");
-  app.add_option("--probe-radius", probe_radius, "Multi-probe L_inf radius P");
-  app.add_option("--bucket-seed", bucket_seed, "RP projection seed (0 = derive from --seed)");
+  app.add_option("--num-pair-dirs", num_pair_dirs, "Pair-hash random 2D directions L (1-64)");
+  app.add_option("--bin-width", bin_width, "Pair-hash bin width w on arcsine-CDF u in [0,1]");
+  app.add_option("--probe-radius", probe_radius, "1D multi-probe radius P");
+  app.add_option("--bucket-seed", bucket_seed, "Pair-hash seed (0 = derive from --seed)");
   app.add_flag("--calibrate", calibrate, "Print L0 probe stats for the first query");
   app.add_flag("--recall", recall,
                "Measure Recall@1@k (exact NN in approx top-k; TurboVec-compatible) and "
@@ -336,16 +332,13 @@ int main(int argc, char** argv) {
     }
     vectorcache::quantize::validate_bits_per_dim(bits);
     vectorcache::quantize::validate_block_dims(block_dims);
-    if (num_projections == 0 || num_projections > vectorcache::index::kMaxProjections) {
-      throw vectorcache::Error("num-projections must be in 1..kMaxProjections");
-    }
-    if (num_tables == 0 || num_tables > vectorcache::index::kMaxTables) {
-      throw vectorcache::Error("num-tables must be in 1..kMaxTables");
+    if (num_pair_dirs == 0 || num_pair_dirs > vectorcache::index::kMaxPairDirs) {
+      throw vectorcache::Error("num-pair-dirs must be in 1..kMaxPairDirs");
     }
     if (!(bin_width > 0.0f)) {
       throw vectorcache::Error("bin-width must be > 0");
     }
-    vectorcache::index::validate_probe_grid(num_projections, probe_radius);
+    vectorcache::index::validate_probe_radius(probe_radius);
 
     if (query_split.empty()) {
       query_split = (dataset == "glove") ? "test" : "holdout";
@@ -365,31 +358,27 @@ int main(int argc, char** argv) {
               << " srht_dim=" << meta.dim << " index_n=" << actual_index
               << " query_n=" << query_limit << " query_split=" << query_split
               << " bits=" << bits << " block_dims=" << block_dims
-              << " R=" << num_projections << " tables=" << num_tables << " w=" << bin_width
-              << " P=" << probe_radius << '\n';
+              << " L=" << num_pair_dirs << " w=" << bin_width << " P=" << probe_radius << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
     }
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto ingest_engine =
-        ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims, num_projections,
-                     num_tables, bin_width, bucket_seed);
+        ingest_index(index_limited, meta.dim, seed, actual_index, bits, block_dims, num_pair_dirs,
+                     bin_width, bucket_seed);
     {
       const auto& store = ingest_engine.store();
-      std::cout << "  stored_vectors=" << store.size() << " tables=" << store.num_tables();
-      for (std::size_t t = 0; t < store.num_tables(); ++t) {
-        std::cout << " bucket_cells[t" << t << "]=" << store.buckets(t).num_cells();
-      }
-      std::cout << '\n';
-      const auto& buckets0 = store.buckets(0);
+      std::cout << "  stored_vectors=" << store.size()
+                << " bucket_cells=" << store.buckets().num_cells() << '\n';
+      const auto& buckets0 = store.buckets();
       std::vector<std::size_t> sizes;
       sizes.reserve(buckets0.num_cells());
       for (std::size_t i = 0; i < buckets0.num_cells(); ++i) {
         sizes.push_back(buckets0.cell(i).length);
       }
       std::sort(sizes.begin(), sizes.end(), std::greater<>());
-      std::cout << "  bucket_sizes table0 (desc):";
+      std::cout << "  bucket_sizes (desc):";
       for (const std::size_t n : sizes) {
         std::cout << ' ' << n;
       }
