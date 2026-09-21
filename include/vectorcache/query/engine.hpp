@@ -21,8 +21,8 @@ struct QueryHit {
 
 struct QueryParams {
   std::size_t k = 10;
-  /// Number of nearest cluster lists to probe (nprobe), ordered by centroid IP.
-  std::size_t probe_radius = 8;
+  /// Fraction of the index to cover by walking cluster lists in descending centroid IP.
+  float probe_fraction = 0.1f;
 };
 
 struct SearchStats {

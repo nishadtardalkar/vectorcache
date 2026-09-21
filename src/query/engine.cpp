@@ -321,14 +321,14 @@ std::vector<QueryHit> QueryEngine::search_prepared(const PreparedQuery& prepared
 
   TopKHits topk(params.k);
   const index::BucketIndex& buckets = store_.buckets();
-  index::validate_probe_radius(params.probe_radius);
+  index::validate_probe_fraction(params.probe_fraction);
 
   build_query_lut(prepared.rotated, codebook_, lut_cache_);
 
   std::size_t candidates = 0;
   const std::vector<index::BucketRange> ranges =
       buckets.probe(std::span<const float>(prepared.rotated.data(), store_.srht_dim()),
-                    params.probe_radius, &candidates);
+                    params.probe_fraction, &candidates);
   if (stats != nullptr) {
     stats->candidates = candidates;
     stats->cells_probed = ranges.size();

@@ -49,9 +49,9 @@ float dot(std::span<const float> a, std::span<const float> b) {
 
 }  // namespace
 
-void validate_probe_radius(std::size_t probe_radius) {
-  if (probe_radius == 0 || probe_radius > kMaxProbeCells) {
-    throw Error("probe_radius (nprobe) must be in 1..kMaxProbeCells");
+void validate_probe_fraction(float probe_fraction) {
+  if (!(probe_fraction > 0.0f) || probe_fraction > 1.0f || !std::isfinite(probe_fraction)) {
+    throw Error("probe_fraction must be in (0, 1]");
   }
 }
 
@@ -231,7 +231,7 @@ BucketRange BucketIndex::find(std::uint64_t key) const {
   return {start, end - start};
 }
 
-std::vector<BucketRange> BucketIndex::probe(std::span<const float> query, std::size_t probe_radius,
+std::vector<BucketRange> BucketIndex::probe(std::span<const float> query, float probe_fraction,
                                             std::size_t* out_candidates) const {
   if (empty()) {
     throw Error("BucketIndex::probe: empty index");
@@ -239,8 +239,12 @@ std::vector<BucketRange> BucketIndex::probe(std::span<const float> query, std::s
   if (query.size() != dim_) {
     throw Error("BucketIndex::probe: query dim mismatch");
   }
-  validate_probe_radius(probe_radius);
-  const std::size_t nprobe = std::min(probe_radius, num_buckets_);
+  validate_probe_fraction(probe_fraction);
+
+  const std::size_t n = size();
+  const std::size_t target = std::max(
+      std::size_t{1},
+      static_cast<std::size_t>(std::ceil(static_cast<double>(probe_fraction) * static_cast<double>(n))));
 
   std::vector<std::pair<float, std::uint64_t>> scored;
   scored.reserve(num_buckets_);
@@ -248,21 +252,23 @@ std::vector<BucketRange> BucketIndex::probe(std::span<const float> query, std::s
     const float ip = dot(centroid(j), query);
     scored.emplace_back(ip, static_cast<std::uint64_t>(j));
   }
-  const std::size_t sort_n = nprobe;
-  std::partial_sort(scored.begin(), scored.begin() + static_cast<std::ptrdiff_t>(sort_n),
-                    scored.end(),
-                    [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::sort(scored.begin(), scored.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
 
   std::vector<BucketRange> ranges;
-  ranges.reserve(nprobe);
+  ranges.reserve(std::min(num_buckets_, target));
   std::size_t candidates = 0;
-  for (std::size_t i = 0; i < nprobe; ++i) {
-    const BucketRange range = find(scored[i].second);
+  for (const auto& [ip, key] : scored) {
+    (void)ip;
+    const BucketRange range = find(key);
     if (range.length == 0) {
       continue;
     }
     ranges.push_back(range);
     candidates += range.length;
+    if (candidates >= target) {
+      break;
+    }
   }
   if (out_candidates != nullptr) {
     *out_candidates = candidates;

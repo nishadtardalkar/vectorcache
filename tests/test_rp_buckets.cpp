@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -167,29 +168,48 @@ TEST(ClusterBucketsTest, RebalanceThenAssignKeepsAlignment) {
   EXPECT_NEAR(dot(cc.centroid(j), c), 1.0f, 1e-5f);
 }
 
-TEST(ClusterBucketsTest, ProbeOrdersByCentroidIp) {
+TEST(ClusterBucketsTest, ProbeCoverageStopsAtFraction) {
   const std::size_t dim = 4;
   index::ClusterCentroids cc(4, dim, 11);
-  // Put one vector in each of two buckets by assigning distinct axes.
+  // Uneven membership: 4 on axis0, 2 on axis1, 1 on axis2 (N=7).
   std::vector<std::uint64_t> keys;
   for (std::size_t i = 0; i < 4; ++i) {
-    auto v = unit_axis(dim, i);
-    keys.push_back(cc.assign_and_update(v));
+    keys.push_back(cc.assign_and_update(unit_axis(dim, 0)));
   }
+  for (std::size_t i = 0; i < 2; ++i) {
+    keys.push_back(cc.assign_and_update(unit_axis(dim, 1)));
+  }
+  keys.push_back(cc.assign_and_update(unit_axis(dim, 2)));
 
   std::vector<std::uint64_t> sorted = keys;
   std::sort(sorted.begin(), sorted.end());
   auto idx = index::BucketIndex::build(sorted, std::move(cc));
+  ASSERT_EQ(idx.size(), 7u);
 
   auto q = unit_axis(dim, 0);
+  // 0.5 * 7 → target 4; best list alone should cover it.
   std::size_t candidates = 0;
-  const auto ranges = idx.probe(q, 2, &candidates);
-  EXPECT_FALSE(ranges.empty());
-  EXPECT_LE(ranges.size(), 2u);
-  EXPECT_GT(candidates, 0u);
+  const auto half = idx.probe(q, 0.5f, &candidates);
+  EXPECT_FALSE(half.empty());
+  EXPECT_GE(candidates, 4u);
+  EXPECT_EQ(candidates, half.front().length);  // first bucket alone meets target
+  EXPECT_EQ(half.size(), 1u);
 
-  EXPECT_THROW(index::validate_probe_radius(0), Error);
-  EXPECT_THROW(index::validate_probe_radius(index::kMaxProbeCells + 1), Error);
+  // Tiny fraction still probes at least one non-empty cell.
+  candidates = 0;
+  const auto tiny = idx.probe(q, 1e-6f, &candidates);
+  EXPECT_EQ(tiny.size(), 1u);
+  EXPECT_GE(candidates, 1u);
+
+  // Full coverage walks all non-empty lists.
+  candidates = 0;
+  const auto full = idx.probe(q, 1.0f, &candidates);
+  EXPECT_EQ(candidates, 7u);
+  EXPECT_EQ(full.size(), 3u);
+
+  EXPECT_THROW(index::validate_probe_fraction(0.0f), Error);
+  EXPECT_THROW(index::validate_probe_fraction(1.1f), Error);
+  EXPECT_THROW(index::validate_probe_fraction(std::numeric_limits<float>::quiet_NaN()), Error);
 }
 
 TEST(ClusterBucketsTest, CsrRangesContiguous) {
@@ -198,6 +218,7 @@ TEST(ClusterBucketsTest, CsrRangesContiguous) {
   // Need matching centroid dim; build does not require counts.
   auto idx = index::BucketIndex::build(keys, std::move(cc));
   EXPECT_EQ(idx.num_cells(), 3u);
+  EXPECT_EQ(idx.size(), 5u);
   EXPECT_EQ(idx.cell(0).start, 0u);
   EXPECT_EQ(idx.cell(0).length, 2u);
   EXPECT_EQ(idx.cell(1).start, 2u);
@@ -222,7 +243,7 @@ TEST(ClusterBucketsTest, FinalizeBuildsBuckets) {
   EXPECT_EQ(store.id_at(0), 1u);  // key 0 first after argsort
 }
 
-TEST(ClusterBucketsTest, SelfHitWithNprobe) {
+TEST(ClusterBucketsTest, SelfHitWithProbeFraction) {
   const std::size_t dim = 32;
   const std::size_t n = 32;
   std::vector<std::vector<float>> vectors;
@@ -245,7 +266,7 @@ TEST(ClusterBucketsTest, SelfHitWithNprobe) {
   auto qe = query::QueryEngine::with_rotation(engine.store(), dim, 42);
   query::QueryParams params;
   params.k = 5;
-  params.probe_radius = 4;
+  params.probe_fraction = 0.25f;
   const auto hits = qe.search(vectors[0], params);
   ASSERT_FALSE(hits.empty());
   EXPECT_EQ(hits.front().id, 0u);
@@ -261,7 +282,7 @@ TEST(ClusterBucketsTest, EmptyListsSkippedInProbe) {
   auto idx = index::BucketIndex::build(keys, std::move(cc));
 
   std::size_t candidates = 0;
-  const auto ranges = idx.probe(v, 8, &candidates);
+  const auto ranges = idx.probe(v, 1.0f, &candidates);
   EXPECT_EQ(ranges.size(), 1u);
   EXPECT_EQ(candidates, 1u);
 }

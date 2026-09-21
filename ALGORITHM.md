@@ -7,7 +7,7 @@ Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation**, 
 3. **Cluster IVF buckets (prune)** on the rotated vector: maintain `B` unit centroids (random init from `bucket_seed`). Assign each vector to `argmax_j ⟨x, ĉ_j⟩`, then update the exact running mean: `S_j += x`, `n_j++`, `ĉ_j = S_j/‖S_j‖`. Every `rebalance_every` vectors (and once at finalize): reassign all retained post-SRHT floats to nearest `ĉ` and recompute `S`/`n`/`ĉ` (empty buckets keep prior `ĉ`). Argsort the store by cell key and build a CSR so each cell is a contiguous row range; store final normalized centroids on the index.
 4. Lloyd-Max scalar quantize: each rotated coord → one of `2^n` centroids on **Beta((dim−1)/2, (dim−1)/2)** on `[-1,1]`; pack `n`-bit indices (`M = dim` codes)
 5. Store per-vector IP scale `α = 1 / ⟨u, x̂⟩` (unit `u`, reconstruction `x̂`) for RaBitQ-style length renormalization
-6. Query: same prep (SRHT; keep query float in rotated space for scoring), **nprobe** nearest cells by `⟨q, ĉ_j⟩` (ordered by score desc), score with asymmetric IP × `α`, take top-k
+6. Query: same prep (SRHT; keep query float in rotated space for scoring), walk cluster cells by `⟨q, ĉ_j⟩` descending until candidates cover `probe_fraction` of the index (whole lists), score with asymmetric IP × `α`, take top-k
 
 ```
  INGEST                              QUERY
@@ -20,10 +20,10 @@ Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation**, 
         ▼                                   ▼
  perm+signs+block-WH (×K)            perm+signs+block-WH (×K)
         │                                   │
-        ├─ max-IP cluster assign            ├─ top nprobe by ⟨q, ĉ⟩
-        │  + running mean / rebalance       ▼
-        ▼                            score × α → top-k
- Lloyd-Max n bits / dim
+        ├─ max-IP cluster assign            ├─ high-IP cells until
+        │  + running mean / rebalance       │  coverage ≥ fraction·N
+        ▼                                   ▼
+ Lloyd-Max n bits / dim              score × α → top-k
  + store α = 1/⟨u,x̂⟩
         │
  argsort by cell key + CSR
@@ -52,9 +52,9 @@ With `VECTORCACHE_OPENMP`, search parallelizes across probed cells when there ar
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `k` | 10 | top-k |
-| `probe_radius` | 8 | nprobe: number of nearest cluster lists by centroid IP |
+| `probe_fraction` | 0.1 | walk high-IP cluster lists until candidates cover this fraction of the index |
 
-Index-time cluster knobs (`BucketParams` / CLI): `num_buckets` (`B`), `rebalance_every` (`0` ⇒ finalize-only Lloyd pass), `bucket_seed`. nprobe must be in `1..4096` and is capped by `B` at probe time.
+Index-time cluster knobs (`BucketParams` / CLI): `num_buckets` (`B`), `rebalance_every` (`0` ⇒ finalize-only Lloyd pass), `bucket_seed`. `probe_fraction` must be in `(0, 1]`; at least one non-empty list is always probed when any exist.
 
 Runtime bits-per-dim (`bits_per_dim` field name) is set at ingest (`IngestionEngine` / `--bits` / `BITS`) and stored on `VectorStore` (`bits` 1–8).
 

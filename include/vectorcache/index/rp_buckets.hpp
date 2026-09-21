@@ -9,11 +9,10 @@
 
 namespace vectorcache::index {
 
-inline constexpr std::size_t kMaxProbeCells = 4096;
 inline constexpr std::size_t kMaxBuckets = 65536;
 
-/// Validate nprobe count: 1..kMaxProbeCells.
-void validate_probe_radius(std::size_t probe_radius);
+/// Validate coverage fraction: (0, 1].
+void validate_probe_fraction(float probe_fraction);
 
 struct BucketRange {
   std::size_t start = 0;
@@ -70,6 +69,8 @@ class BucketIndex {
   bool empty() const { return keys_.empty(); }
   std::size_t num_cells() const { return keys_.size(); }
   std::size_t num_buckets() const { return num_buckets_; }
+  /// Total indexed vectors (CSR length).
+  std::size_t size() const { return offsets_.empty() ? 0 : offsets_.back(); }
   std::size_t dim() const { return dim_; }
   std::span<const float> centroids() const { return centroids_; }
   std::span<const float> centroid(std::size_t j) const;
@@ -80,9 +81,10 @@ class BucketIndex {
   /// Find contiguous range for an exact cell key; length 0 if missing.
   BucketRange find(std::uint64_t key) const;
 
-  /// Top-`probe_radius` buckets by ⟨query, ĉ_j⟩ (descending). Only non-empty CSR cells.
+  /// Walk buckets by ⟨query, ĉ_j⟩ descending until candidates cover `probe_fraction` of the
+  /// index (whole buckets). Always includes at least one non-empty cell when any exist.
   /// `out_candidates` sums range lengths when non-null.
-  std::vector<BucketRange> probe(std::span<const float> query, std::size_t probe_radius,
+  std::vector<BucketRange> probe(std::span<const float> query, float probe_fraction,
                                  std::size_t* out_candidates = nullptr) const;
 
  private:

@@ -171,9 +171,33 @@ std::vector<std::size_t> parse_size_list(const std::string& s, const char* name)
   return out;
 }
 
-bool probe_radius_ok(std::size_t P) {
+std::vector<float> parse_float_list(const std::string& s, const char* name) {
+  std::vector<float> out;
+  if (s.empty()) {
+    throw vectorcache::Error(std::string(name) + " list must be non-empty");
+  }
+  std::stringstream ss(s);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    if (item.empty()) {
+      continue;
+    }
+    char* end = nullptr;
+    const float v = std::strtof(item.c_str(), &end);
+    if (end == item.c_str() || *end != '\0') {
+      throw vectorcache::Error(std::string("invalid ") + name + " value '" + item + "'");
+    }
+    out.push_back(v);
+  }
+  if (out.empty()) {
+    throw vectorcache::Error(std::string(name) + " list must be non-empty");
+  }
+  return out;
+}
+
+bool probe_fraction_ok(float f) {
   try {
-    vectorcache::index::validate_probe_radius(P);
+    vectorcache::index::validate_probe_fraction(f);
     return true;
   } catch (const vectorcache::Error&) {
     return false;
@@ -183,7 +207,7 @@ bool probe_radius_ok(std::size_t P) {
 struct Trial {
   std::size_t B = 0;
   std::size_t rebalance_every = 0;
-  std::size_t P = 0;
+  float probe_fraction = 0.0f;
   double avg_topk_mean = 0.0;
   double avg_vectors_scored = 0.0;
 };
@@ -224,17 +248,17 @@ std::vector<Trial> pareto_front(std::vector<Trial> trials) {
     if (a.rebalance_every != b.rebalance_every) {
       return a.rebalance_every < b.rebalance_every;
     }
-    return a.P < b.P;
+    return a.probe_fraction < b.probe_fraction;
   });
   return front;
 }
 
 Trial run_trial(vectorcache::query::QueryEngine& engine,
                 const std::vector<vectorcache::query::PreparedQuery>& prepared, std::size_t k,
-                std::size_t B, std::size_t rebalance_every, std::size_t P) {
+                std::size_t B, std::size_t rebalance_every, float probe_fraction) {
   vectorcache::query::QueryParams params;
   params.k = k;
-  params.probe_radius = P;
+  params.probe_fraction = probe_fraction;
 
   double sum_topk_mean = 0.0;
   std::size_t scored_queries = 0;
@@ -257,7 +281,7 @@ Trial run_trial(vectorcache::query::QueryEngine& engine,
   Trial t;
   t.B = B;
   t.rebalance_every = rebalance_every;
-  t.P = P;
+  t.probe_fraction = probe_fraction;
   t.avg_topk_mean =
       scored_queries > 0 ? (sum_topk_mean / static_cast<double>(scored_queries)) : 0.0;
   t.avg_vectors_scored =
@@ -284,7 +308,7 @@ int main(int argc, char** argv) {
   std::uint64_t bucket_seed = 0;
   std::string num_buckets_list = "64,256,1024";
   std::string rebalance_every_list = "0,10000";
-  std::string probe_radii = "1,2,4,8,16";
+  std::string probe_fractions = "0.05,0.1,0.2";
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
   app.add_option("--dataset", dataset, "Dataset name")->envname("VECTORCACHE_DATASET");
@@ -301,7 +325,8 @@ int main(int argc, char** argv) {
   app.add_option("--num-buckets-list", num_buckets_list, "Comma-separated B values");
   app.add_option("--rebalance-every-list", rebalance_every_list,
                  "Comma-separated rebalance periods (0 = finalize only)");
-  app.add_option("--probe-radii", probe_radii, "Comma-separated nprobe values");
+  app.add_option("--probe-fractions", probe_fractions,
+                 "Comma-separated index coverage fractions (0,1]");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -313,7 +338,7 @@ int main(int argc, char** argv) {
 
     const auto B_list = parse_size_list(num_buckets_list, "num-buckets");
     const auto rebal_list = parse_size_list(rebalance_every_list, "rebalance-every");
-    const auto P_list = parse_size_list(probe_radii, "probe-radii");
+    const auto F_list = parse_float_list(probe_fractions, "probe-fractions");
 
     for (const std::size_t B : B_list) {
       if (B == 0 || B > vectorcache::index::kMaxBuckets) {
@@ -335,7 +360,7 @@ int main(int argc, char** argv) {
       throw vectorcache::Error("empty index");
     }
 
-    const std::size_t grid_total = B_list.size() * rebal_list.size() * P_list.size();
+    const std::size_t grid_total = B_list.size() * rebal_list.size() * F_list.size();
 
     std::cout << "Cluster IVF tune: index=" << source_label << " dim=" << meta.dim
               << " index_n=" << actual_index << " query_n=" << query_limit
@@ -355,11 +380,11 @@ int main(int argc, char** argv) {
     std::size_t evaluated = 0;
     std::size_t skipped = 0;
 
-    std::vector<std::size_t> valid_P;
-    valid_P.reserve(P_list.size());
-    for (const std::size_t P : P_list) {
-      if (probe_radius_ok(P)) {
-        valid_P.push_back(P);
+    std::vector<float> valid_F;
+    valid_F.reserve(F_list.size());
+    for (const float f : F_list) {
+      if (probe_fraction_ok(f)) {
+        valid_F.push_back(f);
       } else {
         ++skipped;
       }
@@ -367,7 +392,7 @@ int main(int argc, char** argv) {
 
     for (const std::size_t B : B_list) {
       for (const std::size_t rebal : rebal_list) {
-        if (valid_P.empty()) {
+        if (valid_F.empty()) {
           continue;
         }
 
@@ -393,8 +418,8 @@ int main(int argc, char** argv) {
           prepared.push_back(query_engine.prepare(q));
         }
 
-        for (const std::size_t P : valid_P) {
-          trials.push_back(run_trial(query_engine, prepared, k, B, rebal, P));
+        for (const float f : valid_F) {
+          trials.push_back(run_trial(query_engine, prepared, k, B, rebal, f));
           ++evaluated;
         }
       }
@@ -409,7 +434,8 @@ int main(int argc, char** argv) {
     } else {
       for (const auto& t : front) {
         std::cout << std::fixed << std::setprecision(2);
-        std::cout << "  B=" << t.B << " rebal=" << t.rebalance_every << " nprobe=" << t.P;
+        std::cout << "  B=" << t.B << " rebal=" << t.rebalance_every
+                  << " probe_fraction=" << t.probe_fraction;
         std::cout << std::setprecision(4);
         std::cout << "  topk_mean=" << t.avg_topk_mean;
         std::cout << std::setprecision(1);

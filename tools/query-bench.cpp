@@ -498,7 +498,7 @@ int main(int argc, char** argv) {
   std::size_t bits = 1;
   std::size_t num_buckets = 256;
   std::size_t rebalance_every = 10000;
-  std::size_t probe_radius = 8;
+  float probe_fraction = 0.1f;
   std::uint64_t bucket_seed = 0;
   bool calibrate = false;
   bool recall = false;
@@ -517,7 +517,8 @@ int main(int argc, char** argv) {
   app.add_option("--num-buckets", num_buckets, "Cluster IVF bucket count B");
   app.add_option("--rebalance-every", rebalance_every,
                  "Lloyd rebalance every N vectors (0 = finalize only)");
-  app.add_option("--probe-radius", probe_radius, "nprobe: top cluster lists by centroid IP");
+  app.add_option("--probe-fraction", probe_fraction,
+                 "Index coverage fraction: probe high-IP lists until this share of vectors");
   app.add_option("--bucket-seed", bucket_seed, "Cluster centroid seed (0 = derive from --seed)");
   app.add_flag("--calibrate", calibrate,
                "Print rotated_dim / bits / hit count for the first query");
@@ -535,7 +536,7 @@ int main(int argc, char** argv) {
     if (num_buckets == 0 || num_buckets > vectorcache::index::kMaxBuckets) {
       throw vectorcache::Error("num-buckets must be in 1..kMaxBuckets");
     }
-    vectorcache::index::validate_probe_radius(probe_radius);
+    vectorcache::index::validate_probe_fraction(probe_fraction);
 
     if (query_split.empty()) {
       query_split = (dataset == "glove") ? "test" : "holdout";
@@ -556,7 +557,7 @@ int main(int argc, char** argv) {
               << " query_n=" << query_limit << " query_split=" << query_split
               << " bits=" << bits
               << " B=" << num_buckets << " rebalance_every=" << rebalance_every
-              << " nprobe=" << probe_radius << '\n';
+              << " probe_fraction=" << probe_fraction << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
     }
@@ -593,7 +594,7 @@ int main(int argc, char** argv) {
 
     vectorcache::query::QueryParams params;
     params.k = k;
-    params.probe_radius = probe_radius;
+    params.probe_fraction = probe_fraction;
 
     std::vector<std::uint64_t> prep_ns;
     std::vector<std::uint64_t> search_ns;
