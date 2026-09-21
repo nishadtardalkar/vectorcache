@@ -19,6 +19,7 @@ BITS          ?= 1
 BLOCK_DIMS    ?= 1
 NUM_BUCKETS   ?= 256
 REBALANCE_EVERY ?= 10000
+ORTHO_ETA     ?= 0.1
 PROBE_RADIUS  ?= 8
 BUCKET_SEED   ?=
 NUM_BUCKETS_LIST ?=
@@ -62,7 +63,7 @@ CMAKE_COMPUTE_FLAGS := $(CMAKE_COMMON_FLAGS) \
 opt_arg = $(if $(strip $($(1))),--$(2) $($(1)),)
 flag_arg = $(if $(filter 1 ON on true TRUE yes YES,$($(1))),--$(2),)
 
-# Shared ingest-bench / query-bench args (DATASET|NPY + DATA_DIR always set by compute).
+# Shared query-bench args (DATASET|NPY + DATA_DIR always set by compute).
 BENCH_COMMON_ARGS = \
 	$(call opt_arg,SPLIT,split) \
 	$(call opt_arg,LIMIT,limit) \
@@ -71,8 +72,6 @@ BENCH_COMMON_ARGS = \
 	$(call opt_arg,BLOCK_DIMS,block-dims) \
 	$(BENCH_EXTRA_ARGS)
 
-INGEST_BENCH_ARGS = $(BENCH_COMMON_ARGS)
-
 QUERY_BENCH_ARGS = \
 	$(BENCH_COMMON_ARGS) \
 	$(call opt_arg,QUERY_SPLIT,query-split) \
@@ -80,6 +79,7 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,K,k) \
 	$(call opt_arg,NUM_BUCKETS,num-buckets) \
 	$(call opt_arg,REBALANCE_EVERY,rebalance-every) \
+	$(call opt_arg,ORTHO_ETA,ortho-eta) \
 	$(call opt_arg,PROBE_RADIUS,probe-radius) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
 	$(call flag_arg,CALIBRATE,calibrate) \
@@ -91,6 +91,7 @@ QUERY_TUNE_ARGS = \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
+	$(call opt_arg,ORTHO_ETA,ortho-eta) \
 	$(call opt_arg,NUM_BUCKETS_LIST,num-buckets-list) \
 	$(call opt_arg,REBALANCE_EVERY_LIST,rebalance-every-list) \
 	$(call opt_arg,PROBE_RADII,probe-radii)
@@ -103,7 +104,7 @@ help:
 	@echo "VectorCache HPC targets:"
 	@echo ""
 	@echo "  make login    Configure CMake, fetch dependencies, download datasets (login node)"
-	@echo "  make compute  Build, test, ingest-bench, and query-bench offline (compute node)"
+	@echo "  make compute  Build, test, and query-bench offline (compute node)"
 	@echo "  make tune     Build and run query-bench-tune Pareto grid (compute node)"
 	@echo "  make clean    Remove build directory"
 	@echo ""
@@ -113,7 +114,7 @@ help:
 	@echo "  CMAKE_OPTS=$(CMAKE_OPTS)"
 	@echo "  VECTORCACHE_SRHT_ROUNDS (cmake cache, default 2): set to 1 or 3 for multi-round SRHT"
 	@echo ""
-	@echo "Bench variables (map to ingest-bench / query-bench CLI):"
+	@echo "Bench variables (map to query-bench CLI):"
 	@echo "  DATASET / NPY   --dataset or --npy (default DATASET=$(DATASET); pass NPY= to use a file)"
 	@echo "  DATA_DIR        --data-dir (default $(DATA_DIR))"
 	@echo "  SPLIT           --split"
@@ -123,6 +124,7 @@ help:
 	@echo "  BLOCK_DIMS      --block-dims (default $(BLOCK_DIMS); dims per codebook block, 1-16)"
 	@echo "  NUM_BUCKETS     --num-buckets (default $(NUM_BUCKETS); cluster IVF B; query-bench)"
 	@echo "  REBALANCE_EVERY --rebalance-every (default $(REBALANCE_EVERY); 0=finalize only; query-bench)"
+	@echo "  ORTHO_ETA       --ortho-eta (default $(ORTHO_ETA); frame-potential step before Lloyd; 0=skip)"
 	@echo "  PROBE_RADIUS    --probe-radius (default $(PROBE_RADIUS); nprobe top lists; query-bench)"
 	@echo "  BUCKET_SEED     --bucket-seed (cluster centroid seed; query-bench / query-bench-tune)"
 	@echo "  NUM_BUCKETS_LIST --num-buckets-list (comma B values; query-bench-tune)"
@@ -176,38 +178,15 @@ compute:
 		$(CMAKE_COMPUTE_FLAGS)
 	TOOLS_STATUS="$$(grep '^VECTORCACHE_BUILD_TOOLS:BOOL=' "$(BUILD_DIR)/CMakeCache.txt" 2>/dev/null | cut -d= -f2 || true)"
 	if [ "$$TOOLS_STATUS" != ON ]; then
-		echo "VECTORCACHE_BUILD_TOOLS is $${TOOLS_STATUS:-unset}; ingest-bench and query-bench will not be built."
+		echo "VECTORCACHE_BUILD_TOOLS is $${TOOLS_STATUS:-unset}; query-bench will not be built."
 		if [ -n "$(CMAKE_OPTS)" ]; then
 			echo "CMAKE_OPTS is set to '$(CMAKE_OPTS)' and overrides the Makefile default (-DVECTORCACHE_BUILD_TOOLS=ON)."
 		fi
 		echo "Fix: make clean && make login, then make compute without CMAKE_OPTS=-DVECTORCACHE_BUILD_TOOLS=OFF"
 		exit 1
 	fi
-	cmake --build $(BUILD_DIR) --target vectorcache_tests ingest-bench query-bench -j$(JOBS)
+	cmake --build $(BUILD_DIR) --target vectorcache_tests query-bench -j$(JOBS)
 	ctest --test-dir $(BUILD_DIR) --output-on-failure
-	INGEST_BENCH=""
-	for candidate in \
-		"$(BUILD_DIR_ABS)/ingest-bench" \
-		"$(BUILD_DIR_ABS)/$(BUILD_TYPE)/ingest-bench"; do
-		if [ -x "$$candidate" ]; then
-			INGEST_BENCH="$$candidate"
-			break
-		fi
-	done
-	if [ -z "$$INGEST_BENCH" ]; then
-		INGEST_BENCH="$$(find "$(BUILD_DIR_ABS)" -maxdepth 3 \
-			\( -name 'ingest-bench' -o -name 'ingest-bench.exe' \) -type f -print -quit 2>/dev/null || true)"
-	fi
-	if [ -z "$$INGEST_BENCH" ] || [ ! -f "$$INGEST_BENCH" ]; then
-		echo "ingest-bench not found under $(BUILD_DIR_ABS)."
-		echo "Inspect the build log above for ingest-bench compile/link errors."
-		exit 1
-	fi
-	if [ -n "$(strip $(NPY))" ]; then
-		"$$INGEST_BENCH" --npy $(NPY) --data-dir $(DATA_DIR) $(INGEST_BENCH_ARGS)
-	else
-		"$$INGEST_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(INGEST_BENCH_ARGS)
-	fi
 	QUERY_BENCH=""
 	for candidate in \
 		"$(BUILD_DIR_ABS)/query-bench" \

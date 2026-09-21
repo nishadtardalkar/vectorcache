@@ -523,7 +523,7 @@ int main(int argc, char** argv) {
   app.add_option("--rebalance-every", rebalance_every,
                  "Lloyd rebalance every N vectors (0 = finalize only)");
   app.add_option("--ortho-eta", ortho_eta,
-                 "Centroid frame-potential step size after rebalance (0 = skip)");
+                 "Centroid frame-potential step size before Lloyd reassignment (0 = skip)");
   app.add_option("--probe-radius", probe_radius, "nprobe: top cluster lists by centroid IP");
   app.add_option("--bucket-seed", bucket_seed, "Cluster centroid seed (0 = derive from --seed)");
   app.add_flag("--calibrate", calibrate,

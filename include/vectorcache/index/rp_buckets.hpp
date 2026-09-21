@@ -41,9 +41,10 @@ class ClusterCentroids {
   /// Nearest centroid without updating (Voronoi assign).
   std::uint64_t nearest(std::span<const float> x) const;
 
-  /// Keep current ĉ as assign targets; reassign all rows; recompute S/n/ĉ from members.
-  /// Then one simultaneous frame-potential step (drive pairwise ⟨ĉ_i,ĉ_j⟩→0) with step `ortho_eta`
-  /// (`0` = skip). `vectors` is row-major N * dim; `cell_keys` length N is overwritten.
+  /// One simultaneous frame-potential step (drive pairwise ⟨ĉ_i,ĉ_j⟩→0) with step `ortho_eta`
+  /// (`0` = skip), then reassign all rows to the pushed ĉ and recompute S/n/ĉ from members
+  /// (empty buckets keep prior ĉ). `vectors` is row-major N * dim; `cell_keys` length N is
+  /// overwritten.
   void rebalance(std::span<const float> vectors, std::span<std::uint64_t> cell_keys,
                  float ortho_eta = 0.1f);
 

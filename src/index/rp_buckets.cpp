@@ -228,7 +228,10 @@ void ClusterCentroids::rebalance(std::span<const float> vectors, std::span<std::
     throw Error("ClusterCentroids::rebalance: vectors size mismatch");
   }
 
-  // Keep current ĉ for assignment; clear sums/counts then rebuild.
+  // Push ĉ apart first so Lloyd assignment uses the updated Voronoi cells.
+  orthogonalize_step(ortho_eta);
+
+  // Clear sums/counts then rebuild from nearest pushed ĉ.
   sums_.assign(num_buckets_ * dim_, 0.0f);
   counts_.assign(num_buckets_, 0);
 
@@ -250,8 +253,6 @@ void ClusterCentroids::rebalance(std::span<const float> vectors, std::span<std::
     }
     // Empty buckets: keep prior ĉ (already in centroids_).
   }
-
-  orthogonalize_step(ortho_eta);
 }
 
 BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys,

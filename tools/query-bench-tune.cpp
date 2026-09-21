@@ -302,7 +302,7 @@ int main(int argc, char** argv) {
   app.add_option("--block-dims", block_dims, "Dims per codebook block (1-16; default 1)");
   app.add_option("--bucket-seed", bucket_seed, "Cluster centroid seed (0 = derive from --seed)");
   app.add_option("--ortho-eta", ortho_eta,
-                 "Centroid frame-potential step size after rebalance (0 = skip)");
+                 "Centroid frame-potential step size before Lloyd reassignment (0 = skip)");
   app.add_option("--num-buckets-list", num_buckets_list, "Comma-separated B values");
   app.add_option("--rebalance-every-list", rebalance_every_list,
                  "Comma-separated rebalance periods (0 = finalize only)");
