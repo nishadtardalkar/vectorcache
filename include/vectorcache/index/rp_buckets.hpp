@@ -42,12 +42,16 @@ class ClusterCentroids {
   std::uint64_t nearest(std::span<const float> x) const;
 
   /// Keep current ĉ as assign targets; reassign all rows; recompute S/n/ĉ from members.
-  /// `vectors` is row-major N * dim; `cell_keys` length N is overwritten.
-  void rebalance(std::span<const float> vectors, std::span<std::uint64_t> cell_keys);
+  /// Then one simultaneous frame-potential step (drive pairwise ⟨ĉ_i,ĉ_j⟩→0) with step `ortho_eta`
+  /// (`0` = skip). `vectors` is row-major N * dim; `cell_keys` length N is overwritten.
+  void rebalance(std::span<const float> vectors, std::span<std::uint64_t> cell_keys,
+                 float ortho_eta = 0.1f);
 
  private:
   void normalize_centroid(std::size_t j);
   float ip_centroid(std::size_t j, std::span<const float> x) const;
+  /// One GD step on L=Σ_{i<j} ⟨ĉ_i,ĉ_j⟩²; syncs S_i for non-empty buckets.
+  void orthogonalize_step(float eta);
 
   std::size_t num_buckets_ = 0;
   std::size_t dim_ = 0;

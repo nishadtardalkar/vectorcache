@@ -57,6 +57,17 @@ std::vector<float> unit_axis(std::size_t dim, std::size_t axis) {
   return v;
 }
 
+float offdiag_gram_sq(const index::ClusterCentroids& cc) {
+  double sum = 0.0;
+  for (std::size_t i = 0; i < cc.num_buckets(); ++i) {
+    for (std::size_t j = i + 1; j < cc.num_buckets(); ++j) {
+      const float ip = dot(cc.centroid(i), cc.centroid(j));
+      sum += static_cast<double>(ip) * static_cast<double>(ip);
+    }
+  }
+  return static_cast<float>(sum);
+}
+
 }  // namespace
 
 TEST(ClusterBucketsTest, InitDeterministic) {
@@ -120,13 +131,62 @@ TEST(ClusterBucketsTest, RebalanceFixesStickyAssignment) {
   // Pollute: assign both to same online path then rebalance.
   (void)cc.assign_and_update(e0);
   (void)cc.assign_and_update(e0);
-  cc.rebalance(vectors, keys);
+  cc.rebalance(vectors, keys, /*ortho_eta=*/0.1f);
 
   EXPECT_NE(keys[0], keys[1]);
   EXPECT_EQ(keys[0], cc.nearest(e0));
   EXPECT_EQ(keys[1], cc.nearest(e1));
   EXPECT_EQ(cc.count(static_cast<std::size_t>(keys[0])), 1u);
   EXPECT_EQ(cc.count(static_cast<std::size_t>(keys[1])), 1u);
+}
+
+TEST(ClusterBucketsTest, OrthoStepDecreasesFramePotential) {
+  const std::size_t dim = 4;
+  const std::size_t B = 2;
+  index::ClusterCentroids cc(B, dim, 5);
+
+  std::vector<float> vectors;
+  for (std::size_t j = 0; j < B; ++j) {
+    const auto c = cc.centroid(j);
+    vectors.insert(vectors.end(), c.begin(), c.end());
+  }
+  std::vector<std::uint64_t> keys(B, 0);
+
+  cc.rebalance(vectors, keys, /*ortho_eta=*/0.0f);
+  EXPECT_NE(keys[0], keys[1]);
+  const float g_before = offdiag_gram_sq(cc);
+  ASSERT_GT(g_before, 1e-8f);
+
+  // Refresh vectors to current Lloyd means so the next Lloyd is a no-op, then push.
+  vectors.clear();
+  for (std::size_t j = 0; j < B; ++j) {
+    const auto c = cc.centroid(j);
+    vectors.insert(vectors.end(), c.begin(), c.end());
+  }
+  cc.rebalance(vectors, keys, /*ortho_eta=*/0.5f);
+  const float g_after = offdiag_gram_sq(cc);
+  EXPECT_LT(g_after, g_before);
+  for (std::size_t j = 0; j < B; ++j) {
+    EXPECT_NEAR(std::sqrt(dot(cc.centroid(j), cc.centroid(j))), 1.0f, 1e-5f);
+  }
+}
+
+TEST(ClusterBucketsTest, OrthoStepSyncsSumsWithCentroids) {
+  const std::size_t dim = 4;
+  index::ClusterCentroids cc(2, dim, 11);
+
+  std::vector<float> vectors;
+  for (std::size_t j = 0; j < 2; ++j) {
+    const auto c = cc.centroid(j);
+    vectors.insert(vectors.end(), c.begin(), c.end());
+  }
+  std::vector<std::uint64_t> keys(2, 0);
+  cc.rebalance(vectors, keys, /*ortho_eta=*/0.5f);
+
+  const std::size_t j = static_cast<std::size_t>(keys[0]);
+  std::vector<float> c(cc.centroid(j).begin(), cc.centroid(j).end());
+  (void)cc.assign_and_update(c);
+  EXPECT_NEAR(dot(cc.centroid(j), c), 1.0f, 1e-5f);
 }
 
 TEST(ClusterBucketsTest, ProbeOrdersByCentroidIp) {

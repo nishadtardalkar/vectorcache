@@ -26,6 +26,8 @@ struct BucketParams {
   std::size_t num_buckets = 256;
   /// Rebalance every N vectors during ingest; 0 => only at finalize.
   std::size_t rebalance_every = 10000;
+  /// Frame-potential GD step size after each rebalance (`0` = skip).
+  float ortho_eta = 0.1f;
   std::uint64_t bucket_seed = 0;  // 0 => derive from rotation seed when available
 };
 
