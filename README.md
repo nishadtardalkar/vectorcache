@@ -110,7 +110,7 @@ make compute BITS=2 RECALL=1
 make compute BITS=1 BLOCK_DIMS=2
 ```
 
-With `RECALL=1` / `--recall`, query-bench prints **Recall@1@k** (exact NN in approx top-k; TurboVec-compatible) then set-overlap **Recall@k**.
+With `RECALL=1` / `--recall`, query-bench prints **Recall@1@k** (exact NN in approx top-k; TurboVec-compatible) then set-overlap **Recall@k**. Exact cosine top-k ground truth is cached under `.cache/exact_topk/` (keyed by dataset/npy, split, index size, query split/limit, k, and seed) and reused on later runs.
 
 ## CLI tools
 
@@ -161,7 +161,7 @@ Ingest into RAM, then flat-scan asymmetric IP scores:
 ./query-bench --dataset glove --bits 4 --k 8 --limit 100000 --recall
 ```
 
-`--recall` reports **Recall@1@k** (exact cosine NN in approx top-k; matches TurboVec charts) and set-overlap **Recall@k**.
+`--recall` reports **Recall@1@k** (exact cosine NN in approx top-k; matches TurboVec charts) and set-overlap **Recall@k**. Exact top-k IDs are stored under `.cache/exact_topk/` and loaded on subsequent runs with the same ground-truth parameters (delete the file to recompute).
 
 Environment variables:
 - `VECTORCACHE_DATASET` / `VECTORCACHE_DATA_DIR`

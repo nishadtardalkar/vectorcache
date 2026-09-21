@@ -132,7 +132,7 @@ help:
 	@echo "  QUERY_LIMIT     --query-limit (query-bench / query-bench-tune)"
 	@echo "  K               --k (default $(K); query-bench / query-bench-tune)"
 	@echo "  CALIBRATE=1     --calibrate (query-bench only)"
-	@echo "  RECALL=1        --recall (query-bench: Recall@1@k + Recall@k)"
+	@echo "  RECALL=1        --recall (query-bench: Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
 	@echo "  BENCH_EXTRA_ARGS  appended to benches as-is"
 	@echo ""
 	@echo "For native SIMD on compute nodes: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
