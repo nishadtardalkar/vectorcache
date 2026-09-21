@@ -79,13 +79,12 @@ vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::Dataset
                                                   std::size_t dim, std::uint64_t seed,
                                                   std::size_t limit, std::size_t bits,
                                                   std::size_t num_buckets,
-                                                  std::size_t rebalance_every, float ortho_eta,
+                                                  std::size_t rebalance_every,
                                                   std::uint64_t bucket_seed) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
   vectorcache::ingest::BucketParams buckets;
   buckets.num_buckets = num_buckets;
   buckets.rebalance_every = rebalance_every;
-  buckets.ortho_eta = ortho_eta;
   buckets.bucket_seed = bucket_seed;
   auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits, buckets);
   engine.reserve_vectors(limit);
@@ -499,7 +498,6 @@ int main(int argc, char** argv) {
   std::size_t bits = 1;
   std::size_t num_buckets = 256;
   std::size_t rebalance_every = 10000;
-  float ortho_eta = 0.1f;
   std::size_t probe_radius = 8;
   std::uint64_t bucket_seed = 0;
   bool calibrate = false;
@@ -519,8 +517,6 @@ int main(int argc, char** argv) {
   app.add_option("--num-buckets", num_buckets, "Cluster IVF bucket count B");
   app.add_option("--rebalance-every", rebalance_every,
                  "Lloyd rebalance every N vectors (0 = finalize only)");
-  app.add_option("--ortho-eta", ortho_eta,
-                 "Centroid frame-potential step size before Lloyd reassignment (0 = skip)");
   app.add_option("--probe-radius", probe_radius, "nprobe: top cluster lists by centroid IP");
   app.add_option("--bucket-seed", bucket_seed, "Cluster centroid seed (0 = derive from --seed)");
   app.add_flag("--calibrate", calibrate,
@@ -560,7 +556,7 @@ int main(int argc, char** argv) {
               << " query_n=" << query_limit << " query_split=" << query_split
               << " bits=" << bits
               << " B=" << num_buckets << " rebalance_every=" << rebalance_every
-              << " ortho_eta=" << ortho_eta << " nprobe=" << probe_radius << '\n';
+              << " nprobe=" << probe_radius << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
     }
@@ -568,7 +564,7 @@ int main(int argc, char** argv) {
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto ingest_engine =
         ingest_index(index_limited, meta.dim, seed, actual_index, bits, num_buckets,
-                     rebalance_every, ortho_eta, bucket_seed);
+                     rebalance_every, bucket_seed);
     {
       const auto& store = ingest_engine.store();
       std::cout << "  stored_vectors=" << store.size()

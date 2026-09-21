@@ -134,90 +134,7 @@ std::uint64_t ClusterCentroids::assign_and_update(std::span<const float> x) {
   return key;
 }
 
-void ClusterCentroids::orthogonalize_step(float eta) {
-  if (eta == 0.0f || num_buckets_ < 2) {
-    return;
-  }
-
-  // Simultaneous gradients g_i = Σ_{j≠i} ⟨ĉ_i, ĉ_j⟩ ĉ_j from pre-step centroids.
-  AlignedVector<float> grads(num_buckets_ * dim_, 0.0f);
-  for (std::size_t i = 0; i < num_buckets_; ++i) {
-    const float* ci = centroids_.data() + i * dim_;
-    float* gi = grads.data() + i * dim_;
-    for (std::size_t j = 0; j < num_buckets_; ++j) {
-      if (j == i) {
-        continue;
-      }
-      const float* cj = centroids_.data() + j * dim_;
-      float ip = 0.0f;
-      for (std::size_t d = 0; d < dim_; ++d) {
-        ip += ci[d] * cj[d];
-      }
-      for (std::size_t d = 0; d < dim_; ++d) {
-        gi[d] += ip * cj[d];
-      }
-    }
-  }
-
-  AlignedVector<float> next(num_buckets_ * dim_, 0.0f);
-  std::vector<float> sum_norms(num_buckets_, 0.0f);
-  for (std::size_t i = 0; i < num_buckets_; ++i) {
-    if (counts_[i] > 0) {
-      const float* s = sums_.data() + i * dim_;
-      double energy = 0.0;
-      for (std::size_t d = 0; d < dim_; ++d) {
-        energy += static_cast<double>(s[d]) * static_cast<double>(s[d]);
-      }
-      sum_norms[i] = static_cast<float>(std::sqrt(energy));
-    }
-  }
-
-  for (std::size_t i = 0; i < num_buckets_; ++i) {
-    const float* ci = centroids_.data() + i * dim_;
-    float* gi = grads.data() + i * dim_;
-    float* out = next.data() + i * dim_;
-
-    float g_dot_c = 0.0f;
-    for (std::size_t d = 0; d < dim_; ++d) {
-      g_dot_c += gi[d] * ci[d];
-    }
-    for (std::size_t d = 0; d < dim_; ++d) {
-      gi[d] -= g_dot_c * ci[d];
-      out[d] = ci[d] - eta * gi[d];
-    }
-
-    double energy = 0.0;
-    for (std::size_t d = 0; d < dim_; ++d) {
-      energy += static_cast<double>(out[d]) * static_cast<double>(out[d]);
-    }
-    if (energy <= 0.0) {
-      for (std::size_t d = 0; d < dim_; ++d) {
-        out[d] = ci[d];
-      }
-    } else {
-      const float inv = static_cast<float>(1.0 / std::sqrt(energy));
-      for (std::size_t d = 0; d < dim_; ++d) {
-        out[d] *= inv;
-      }
-    }
-  }
-
-  centroids_ = std::move(next);
-
-  for (std::size_t i = 0; i < num_buckets_; ++i) {
-    if (counts_[i] == 0 || sum_norms[i] <= 0.0f) {
-      continue;
-    }
-    const float* c = centroids_.data() + i * dim_;
-    float* s = sums_.data() + i * dim_;
-    for (std::size_t d = 0; d < dim_; ++d) {
-      s[d] = c[d] * sum_norms[i];
-    }
-  }
-}
-
-void ClusterCentroids::rebalance(std::span<const float> vectors, std::span<std::uint64_t> cell_keys,
-                                 float ortho_eta) {
+void ClusterCentroids::rebalance(std::span<const float> vectors, std::span<std::uint64_t> cell_keys) {
   if (empty()) {
     throw Error("ClusterCentroids::rebalance: empty");
   }
@@ -228,10 +145,7 @@ void ClusterCentroids::rebalance(std::span<const float> vectors, std::span<std::
     throw Error("ClusterCentroids::rebalance: vectors size mismatch");
   }
 
-  // Push ĉ apart first so Lloyd assignment uses the updated Voronoi cells.
-  orthogonalize_step(ortho_eta);
-
-  // Clear sums/counts then rebuild from nearest pushed ĉ.
+  // Clear sums/counts then rebuild from nearest ĉ.
   sums_.assign(num_buckets_ * dim_, 0.0f);
   counts_.assign(num_buckets_, 0);
 

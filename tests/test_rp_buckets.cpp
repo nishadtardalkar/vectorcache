@@ -120,7 +120,7 @@ TEST(ClusterBucketsTest, RebalanceFixesStickyAssignment) {
   // Pollute: assign both to same online path then rebalance.
   (void)cc.assign_and_update(e0);
   (void)cc.assign_and_update(e0);
-  cc.rebalance(vectors, keys, /*ortho_eta=*/0.1f);
+  cc.rebalance(vectors, keys);
 
   EXPECT_NE(keys[0], keys[1]);
   EXPECT_EQ(keys[0], cc.nearest(e0));
@@ -129,7 +129,7 @@ TEST(ClusterBucketsTest, RebalanceFixesStickyAssignment) {
   EXPECT_EQ(cc.count(static_cast<std::size_t>(keys[1])), 1u);
 }
 
-TEST(ClusterBucketsTest, OrthoBeforeLloydKeepsUnitCentroids) {
+TEST(ClusterBucketsTest, RebalanceKeepsUnitCentroids) {
   const std::size_t dim = 4;
   const std::size_t B = 2;
   index::ClusterCentroids cc(B, dim, 5);
@@ -141,8 +141,7 @@ TEST(ClusterBucketsTest, OrthoBeforeLloydKeepsUnitCentroids) {
   }
   std::vector<std::uint64_t> keys(B, 0);
 
-  // Ortho pushes first; Lloyd then sets ĉ to member means (here the input rows).
-  cc.rebalance(vectors, keys, /*ortho_eta=*/0.5f);
+  cc.rebalance(vectors, keys);
   EXPECT_NE(keys[0], keys[1]);
   for (std::size_t j = 0; j < B; ++j) {
     EXPECT_NEAR(std::sqrt(dot(cc.centroid(j), cc.centroid(j))), 1.0f, 1e-5f);
@@ -150,7 +149,7 @@ TEST(ClusterBucketsTest, OrthoBeforeLloydKeepsUnitCentroids) {
   }
 }
 
-TEST(ClusterBucketsTest, OrthoStepSyncsSumsWithCentroids) {
+TEST(ClusterBucketsTest, RebalanceThenAssignKeepsAlignment) {
   const std::size_t dim = 4;
   index::ClusterCentroids cc(2, dim, 11);
 
@@ -160,7 +159,7 @@ TEST(ClusterBucketsTest, OrthoStepSyncsSumsWithCentroids) {
     vectors.insert(vectors.end(), c.begin(), c.end());
   }
   std::vector<std::uint64_t> keys(2, 0);
-  cc.rebalance(vectors, keys, /*ortho_eta=*/0.5f);
+  cc.rebalance(vectors, keys);
 
   const std::size_t j = static_cast<std::size_t>(keys[0]);
   std::vector<float> c(cc.centroid(j).begin(), cc.centroid(j).end());

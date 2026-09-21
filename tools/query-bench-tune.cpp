@@ -282,7 +282,6 @@ int main(int argc, char** argv) {
   std::size_t k = 10;
   std::size_t bits = 1;
   std::uint64_t bucket_seed = 0;
-  float ortho_eta = 0.1f;
   std::string num_buckets_list = "64,256,1024";
   std::string rebalance_every_list = "0,10000";
   std::string probe_radii = "1,2,4,8,16";
@@ -299,8 +298,6 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_option("--bits", bits, "TurboQuantMSE bits per dim (1-8)");
   app.add_option("--bucket-seed", bucket_seed, "Cluster centroid seed (0 = derive from --seed)");
-  app.add_option("--ortho-eta", ortho_eta,
-                 "Centroid frame-potential step size before Lloyd reassignment (0 = skip)");
   app.add_option("--num-buckets-list", num_buckets_list, "Comma-separated B values");
   app.add_option("--rebalance-every-list", rebalance_every_list,
                  "Comma-separated rebalance periods (0 = finalize only)");
@@ -379,7 +376,6 @@ int main(int argc, char** argv) {
         vectorcache::ingest::BucketParams buckets;
         buckets.num_buckets = B;
         buckets.rebalance_every = rebal;
-        buckets.ortho_eta = ortho_eta;
         buckets.bucket_seed = bucket_seed;
         auto ingest_engine = vectorcache::ingest::IngestionEngine::with_rotation(
             meta.dim, seed, bits, buckets);

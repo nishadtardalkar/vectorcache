@@ -156,7 +156,7 @@ void IngestionEngine::maybe_rebalance(std::vector<std::uint64_t>& cell_keys, boo
     }
   }
   centroids_.rebalance(std::span<const float>(rotated_all_.data(), n * srht_dim_),
-                       std::span<std::uint64_t>(cell_keys.data(), n), bucket_params_.ortho_eta);
+                       std::span<std::uint64_t>(cell_keys.data(), n));
 }
 
 void IngestionEngine::finalize_bucket_index(std::vector<std::uint64_t>& cell_keys) {

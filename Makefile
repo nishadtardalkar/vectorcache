@@ -18,7 +18,6 @@ SEED          ?=
 BITS          ?= 1
 NUM_BUCKETS   ?= 256
 REBALANCE_EVERY ?= 10000
-ORTHO_ETA     ?= 0.1
 PROBE_RADIUS  ?= 8
 BUCKET_SEED   ?=
 NUM_BUCKETS_LIST ?=
@@ -77,7 +76,6 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,K,k) \
 	$(call opt_arg,NUM_BUCKETS,num-buckets) \
 	$(call opt_arg,REBALANCE_EVERY,rebalance-every) \
-	$(call opt_arg,ORTHO_ETA,ortho-eta) \
 	$(call opt_arg,PROBE_RADIUS,probe-radius) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
 	$(call flag_arg,CALIBRATE,calibrate) \
@@ -89,7 +87,6 @@ QUERY_TUNE_ARGS = \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
-	$(call opt_arg,ORTHO_ETA,ortho-eta) \
 	$(call opt_arg,NUM_BUCKETS_LIST,num-buckets-list) \
 	$(call opt_arg,REBALANCE_EVERY_LIST,rebalance-every-list) \
 	$(call opt_arg,PROBE_RADII,probe-radii)
@@ -121,7 +118,6 @@ help:
 	@echo "  BITS            --bits (default $(BITS); TurboQuantMSE bits/dim, 1-8)"
 	@echo "  NUM_BUCKETS     --num-buckets (default $(NUM_BUCKETS); cluster IVF B; query-bench)"
 	@echo "  REBALANCE_EVERY --rebalance-every (default $(REBALANCE_EVERY); 0=finalize only; query-bench)"
-	@echo "  ORTHO_ETA       --ortho-eta (default $(ORTHO_ETA); frame-potential step before Lloyd; 0=skip)"
 	@echo "  PROBE_RADIUS    --probe-radius (default $(PROBE_RADIUS); nprobe top lists; query-bench)"
 	@echo "  BUCKET_SEED     --bucket-seed (cluster centroid seed; query-bench / query-bench-tune)"
 	@echo "  NUM_BUCKETS_LIST --num-buckets-list (comma B values; query-bench-tune)"
