@@ -77,7 +77,7 @@ ctest --output-on-failure
 
 OpenAI NPY corpora have no HDF5-style `test` split; `--query-split` defaults to `holdout` (last `--query-limit` rows) for them. GloVe defaults to `test`.
 
-Reports median batch search latency (`ms_per_query`) and optional **Recall@1@k** / **Recall@k**.
+Reports median batch search latency (`ms_per_query`) and optional **Recall@1@k** / **Recall@k**. Exact top-k IDs are cached under `.cache/exact_topk/` (keyed by dataset/npy, split, index size, query split/limit, and k) and reused on later runs with the same ground-truth parameters.
 
 ## Library sketch
 

@@ -89,7 +89,7 @@ help:
 	@echo "  QUERY_LIMIT     --query-limit"
 	@echo "  QUERY_SPLIT     --query-split (test for glove; holdout for openai)"
 	@echo "  CALIBRATE=1     --calibrate (TQ+)"
-	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k)"
+	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
