@@ -8,27 +8,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VECTORCACHE_BUILD_GLOVE "Enable GloVe HDF5 reader" ON)
 option(VECTORCACHE_BUILD_TOOLS "Build CLI tools" ON)
-option(VECTORCACHE_BUILD_TESTS "Build tests" ON)
+option(VECTORCACHE_BUILD_TESTS "Build GoogleTest suite" ON)
+option(VECTORCACHE_OPENMP "Enable OpenMP parallelism" ON)
 option(VECTORCACHE_FETCH_DATASETS "Build fetch-datasets (requires libcurl)" ON)
 option(VECTORCACHE_FETCH_OPENAI "Download/convert OpenAI parquet shards (requires Arrow)" ON)
-
-option(VECTORCACHE_OPENMP "Enable OpenMP parallel ingest + query scan" ON)
-
-set(VECTORCACHE_SRHT_ROUNDS 2 CACHE STRING "Compile-time SRHT round count (1, 2, or 3); TurboVec uses 2")
-set_property(CACHE VECTORCACHE_SRHT_ROUNDS PROPERTY STRINGS 1 2 3)
-if(NOT VECTORCACHE_SRHT_ROUNDS MATCHES "^[123]$")
-  message(FATAL_ERROR "VECTORCACHE_SRHT_ROUNDS must be 1, 2, or 3 (got '${VECTORCACHE_SRHT_ROUNDS}')")
-endif()
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  add_compile_options(-mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vpopcntdq
-                      -mavx512vbmi -mavx512vnni -mfma)
-elseif(MSVC)
-  # /arch:AVX512 does not define __AVX512VPOPCNTDQ__; force it so _mm512_popcnt_epi64 is used.
-  # VBMI/VNNI macros are not always set by MSVC; define them for FastScan kernels.
-  add_compile_options(/arch:AVX512)
-  add_compile_definitions(__AVX512VPOPCNTDQ__=1 __AVX512VBMI__=1 __AVX512VNNI__=1)
-endif()
 
 include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
@@ -41,18 +24,16 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(CLI11)
 
 set(VECTORCACHE_SOURCES
-  src/transform/fwht.cpp
-  src/transform/normalize.cpp
-  src/transform/srht.cpp
-  src/quantize/quantize.cpp
-  src/index/rp_buckets.cpp
-  src/ingest/store.cpp
-  src/ingest/timing.cpp
-  src/ingest/engine.cpp
-  src/query/distance.cpp
-  src/query/engine.cpp
+  src/chacha8.cpp
+  src/transform/rotation.cpp
+  src/quantize/codebook.cpp
+  src/encode/encode.cpp
+  src/pack/pack.cpp
+  src/search/search.cpp
+  src/search/search_avx2.cpp
+  src/index.cpp
   src/datasets/npy.cpp
-  src/datasets/sample.cpp
+  src/datasets/datasets.cpp
 )
 
 if(VECTORCACHE_BUILD_GLOVE)
@@ -62,34 +43,24 @@ endif()
 add_library(vectorcache ${VECTORCACHE_SOURCES})
 target_include_directories(vectorcache PUBLIC include)
 target_compile_features(vectorcache PUBLIC cxx_std_20)
-target_compile_definitions(vectorcache PUBLIC VECTORCACHE_SRHT_ROUNDS=${VECTORCACHE_SRHT_ROUNDS})
+
+if(MSVC)
+  target_compile_options(vectorcache PRIVATE /W4 /arch:AVX2)
+else()
+  target_compile_options(vectorcache PRIVATE
+    -Wall -Wextra
+    -mavx2 -mfma
+  )
+  # Compile AVX2 search TU with broader ISA; runtime dispatch selects path.
+  set_source_files_properties(src/search/search_avx2.cpp PROPERTIES
+    COMPILE_FLAGS "-mavx2 -mfma")
+endif()
 
 if(VECTORCACHE_OPENMP)
-  # FindOpenMP may cache an absolute libgomp under CMAKE_PREFIX_PATH (e.g. env/).
-  # If that file disappears between login/compute, Make dies with "No rule to make
-  # target '.../libgomp.so'". Drop the stale cache entry and prefer -fopenmp so
-  # the compiler driver resolves libgomp instead of baking a Make dependency.
-  if(DEFINED OpenMP_gomp_LIBRARY AND OpenMP_gomp_LIBRARY AND
-     NOT EXISTS "${OpenMP_gomp_LIBRARY}")
-    message(STATUS "Clearing stale OpenMP_gomp_LIBRARY=${OpenMP_gomp_LIBRARY}")
-    unset(OpenMP_gomp_LIBRARY CACHE)
-    unset(OpenMP_omp_LIBRARY CACHE)
-    unset(OpenMP_CXX_FOUND CACHE)
-    unset(OpenMP_C_FOUND CACHE)
-    unset(OpenMP_FOUND CACHE)
-  endif()
   find_package(OpenMP)
   if(OpenMP_CXX_FOUND)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-      separate_arguments(_vc_omp_flags NATIVE_COMMAND "${OpenMP_CXX_FLAGS}")
-      target_compile_options(vectorcache PUBLIC ${_vc_omp_flags})
-      target_link_options(vectorcache PUBLIC ${_vc_omp_flags})
-    else()
-      target_link_libraries(vectorcache PUBLIC OpenMP::OpenMP_CXX)
-    endif()
-    target_compile_definitions(vectorcache PUBLIC VECTORCACHE_OPENMP=1)
-  else()
-    message(WARNING "VECTORCACHE_OPENMP=ON but OpenMP was not found; building without OpenMP")
+    target_link_libraries(vectorcache PUBLIC OpenMP::OpenMP_CXX)
+    target_compile_definitions(vectorcache PUBLIC VECTORCACHE_OPENMP)
   endif()
 endif()
 
@@ -100,9 +71,6 @@ if(VECTORCACHE_BUILD_GLOVE)
   target_link_libraries(vectorcache PUBLIC ${HDF5_LIBRARIES})
 endif()
 
-# Shared Parquet from conda-forge or GCC 14+ may require libstdc++ with CXXABI_1.3.15
-# (__cxa_call_terminate). Link libstdc++ from the same prefix as libparquet when the
-# compiler's default libstdc++ is too old.
 function(vectorcache_link_parquet_libstdcxx link_target parquet_target)
   if(NOT TARGET ${parquet_target})
     return()
@@ -121,14 +89,8 @@ function(vectorcache_link_parquet_libstdcxx link_target parquet_target)
   if(VECTORCACHE_PARQUET_LIBSTDCXX)
     target_link_libraries(${link_target} PUBLIC "${VECTORCACHE_PARQUET_LIBSTDCXX}")
     target_link_options(${link_target} PUBLIC "LINKER:-rpath,${_parquet_libdir}")
-    message(STATUS "Linking libstdc++ from Parquet prefix for C++ ABI compatibility: "
-                    "${VECTORCACHE_PARQUET_LIBSTDCXX}")
   endif()
 endfunction()
-
-if(VECTORCACHE_BUILD_TOOLS)
-  target_sources(vectorcache PRIVATE src/datasets/datasets.cpp)
-endif()
 
 if(VECTORCACHE_BUILD_TOOLS AND VECTORCACHE_FETCH_DATASETS)
   find_package(CURL REQUIRED)
@@ -153,23 +115,14 @@ if(VECTORCACHE_BUILD_TOOLS AND VECTORCACHE_FETCH_DATASETS)
       message(FATAL_ERROR "Could not find Arrow CMake target")
     endif()
   endif()
+
+  add_executable(fetch-datasets tools/fetch-datasets.cpp)
+  target_link_libraries(fetch-datasets PRIVATE vectorcache vectorcache_fetch CLI11::CLI11)
 endif()
 
 if(VECTORCACHE_BUILD_TOOLS)
-  function(add_vectorcache_tool name)
-    add_executable(${name} tools/${name}.cpp)
-    target_link_libraries(${name} PRIVATE vectorcache CLI11::CLI11)
-  endfunction()
-
-  if(VECTORCACHE_FETCH_DATASETS)
-    add_vectorcache_tool(fetch-datasets)
-    target_link_libraries(fetch-datasets PRIVATE vectorcache_fetch)
-  endif()
-
-  add_vectorcache_tool(ingest-sample)
-  add_vectorcache_tool(ingest-bench)
-  add_vectorcache_tool(query-bench)
-  add_vectorcache_tool(query-bench-tune)
+  add_executable(query-bench tools/query-bench.cpp)
+  target_link_libraries(query-bench PRIVATE vectorcache CLI11::CLI11)
 endif()
 
 if(VECTORCACHE_BUILD_TESTS)
@@ -184,22 +137,11 @@ if(VECTORCACHE_BUILD_TESTS)
 
   add_executable(vectorcache_tests
     tests/test_main.cpp
-    tests/test_fwht.cpp
-    tests/test_normalize.cpp
-    tests/test_srht.cpp
-    tests/test_quantize.cpp
-    tests/test_store.cpp
-    tests/test_engine.cpp
-    tests/test_query.cpp
-    tests/test_rp_buckets.cpp
-    tests/test_sample.cpp
-    tests/test_npy.cpp
+    tests/test_rotation.cpp
+    tests/test_codebook.cpp
+    tests/test_pack.cpp
+    tests/test_index.cpp
   )
-
-  if(VECTORCACHE_BUILD_GLOVE)
-    target_sources(vectorcache_tests PRIVATE tests/test_hdf5.cpp)
-  endif()
-
   target_link_libraries(vectorcache_tests PRIVATE vectorcache GTest::gtest)
   include(GoogleTest)
   gtest_discover_tests(vectorcache_tests)

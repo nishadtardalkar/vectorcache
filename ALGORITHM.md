@@ -1,13 +1,13 @@
 # VectorCache Algorithm
 
-Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation**, **TurboQuant** scalar codes (`n` bits per rotated dimension), and **spherical cluster IVF** prune before quantized rescoring.
+Flat approximate nearest-neighbor search matching turbovec's TurboQuant core (no IVF).
 
-1. L2-normalize on `dim`
-2. Apply `K` rounds of (global Fisher–Yates permutation → ±1 signs → normalized block Walsh–Hadamard); `K` is compile-time (`VECTORCACHE_SRHT_ROUNDS`, default **2**). Block size is the largest power-of-two divisor of `dim` (no zero-pad).
-3. **Cluster IVF buckets (prune)** on the rotated vector: start with **zero** centroids. First vector seeds bucket `0` (`ĉ = x`). Assign each later vector to `argmax_j ⟨x, ĉ_j⟩`, then update the exact running mean: `S_j += x`, `n_j++`, `ĉ_j = S_j/‖S_j‖`. When `n_j` exceeds `max_bucket_items`, binary-split cell `j` with a diametral median cut on its members (A = farthest from `ĉ`, B = farthest from A; partition on `⟨x,B⟩−⟨x,A⟩` at the median; grow `B` by 1), then **local Lloyd** on the two children (`split_lloyd_iters`, default 1), **neighbor steal**: reassign members of `S = {j, j_new} ∪` top-`steal_neighbors` other centroids (by `max(⟨ĉ_n,ĉ_j⟩, ⟨ĉ_n,ĉ_j_new⟩)`) among `S` only (default `steal_neighbors = 4`), and **global nearest eject**: any member of `{j, j_new}` whose max-IP centroid over all buckets is elsewhere moves there (skipped if it would empty that child). No full / end-of-stream Lloyd rebalance — ingest is continuous streaming. For query, optionally argsort the store by cell key and build a CSR snapshot of online keys; store normalized centroids on the index.
-4. Lloyd-Max scalar quantize: each rotated coord → one of `2^n` centroids on **Beta((dim−1)/2, (dim−1)/2)** on `[-1,1]`; pack `n`-bit indices (`M = dim` codes)
-5. Store per-vector IP scale `α = 1 / ⟨u, x̂⟩` (unit `u`, reconstruction `x̂`) for RaBitQ-style length renormalization
-6. Query: same prep (SRHT; keep query float in rotated space for scoring), walk cluster cells by `⟨q, ĉ_j⟩` descending until candidates cover `probe_fraction` of the index (whole lists), score with asymmetric IP × `α`, take top-k
+1. L2-normalize on `dim` (8-way chain norm, no FMA)
+2. Apply `K=2` rounds of (global ChaCha8 Fisher–Yates → ±1 signs → normalized block Walsh–Hadamard). Block size `B = dim & -dim`. Frozen ChaCha8 seed from turbovec v5.
+3. Optional TQ+: per-coord `(x + shift) * scale` fitted from sample quantiles onto outermost Lloyd-Max centroids
+4. Lloyd-Max scalar quantize: each rotated coord → one of `2^n` centroids (`n ∈ {2,3,4}`) on Beta((dim−1)/2,(dim−1)/2); boundaries are f32 midpoints of f32 centroids; pack bit-planes
+5. Store per-vector scale `α = ‖v‖ / ⟨u, x̂⟩` (RaBitQ-style); degenerate inner → 0
+6. Query: same prep; score all vectors with nibble LUT / FastScan over BLOCK=32 layout; multiply by `α`; take top-k
 
 ```
  INGEST                              QUERY
@@ -18,52 +18,34 @@ Approximate nearest-neighbor search via **TurboVec-style orthogonal rotation**, 
  L2 normalize                        L2 normalize
         │                                   │
         ▼                                   ▼
- perm+signs+block-WH (×K)            perm+signs+block-WH (×K)
+ perm+signs+block-WH (×2)            perm+signs+block-WH (×2)
         │                                   │
-        ├─ max-IP cluster assign            ├─ high-IP cells until
-        │  + running mean / split           │  coverage ≥ fraction·N
         ▼                                   ▼
- Lloyd-Max n bits / dim              score × α → top-k
- + store α = 1/⟨u,x̂⟩
-        │
- argsort by cell key + CSR (snapshot)
+ optional TQ+                        TQ+ inverse + bias
+        │                                   │
+        ▼                                   ▼
+ Lloyd-Max n bits / dim              LUT / FastScan × α → top-k
+ + store α
 ```
 
 ## Ranking
 
-Asymmetric inner product in rotated space with length renormalization:
+`score = α · Σ_i q_i · centroid[code_i]` (asymmetric IP in rotated / calibrated space).
 
-`score = α · Σ_i q_i · centroid[code_i]`
+## Layout
 
-Higher is better. Only vectors in probed cluster cells are scored.
+- Bit-plane packed codes → blocked layout
+- x86 without AVX-512 VNNI: FAISS `PERM0` hi/lo nibble interleave
+- x86 with AVX-512 VNNI+VBMI: vector-major units of 4 byte-groups × 32 vectors
+- Search dispatch: AVX2 perm0 FastScan path when available; scalar `read_code` fallback (including vector-major)
 
-Codes are stored vector-major (reordered by bucket for contiguous ranges). For byte-aligned widths (`n ∈ {1,2,4,8}` and `(dim·n) % 8 == 0`), search builds exact float query LUTs (one 256-entry table per packed **code** byte-group) and scores each probed CSR range with vector-major LUT / mask-add kernels. Odd / non-byte-aligned widths unpack scalar codes per vector.
-
-| bits | Hot path |
-|------|----------|
-| 1 | AVX-512 mask-add (`score = base + Σ_{bit b set} Δ_b` over `dim` codes), 4-way interleave of DB rows; requires `dim % 64 == 0` |
-| 2 / 4 / 8 | Byte-group float LUT lookup (gather / scalar table) over vector-major packed codes |
-| odd | Scalar unpack + MAC |
-
-With `VECTORCACHE_OPENMP`, search parallelizes across probed cells when there are enough cells/candidates **and** `omp_get_max_threads() > 1`: per-thread top-k then merge. The math is unchanged; `α` is applied after the asymmetric IP score.
-
-## Query knobs (`QueryParams`)
-
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `k` | 10 | top-k |
-| `probe_fraction` | 0.1 | walk high-IP cluster lists until candidates cover this fraction of the index |
-
-Index-time cluster knobs (`BucketParams` / CLI): `max_bucket_items` (split when online cell count exceeds; default 1024), `bucket_seed` (reserved), `split_lloyd_iters` (local Lloyd on children after median split; default 1), `steal_neighbors` (top-M neighbor steal set size; default 4, 0 disables). After steal, both children always run a global nearest eject (no knob). Bucket count `B` grows unbounded from splits. `probe_fraction` must be in `(0, 1]`; at least one non-empty list is always probed when any exist.
-
-Runtime bits-per-dim (`bits_per_dim` field name) is set at ingest (`IngestionEngine` / `--bits` / `BITS`) and stored on `VectorStore` (`bits` 1–8).
-
-## Primary sources
+## Sources
 
 | Area | Files |
 |------|-------|
-| Cluster IVF buckets | `include/vectorcache/index/rp_buckets.hpp`, `src/index/rp_buckets.cpp` |
-| Quantize | `include/vectorcache/quantize/quantize.hpp`, `src/quantize/quantize.cpp` |
-| Rotation | `include/vectorcache/transform/srht.hpp`, `src/transform/srht.cpp` |
-| Store | `include/vectorcache/ingest/store.hpp`, `src/ingest/store.cpp` |
-| Query | `src/query/engine.cpp`, `src/query/distance.cpp` |
+| Rotation | `include/vectorcache/transform/rotation.hpp`, `src/transform/rotation.cpp` |
+| Codebook | `include/vectorcache/quantize/codebook.hpp`, `src/quantize/codebook.cpp` |
+| Encode | `include/vectorcache/encode/encode.hpp`, `src/encode/encode.cpp` |
+| Pack | `include/vectorcache/pack/pack.hpp`, `src/pack/pack.cpp` |
+| Search | `include/vectorcache/search/search.hpp`, `src/search/search*.cpp` |
+| Index | `include/vectorcache/index.hpp`, `src/index.cpp` |

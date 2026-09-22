@@ -5,7 +5,6 @@
 #include <algorithm>
 
 #include "vectorcache/error.hpp"
-#include "vectorcache/ingest/engine.hpp"
 
 namespace vectorcache::datasets {
 
@@ -17,7 +16,7 @@ void check_h5(herr_t status, const std::string& context) {
   }
 }
 
-constexpr std::size_t kChunkRows = ingest::INGEST_BATCH_SIZE * 4;
+constexpr std::size_t kChunkRows = 1024;
 
 }  // namespace
 

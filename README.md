@@ -1,60 +1,47 @@
 # VectorCache
 
-Flat quantized vector retrieval engine (C++20).
-
-VectorCache implements approximate nearest neighbor search via a **TurboVec-style** orthogonal rotation (perm + signs + block Walsh–Hadamard) and **TurboQuant** Beta Lloyd-Max / block-VQ codes (`n` bits per block of `d` dims; default `d=1`), with per-vector IP length renormalization. Vectors are stored in a flat in-RAM index; queries score every code with asymmetric inner-product top-k in rotated space.
+Flat TurboQuant ANN engine (C++20) matching [turbovec](https://github.com/RyanCodrai/turbovec)'s core path: ChaCha8 block-Hadamard rotation, Lloyd-Max Beta codebook, bit-plane encode, FastScan blocked layout, and SIMD search — plus dataset fetch helpers for TurboVec/TurboQuant benchmarks.
 
 ## Requirements
 
 - C++20 compiler (GCC 10+, Clang 12+)
 - CMake 3.20+
-- For CLI tools (`fetch-datasets`):
-  - libcurl
-  - Apache Arrow C++ with Parquet
-- For GloVe HDF5 support (`-DVECTORCACHE_BUILD_GLOVE=ON`):
-  - HDF5 C library
+- OpenMP (recommended)
+- For `fetch-datasets`: libcurl; Apache Arrow/Parquet for OpenAI datasets
+- For GloVe: HDF5 C library
 
-On HPC clusters, load modules before building:
+On HPC clusters:
 
 ```bash
 source scripts/envs.sh
-# Or manually (names vary by site):
-module load gcc cmake
-module load curl arrow hdf5
 ```
 
-If you see `Unable to locate a modulefile for 'curl'` or `'arrow'`, those exact names are not on your cluster. Search for the real names:
+## HPC workflow
 
 ```bash
-module avail 2>&1 | grep -iE 'curl|arrow|hdf5'
-```
-
-Then either edit `scripts/envs.sh` or export overrides before `make login`:
-
-```bash
-export VECTORCACHE_MODULE_CURL=libcurl/8.5.0      # example
-export VECTORCACHE_MODULE_ARROW=apache-arrow/15.0.0
-export VECTORCACHE_MODULE_HDF5=hdf5/1.14.3
+# Login node (internet):
 make login
-```
+make login DATASETS=glove
 
-### HPC workflow
-
-Use the root `Makefile` to split internet-dependent work (login node) from offline build/test/benchmark (compute node). Both nodes must see the same project path.
-
-```bash
-# On login node (internet):
-make login
-
-# On compute node (no internet); defaults to DATASET=glove:
+# Compute node (offline):
 make compute
-
-# Optional overrides:
-make compute DATASET=openai-1536 BITS=2 RECALL=1
-make compute BENCH_EXTRA_ARGS="--limit 50000"
+make compute BITS=4 RECALL=1 CALIBRATE=1
+make compute DATASET=openai-1536 BITS=2 K=64
 ```
 
-`make login` runs CMake configure (FetchContent clones), builds `fetch-datasets`, and downloads datasets into `data/`. `make compute` reconfigures with `FETCHCONTENT_FULLY_DISCONNECTED=ON`, builds everything, runs `ctest`, and runs `ingest-bench` / `query-bench` (default `DATASET=glove`; override with `DATASET=` / `NPY=`). Indexes live entirely in `VectorStore` (RAM); queries score probed cluster-IVF ranges of packed TurboQuantMSE codes in memory.
+`make login` configures CMake and downloads datasets into `data/`.  
+`make compute` reconfigures offline, builds tests + `query-bench`, runs `ctest`, then runs `query-bench`.
+
+## Algorithm (turbovec-compatible)
+
+1. L2-normalize
+2. K=2 rounds of global ChaCha8 Fisher–Yates → ±1 signs → normalized block Walsh–Hadamard (`B = dim & -dim`)
+3. Optional TQ+ per-coordinate shift/scale
+4. Lloyd-Max scalar quantize (`bits` ∈ {2,3,4}) on Beta((d−1)/2,(d−1)/2)
+5. Store RaBitQ-style scale `α = ‖v‖ / ⟨u, x̂⟩`
+6. Flat SIMD search over BLOCK=32 FastScan layout (x86: FAISS `PERM0` or vector-major when AVX-512 VNNI is available)
+
+`dim` must be a positive multiple of 8, ≤ 16384.
 
 ## Build
 
@@ -72,178 +59,31 @@ ctest --output-on-failure
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `VECTORCACHE_BUILD_GLOVE` | ON | Enable GloVe HDF5 reader |
-| `VECTORCACHE_BUILD_TOOLS` | ON | Build CLI tools (requires curl + Arrow) |
-| `VECTORCACHE_BUILD_TESTS` | ON | Build GoogleTest suite |
-| `VECTORCACHE_OPENMP` | ON | Parallel ingest batches and query scan (≥~32K vectors) |
+| `VECTORCACHE_BUILD_GLOVE` | ON | GloVe HDF5 reader |
+| `VECTORCACHE_BUILD_TOOLS` | ON | CLI tools |
+| `VECTORCACHE_BUILD_TESTS` | ON | GoogleTest |
+| `VECTORCACHE_OPENMP` | ON | OpenMP encode/search |
+| `VECTORCACHE_FETCH_DATASETS` | ON | `fetch-datasets` |
+| `VECTORCACHE_FETCH_OPENAI` | ON | OpenAI parquet→npy |
 
-### SIMD
-
-The library requires AVX-512F/DQ/BW/VL/VBMI/VNNI + VPOPCNTDQ. GCC/Clang builds use `-mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx512vpopcntdq -mavx512vbmi -mavx512vnni -mfma`; MSVC uses `/arch:AVX512` (with VBMI/VNNI macros forced). There are no scalar fallbacks.
-
-Query scoring uses vector-major packed codes with exact float query LUTs (see `ALGORITHM.md`): bits=1 AVX-512 mask-add, bits=2/4/8 byte-group LUT lookup, and OpenMP over probed cells when the corpus is large enough.
-
-For maximum single-node performance on homogeneous clusters:
+## CLI: query-bench
 
 ```bash
-cmake .. -DCMAKE_CXX_FLAGS="-march=native"
+./query-bench --dataset glove --bits 4 --k 10
+./query-bench --dataset glove --bits 4 --calibrate --recall
+./query-bench --npy data/glove-train-100k.npy --limit 100000 --query-limit 1000
 ```
 
-### Rotation round count (compile-time)
+Reports median batch search latency (`ms_per_query`) and optional **Recall@1@k** / **Recall@k**.
 
-Default is **2** rounds (TurboVec-compatible). Each round is global perm → signs → block Hadamard. To override:
+## Library sketch
 
-```bash
-cmake .. -DVECTORCACHE_SRHT_ROUNDS=3
+```cpp
+#include "vectorcache/index.hpp"
+
+vectorcache::TurboQuantIndex index(/*dim=*/1536, /*bits=*/4);
+index.calibrate(sample);   // optional TQ+
+index.add(database);       // flat float[n * dim]
+index.prepare();
+auto res = index.search(queries, /*k=*/10);
 ```
-
-Allowed values: `1`, `2`, or `3`. Reconfigure and rebuild after changing; there is no runtime flag.
-
-### Bits per dim (runtime)
-
-TurboQuant uses `n` bits per rotated coordinate (`2^n` Lloyd-Max centroids) under scalar Beta((dim−1)/2,(dim−1)/2) on `[-1,1]`. Pass `--bits` on CLI tools or `BITS=` to `make compute` (`bits` 1–8).
-
-```bash
-./query-bench --dataset glove --bits 2
-make compute BITS=2 RECALL=1
-```
-
-With `RECALL=1` / `--recall`, query-bench prints **Recall@1@k** (exact NN in approx top-k; TurboVec-compatible) then set-overlap **Recall@k**. Exact cosine top-k ground truth is cached under `.cache/exact_topk/` (keyed by dataset/npy, split, index size, query split/limit, k, and seed) and reused on later runs.
-
-## CLI tools
-
-### fetch-datasets
-
-Download benchmark datasets into `data/`:
-
-```bash
-./fetch-datasets all
-./fetch-datasets glove openai-1536
-./fetch-datasets --data-dir data --force openai-3072
-```
-
-### ingest-sample
-
-Ingest vectors and optionally report variance:
-
-```bash
-./ingest-sample --npy data/.cache/glove-sample-100.npy
-./ingest-sample --dataset glove --limit 100 --variance
-./ingest-sample --dataset glove --limit 100 --bits 2 --show-index 0
-```
-
-Environment variables:
-- `VECTORCACHE_DATASET` (default: `glove`)
-- `VECTORCACHE_DATA_DIR` (default: `data`)
-
-### ingest-bench
-
-Profile ingestion stage hot paths into an in-memory `VectorStore`:
-
-```bash
-./ingest-bench --dataset glove
-./ingest-bench --dataset glove --limit 50000 --bits 2
-./ingest-bench --npy data/openai-1536.npy --limit 50000
-```
-
-### query-bench
-
-Ingest into RAM, then flat-scan asymmetric IP scores:
-
-```bash
-./query-bench --dataset glove
-./query-bench --dataset glove --k 10 --bits 2
-./query-bench --dataset glove --bits 4 --k 8 --limit 100000 --recall
-```
-
-`--recall` reports **Recall@1@k** (exact cosine NN in approx top-k; matches TurboVec charts) and set-overlap **Recall@k**. Exact top-k IDs are stored under `.cache/exact_topk/` and loaded on subsequent runs with the same ground-truth parameters (delete the file to recompute).
-
-Environment variables:
-- `VECTORCACHE_DATASET` / `VECTORCACHE_DATA_DIR`
-## Project layout
-
-```
-include/vectorcache/   Public headers
-src/                   Library implementation
-tools/                 CLI executables
-tests/                 GoogleTest suite
-data/                  Dataset storage (gitignored)
-scripts/envs.sh        HPC module setup
-```
-
-## Datasets
-
-| Dataset | Dim | Padded | Format |
-|---------|-----|--------|--------|
-| GloVe | 200 | 256 | HDF5 |
-| OpenAI-1536 | 1536 | 2048 | NPY |
-| OpenAI-3072 | 3072 | 4096 | NPY |
-
-### Link error: `__cxa_call_terminate@CXXABI_1.3.15`
-
-This means **libparquet was built with a newer GCC/libstdc++ than your linker is using** (common with conda/mamba Arrow in `env/` on clusters that default to GCC 12/13).
-
-Fix options (pick one):
-
-1. **Load GCC 14+** before building (if your cluster has it):
-   ```bash
-   module avail 2>&1 | grep -i gcc
-   module load gcc/14    # example
-   make clean && make login
-   ```
-
-2. **Use a local conda/mamba env** for Arrow and let CMake link its libstdc++ (automatic if `env/` exists and you reconfigure):
-   ```bash
-   micromamba create -p ./env -c conda-forge "arrow>=15" parquet
-   source scripts/envs.sh
-   make clean && make login
-   ```
-
-3. **Use the cluster Arrow module** built with the same GCC you compile with, instead of conda Arrow:
-   ```bash
-   export VECTORCACHE_MODULE_ARROW=apache-arrow/15.0.0   # example
-   unset CMAKE_PREFIX_PATH   # drop ./env if set
-   make clean && make login
-   ```
-
-4. **Skip OpenAI datasets** if you only need GloVe:
-   ```bash
-   make login DATASETS=glove
-   ```
-
-## Missing dependencies on HPC
-
-Apache Arrow is only required when downloading OpenAI datasets (`openai-1536`, `openai-3072`, or `DATASETS=all`). GloVe-only login does not need Arrow:
-
-```bash
-make login DATASETS=glove
-```
-
-For all datasets, Arrow must be installed separately and pointed at via CMake (not bundled in this repo):
-
-```bash
-export CMAKE_PREFIX_PATH=/path/to/arrow/prefix   # contains lib/cmake/Arrow/ArrowConfig.cmake
-make login
-```
-
-Or set `Arrow_DIR` directly:
-
-```bash
-make login CMAKE_OPTS="-DArrow_DIR=/path/to/lib/cmake/Arrow"
-```
-
-If Arrow or HDF5 are unavailable on your cluster:
-
-1. Request them from your cluster admin, or
-2. Copy pre-downloaded `data/` from a machine that already has the datasets, or
-3. Use GloVe only: `make login DATASETS=glove` / `make compute`
-
-To build without dataset fetching (library + tests only):
-
-```bash
-cmake .. -DVECTORCACHE_BUILD_TOOLS=OFF
-```
-
-## License
-
-MIT OR Apache-2.0
