@@ -23,10 +23,9 @@ struct IngestReport {
 };
 
 struct BucketParams {
-  std::size_t num_buckets = 256;
-  /// Rebalance every N vectors during ingest; 0 => only at finalize.
-  std::size_t rebalance_every = 10000;
-  std::uint64_t bucket_seed = 0;  // 0 => derive from rotation seed when available
+  /// Split a cell when its online count exceeds this (must be >= 1).
+  std::size_t max_bucket_items = 1024;
+  std::uint64_t bucket_seed = 0;  // reserved; first centroid is data-driven
 };
 
 class IngestionEngine {
@@ -58,12 +57,12 @@ class IngestionEngine {
   IngestionEngine(VectorStore store, std::optional<transform::SrhtRotation> rotation,
                   bool quantize_only, std::size_t input_dim, std::size_t srht_dim,
                   std::size_t l0_words_per_vec, quantize::LloydMaxCodebook codebook,
-                  BucketParams bucket_params, std::uint64_t resolved_bucket_seed);
+                  BucketParams bucket_params);
 
   void ensure_batch_capacity(std::size_t batch_cap);
   std::size_t read_batch(datasets::DatasetReader& reader);
   void process_batch(std::size_t batch_len);
-  void maybe_rebalance(std::vector<std::uint64_t>& cell_keys, bool force);
+  void maybe_split(std::vector<std::uint64_t>& cell_keys);
   void finalize_bucket_index(std::vector<std::uint64_t>& cell_keys);
 
   VectorStore store_;
@@ -74,9 +73,8 @@ class IngestionEngine {
   std::size_t l0_words_per_vec_;
   quantize::LloydMaxCodebook codebook_;
   BucketParams bucket_params_;
-  std::uint64_t bucket_seed_;
   index::ClusterCentroids centroids_;
-  /// Row-major post-SRHT floats retained until finalize (N * srht_dim).
+  /// Row-major post-SRHT floats retained for split membership (N * srht_dim).
   AlignedVector<float> rotated_all_;
   std::vector<VectorWork> batch_work_;
 };

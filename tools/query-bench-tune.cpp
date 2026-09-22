@@ -205,8 +205,7 @@ bool probe_fraction_ok(float f) {
 }
 
 struct Trial {
-  std::size_t B = 0;
-  std::size_t rebalance_every = 0;
+  std::size_t max_bucket_items = 0;
   float probe_fraction = 0.0f;
   double avg_topk_mean = 0.0;
   double avg_vectors_scored = 0.0;
@@ -242,11 +241,8 @@ std::vector<Trial> pareto_front(std::vector<Trial> trials) {
     if (a.avg_vectors_scored != b.avg_vectors_scored) {
       return a.avg_vectors_scored < b.avg_vectors_scored;
     }
-    if (a.B != b.B) {
-      return a.B < b.B;
-    }
-    if (a.rebalance_every != b.rebalance_every) {
-      return a.rebalance_every < b.rebalance_every;
+    if (a.max_bucket_items != b.max_bucket_items) {
+      return a.max_bucket_items < b.max_bucket_items;
     }
     return a.probe_fraction < b.probe_fraction;
   });
@@ -255,7 +251,7 @@ std::vector<Trial> pareto_front(std::vector<Trial> trials) {
 
 Trial run_trial(vectorcache::query::QueryEngine& engine,
                 const std::vector<vectorcache::query::PreparedQuery>& prepared, std::size_t k,
-                std::size_t B, std::size_t rebalance_every, float probe_fraction) {
+                std::size_t max_bucket_items, float probe_fraction) {
   vectorcache::query::QueryParams params;
   params.k = k;
   params.probe_fraction = probe_fraction;
@@ -279,8 +275,7 @@ Trial run_trial(vectorcache::query::QueryEngine& engine,
   }
 
   Trial t;
-  t.B = B;
-  t.rebalance_every = rebalance_every;
+  t.max_bucket_items = max_bucket_items;
   t.probe_fraction = probe_fraction;
   t.avg_topk_mean =
       scored_queries > 0 ? (sum_topk_mean / static_cast<double>(scored_queries)) : 0.0;
@@ -306,8 +301,7 @@ int main(int argc, char** argv) {
   std::size_t k = 10;
   std::size_t bits = 1;
   std::uint64_t bucket_seed = 0;
-  std::string num_buckets_list = "64,256,1024";
-  std::string rebalance_every_list = "0,10000";
+  std::string max_bucket_items_list = "256,1024,4096";
   std::string probe_fractions = "0.05,0.1,0.2";
 
   app.add_option("--npy", npy_path, "Pre-extracted float32 NPY matrix");
@@ -321,10 +315,9 @@ int main(int argc, char** argv) {
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
   app.add_option("--bits", bits, "TurboQuantMSE bits per dim (1-8)");
-  app.add_option("--bucket-seed", bucket_seed, "Cluster centroid seed (0 = derive from --seed)");
-  app.add_option("--num-buckets-list", num_buckets_list, "Comma-separated B values");
-  app.add_option("--rebalance-every-list", rebalance_every_list,
-                 "Comma-separated rebalance periods (0 = finalize only)");
+  app.add_option("--bucket-seed", bucket_seed, "Reserved cluster seed (first centroid is data-driven)");
+  app.add_option("--max-bucket-items-list", max_bucket_items_list,
+                 "Comma-separated max bucket item counts");
   app.add_option("--probe-fractions", probe_fractions,
                  "Comma-separated index coverage fractions (0,1]");
 
@@ -336,13 +329,12 @@ int main(int argc, char** argv) {
     }
     vectorcache::quantize::validate_bits_per_dim(bits);
 
-    const auto B_list = parse_size_list(num_buckets_list, "num-buckets");
-    const auto rebal_list = parse_size_list(rebalance_every_list, "rebalance-every");
+    const auto max_list = parse_size_list(max_bucket_items_list, "max-bucket-items");
     const auto F_list = parse_float_list(probe_fractions, "probe-fractions");
 
-    for (const std::size_t B : B_list) {
-      if (B == 0 || B > vectorcache::index::kMaxBuckets) {
-        throw vectorcache::Error("num-buckets must be in 1..kMaxBuckets");
+    for (const std::size_t m : max_list) {
+      if (m == 0) {
+        throw vectorcache::Error("max-bucket-items must be >= 1");
       }
     }
 
@@ -360,7 +352,7 @@ int main(int argc, char** argv) {
       throw vectorcache::Error("empty index");
     }
 
-    const std::size_t grid_total = B_list.size() * rebal_list.size() * F_list.size();
+    const std::size_t grid_total = max_list.size() * F_list.size();
 
     std::cout << "Cluster IVF tune: index=" << source_label << " dim=" << meta.dim
               << " index_n=" << actual_index << " query_n=" << query_limit
@@ -390,38 +382,35 @@ int main(int argc, char** argv) {
       }
     }
 
-    for (const std::size_t B : B_list) {
-      for (const std::size_t rebal : rebal_list) {
-        if (valid_F.empty()) {
-          continue;
-        }
+    for (const std::size_t max_items : max_list) {
+      if (valid_F.empty()) {
+        continue;
+      }
 
-        MatrixReader matrix_reader(std::span<const float>(raw.data(), raw.size()), meta.dim,
-                                   actual_index);
-        vectorcache::ingest::BucketParams buckets;
-        buckets.num_buckets = B;
-        buckets.rebalance_every = rebal;
-        buckets.bucket_seed = bucket_seed;
-        auto ingest_engine = vectorcache::ingest::IngestionEngine::with_rotation(
-            meta.dim, seed, bits, buckets);
-        const auto report = ingest_engine.ingest(matrix_reader, true);
-        if (report.vectors_ingested != actual_index) {
-          throw vectorcache::Error("index ingest count mismatch");
-        }
+      MatrixReader matrix_reader(std::span<const float>(raw.data(), raw.size()), meta.dim,
+                                 actual_index);
+      vectorcache::ingest::BucketParams buckets;
+      buckets.max_bucket_items = max_items;
+      buckets.bucket_seed = bucket_seed;
+      auto ingest_engine = vectorcache::ingest::IngestionEngine::with_rotation(
+          meta.dim, seed, bits, buckets);
+      const auto report = ingest_engine.ingest(matrix_reader, true);
+      if (report.vectors_ingested != actual_index) {
+        throw vectorcache::Error("index ingest count mismatch");
+      }
 
-        const auto& store = ingest_engine.store();
-        auto query_engine = vectorcache::query::QueryEngine::with_rotation(store, meta.dim, seed);
+      const auto& store = ingest_engine.store();
+      auto query_engine = vectorcache::query::QueryEngine::with_rotation(store, meta.dim, seed);
 
-        std::vector<vectorcache::query::PreparedQuery> prepared;
-        prepared.reserve(queries.size());
-        for (const auto& q : queries) {
-          prepared.push_back(query_engine.prepare(q));
-        }
+      std::vector<vectorcache::query::PreparedQuery> prepared;
+      prepared.reserve(queries.size());
+      for (const auto& q : queries) {
+        prepared.push_back(query_engine.prepare(q));
+      }
 
-        for (const float f : valid_F) {
-          trials.push_back(run_trial(query_engine, prepared, k, B, rebal, f));
-          ++evaluated;
-        }
+      for (const float f : valid_F) {
+        trials.push_back(run_trial(query_engine, prepared, k, max_items, f));
+        ++evaluated;
       }
     }
 
@@ -434,7 +423,7 @@ int main(int argc, char** argv) {
     } else {
       for (const auto& t : front) {
         std::cout << std::fixed << std::setprecision(2);
-        std::cout << "  B=" << t.B << " rebal=" << t.rebalance_every
+        std::cout << "  max_bucket_items=" << t.max_bucket_items
                   << " probe_fraction=" << t.probe_fraction;
         std::cout << std::setprecision(4);
         std::cout << "  topk_mean=" << t.avg_topk_mean;

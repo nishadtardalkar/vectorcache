@@ -16,12 +16,10 @@ SPLIT         ?=
 LIMIT         ?= 100000
 SEED          ?=
 BITS          ?= 1
-NUM_BUCKETS   ?= 256
-REBALANCE_EVERY ?= 10000
+MAX_BUCKET_ITEMS ?= 1024
 PROBE_FRACTION  ?= 0.1
 BUCKET_SEED   ?=
-NUM_BUCKETS_LIST ?=
-REBALANCE_EVERY_LIST ?=
+MAX_BUCKET_ITEMS_LIST ?=
 PROBE_FRACTIONS   ?=
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
@@ -74,8 +72,7 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_SPLIT,query-split) \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
-	$(call opt_arg,NUM_BUCKETS,num-buckets) \
-	$(call opt_arg,REBALANCE_EVERY,rebalance-every) \
+	$(call opt_arg,MAX_BUCKET_ITEMS,max-bucket-items) \
 	$(call opt_arg,PROBE_FRACTION,probe-fraction) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
 	$(call flag_arg,CALIBRATE,calibrate) \
@@ -87,8 +84,7 @@ QUERY_TUNE_ARGS = \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
 	$(call opt_arg,BUCKET_SEED,bucket-seed) \
-	$(call opt_arg,NUM_BUCKETS_LIST,num-buckets-list) \
-	$(call opt_arg,REBALANCE_EVERY_LIST,rebalance-every-list) \
+	$(call opt_arg,MAX_BUCKET_ITEMS_LIST,max-bucket-items-list) \
 	$(call opt_arg,PROBE_FRACTIONS,probe-fractions)
 
 .PHONY: help login compute tune clean
@@ -116,12 +112,10 @@ help:
 	@echo "  LIMIT           --limit"
 	@echo "  SEED            --seed"
 	@echo "  BITS            --bits (default $(BITS); TurboQuantMSE bits/dim, 1-8)"
-	@echo "  NUM_BUCKETS     --num-buckets (default $(NUM_BUCKETS); cluster IVF B; query-bench)"
-	@echo "  REBALANCE_EVERY --rebalance-every (default $(REBALANCE_EVERY); 0=finalize only; query-bench)"
+	@echo "  MAX_BUCKET_ITEMS --max-bucket-items (default $(MAX_BUCKET_ITEMS); split when cell count exceeds; query-bench)"
 	@echo "  PROBE_FRACTION  --probe-fraction (default $(PROBE_FRACTION); index coverage; query-bench)"
-	@echo "  BUCKET_SEED     --bucket-seed (cluster centroid seed; query-bench / query-bench-tune)"
-	@echo "  NUM_BUCKETS_LIST --num-buckets-list (comma B values; query-bench-tune)"
-	@echo "  REBALANCE_EVERY_LIST --rebalance-every-list (comma periods; query-bench-tune)"
+	@echo "  BUCKET_SEED     --bucket-seed (reserved; query-bench / query-bench-tune)"
+	@echo "  MAX_BUCKET_ITEMS_LIST --max-bucket-items-list (comma values; query-bench-tune)"
 	@echo "  PROBE_FRACTIONS --probe-fractions (comma coverage fractions; query-bench-tune)"
 	@echo "  QUERY_SPLIT     --query-split (query-bench / query-bench-tune)"
 	@echo "  QUERY_LIMIT     --query-limit (query-bench / query-bench-tune)"
@@ -136,8 +130,8 @@ help:
 	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make compute"
 	@echo "Example: make compute BITS=2 RECALL=1"
-	@echo "Example: make compute NUM_PAIR_DIRS=8 BIN_WIDTH=0.1 PROBE_FRACTION=0.05"
-	@echo "Example: make tune NUM_PAIR_DIRS_LIST=4,8,16 BIN_WIDTHS=0.1,0.2 PROBE_FRACTIONS=0.05,0.1,0.2"
+	@echo "Example: make compute MAX_BUCKET_ITEMS=512 PROBE_FRACTION=0.05"
+	@echo "Example: make tune MAX_BUCKET_ITEMS_LIST=256,1024,4096 PROBE_FRACTIONS=0.05,0.1,0.2"
 
 login: $(LOGIN_READY)
 

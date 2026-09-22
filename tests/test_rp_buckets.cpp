@@ -13,8 +13,6 @@
 #include "vectorcache/ingest/engine.hpp"
 #include "vectorcache/ingest/store.hpp"
 #include "vectorcache/query/engine.hpp"
-#include "vectorcache/transform/normalize.hpp"
-#include "vectorcache/transform/srht.hpp"
 
 using namespace vectorcache;
 
@@ -58,24 +56,51 @@ std::vector<float> unit_axis(std::size_t dim, std::size_t axis) {
   return v;
 }
 
+/// Grow centroids to at least `min_buckets` by assigning distinct axes and splitting at max=1.
+void grow_buckets(index::ClusterCentroids& cc, std::size_t min_buckets,
+                  std::vector<float>& vectors, std::vector<std::uint64_t>& keys) {
+  const std::size_t dim = cc.dim();
+  std::size_t axis = 0;
+  while (cc.num_buckets() < min_buckets) {
+    auto v = unit_axis(dim, axis++);
+    keys.push_back(cc.assign_and_update(v));
+    vectors.insert(vectors.end(), v.begin(), v.end());
+    bool split = true;
+    while (split) {
+      split = false;
+      for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
+        if (cc.count(j) > 1) {
+          cc.split_bucket(j, vectors, keys);
+          split = true;
+          break;
+        }
+      }
+    }
+    if (axis > min_buckets * 8) {
+      break;
+    }
+  }
+}
+
 }  // namespace
 
-TEST(ClusterBucketsTest, InitDeterministic) {
-  index::ClusterCentroids a(8, 16, 42);
-  index::ClusterCentroids b(8, 16, 42);
-  index::ClusterCentroids c(8, 16, 43);
-  EXPECT_EQ(a.num_buckets(), 8u);
-  EXPECT_EQ(a.dim(), 16u);
-  for (std::size_t j = 0; j < 8; ++j) {
-    EXPECT_FLOAT_EQ(dot(a.centroid(j), b.centroid(j)), 1.0f);
-    EXPECT_NEAR(std::sqrt(dot(a.centroid(j), a.centroid(j))), 1.0f, 1e-5f);
-  }
-  EXPECT_LT(dot(a.centroid(0), c.centroid(0)), 0.999f);
+TEST(ClusterBucketsTest, StartsEmptyThenSeedsFirst) {
+  const std::size_t dim = 16;
+  index::ClusterCentroids cc(dim);
+  EXPECT_TRUE(cc.empty());
+  EXPECT_EQ(cc.num_buckets(), 0u);
+
+  auto v = unit_axis(dim, 0);
+  const auto key = cc.assign_and_update(v);
+  EXPECT_EQ(key, 0u);
+  EXPECT_EQ(cc.num_buckets(), 1u);
+  EXPECT_EQ(cc.count(0), 1u);
+  EXPECT_NEAR(dot(cc.centroid(0), v), 1.0f, 1e-5f);
 }
 
 TEST(ClusterBucketsTest, AssignAndUpdateMatchesBatchMean) {
   const std::size_t dim = 8;
-  index::ClusterCentroids cc(2, dim, 7);
+  index::ClusterCentroids cc(dim);
 
   std::vector<float> x0 = unit_axis(dim, 0);
   std::vector<float> x1 = unit_axis(dim, 0);
@@ -104,82 +129,70 @@ TEST(ClusterBucketsTest, AssignAndUpdateMatchesBatchMean) {
   EXPECT_NEAR(dot(cc.centroid(j), mean), 1.0f, 1e-5f);
 }
 
-TEST(ClusterBucketsTest, RebalanceFixesStickyAssignment) {
+TEST(ClusterBucketsTest, SplitGrowsAndCapsCount) {
   const std::size_t dim = 4;
-  const std::size_t B = 2;
-  index::ClusterCentroids cc(B, dim, 99);
-
-  // Force both vectors into whatever buckets online assign gives, then shift
-  // membership via rebalance with vectors clearly on opposite axes.
+  index::ClusterCentroids cc(dim);
   std::vector<float> vectors;
-  auto e0 = unit_axis(dim, 0);
-  auto e1 = unit_axis(dim, 1);
-  vectors.insert(vectors.end(), e0.begin(), e0.end());
-  vectors.insert(vectors.end(), e1.begin(), e1.end());
+  std::vector<std::uint64_t> keys;
 
-  std::vector<std::uint64_t> keys(2, 0);
-  // Pollute: assign both to same online path then rebalance.
-  (void)cc.assign_and_update(e0);
-  (void)cc.assign_and_update(e0);
-  cc.rebalance(vectors, keys);
-
-  EXPECT_NE(keys[0], keys[1]);
-  EXPECT_EQ(keys[0], cc.nearest(e0));
-  EXPECT_EQ(keys[1], cc.nearest(e1));
-  EXPECT_EQ(cc.count(static_cast<std::size_t>(keys[0])), 1u);
-  EXPECT_EQ(cc.count(static_cast<std::size_t>(keys[1])), 1u);
-}
-
-TEST(ClusterBucketsTest, RebalanceKeepsUnitCentroids) {
-  const std::size_t dim = 4;
-  const std::size_t B = 2;
-  index::ClusterCentroids cc(B, dim, 5);
-
-  std::vector<float> vectors;
-  for (std::size_t j = 0; j < B; ++j) {
-    const auto c = cc.centroid(j);
-    vectors.insert(vectors.end(), c.begin(), c.end());
+  // Three near-orthogonal vectors → after overflows, expect growth.
+  for (std::size_t a = 0; a < 3; ++a) {
+    auto v = unit_axis(dim, a);
+    keys.push_back(cc.assign_and_update(v));
+    vectors.insert(vectors.end(), v.begin(), v.end());
+    if (cc.count(static_cast<std::size_t>(keys.back())) > 1) {
+      cc.split_bucket(static_cast<std::size_t>(keys.back()), vectors, keys);
+    }
   }
-  std::vector<std::uint64_t> keys(B, 0);
+  // Force splits until every cell has count <= 1.
+  bool split = true;
+  while (split) {
+    split = false;
+    for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
+      if (cc.count(j) > 1) {
+        cc.split_bucket(j, vectors, keys);
+        split = true;
+        break;
+      }
+    }
+  }
 
-  cc.rebalance(vectors, keys);
-  EXPECT_NE(keys[0], keys[1]);
-  for (std::size_t j = 0; j < B; ++j) {
+  EXPECT_GE(cc.num_buckets(), 2u);
+  for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
+    EXPECT_LE(cc.count(j), 1u);
     EXPECT_NEAR(std::sqrt(dot(cc.centroid(j), cc.centroid(j))), 1.0f, 1e-5f);
-    EXPECT_EQ(cc.count(j), 1u);
   }
-}
-
-TEST(ClusterBucketsTest, RebalanceThenAssignKeepsAlignment) {
-  const std::size_t dim = 4;
-  index::ClusterCentroids cc(2, dim, 11);
-
-  std::vector<float> vectors;
-  for (std::size_t j = 0; j < 2; ++j) {
-    const auto c = cc.centroid(j);
-    vectors.insert(vectors.end(), c.begin(), c.end());
-  }
-  std::vector<std::uint64_t> keys(2, 0);
-  cc.rebalance(vectors, keys);
-
-  const std::size_t j = static_cast<std::size_t>(keys[0]);
-  std::vector<float> c(cc.centroid(j).begin(), cc.centroid(j).end());
-  (void)cc.assign_and_update(c);
-  EXPECT_NEAR(dot(cc.centroid(j), c), 1.0f, 1e-5f);
+  EXPECT_EQ(keys.size(), 3u);
 }
 
 TEST(ClusterBucketsTest, ProbeCoverageStopsAtFraction) {
   const std::size_t dim = 4;
-  index::ClusterCentroids cc(4, dim, 11);
-  // Uneven membership: 4 on axis0, 2 on axis1, 1 on axis2 (N=7).
+  index::ClusterCentroids cc(dim);
+  std::vector<float> vectors;
   std::vector<std::uint64_t> keys;
-  for (std::size_t i = 0; i < 4; ++i) {
-    keys.push_back(cc.assign_and_update(unit_axis(dim, 0)));
-  }
-  for (std::size_t i = 0; i < 2; ++i) {
-    keys.push_back(cc.assign_and_update(unit_axis(dim, 1)));
-  }
-  keys.push_back(cc.assign_and_update(unit_axis(dim, 2)));
+
+  // Uneven membership: 4 on axis0, 2 on axis1, 1 on axis2 (N=7), with splits at max=2.
+  auto ingest_axis = [&](std::size_t axis, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+      auto v = unit_axis(dim, axis);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+      bool split = true;
+      while (split) {
+        split = false;
+        for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
+          if (cc.count(j) > 2) {
+            cc.split_bucket(j, vectors, keys);
+            split = true;
+            break;
+          }
+        }
+      }
+    }
+  };
+  ingest_axis(0, 4);
+  ingest_axis(1, 2);
+  ingest_axis(2, 1);
 
   std::vector<std::uint64_t> sorted = keys;
   std::sort(sorted.begin(), sorted.end());
@@ -187,25 +200,19 @@ TEST(ClusterBucketsTest, ProbeCoverageStopsAtFraction) {
   ASSERT_EQ(idx.size(), 7u);
 
   auto q = unit_axis(dim, 0);
-  // 0.5 * 7 → target 4; best list alone should cover it.
   std::size_t candidates = 0;
   const auto half = idx.probe(q, 0.5f, &candidates);
   EXPECT_FALSE(half.empty());
   EXPECT_GE(candidates, 4u);
-  EXPECT_EQ(candidates, half.front().length);  // first bucket alone meets target
-  EXPECT_EQ(half.size(), 1u);
 
-  // Tiny fraction still probes at least one non-empty cell.
   candidates = 0;
   const auto tiny = idx.probe(q, 1e-6f, &candidates);
   EXPECT_EQ(tiny.size(), 1u);
   EXPECT_GE(candidates, 1u);
 
-  // Full coverage walks all non-empty lists.
   candidates = 0;
   const auto full = idx.probe(q, 1.0f, &candidates);
   EXPECT_EQ(candidates, 7u);
-  EXPECT_EQ(full.size(), 3u);
 
   EXPECT_THROW(index::validate_probe_fraction(0.0f), Error);
   EXPECT_THROW(index::validate_probe_fraction(1.1f), Error);
@@ -213,9 +220,14 @@ TEST(ClusterBucketsTest, ProbeCoverageStopsAtFraction) {
 }
 
 TEST(ClusterBucketsTest, CsrRangesContiguous) {
-  index::ClusterCentroids cc(3, 4, 1);
+  const std::size_t dim = 4;
+  index::ClusterCentroids cc(dim);
+  std::vector<float> vectors;
+  std::vector<std::uint64_t> grow_keys;
+  grow_buckets(cc, 3, vectors, grow_keys);
+  ASSERT_GE(cc.num_buckets(), 3u);
+
   std::vector<std::uint64_t> keys = {0, 0, 1, 2, 2};
-  // Need matching centroid dim; build does not require counts.
   auto idx = index::BucketIndex::build(keys, std::move(cc));
   EXPECT_EQ(idx.num_cells(), 3u);
   EXPECT_EQ(idx.size(), 5u);
@@ -235,7 +247,12 @@ TEST(ClusterBucketsTest, FinalizeBuildsBuckets) {
   for (std::size_t i = 0; i < 5; ++i) {
     store.push(i, code, 1.0f);
   }
-  index::ClusterCentroids cc(4, dim, 99);
+  index::ClusterCentroids cc(dim);
+  std::vector<float> vectors;
+  std::vector<std::uint64_t> grow_keys;
+  grow_buckets(cc, 3, vectors, grow_keys);
+  ASSERT_GE(cc.num_buckets(), 3u);
+
   std::vector<std::uint64_t> keys = {2, 0, 2, 1, 0};
   store.finalize_buckets(keys, std::move(cc));
   EXPECT_TRUE(store.has_buckets());
@@ -257,11 +274,10 @@ TEST(ClusterBucketsTest, SelfHitWithProbeFraction) {
 
   MockReader reader(vectors, dim);
   ingest::BucketParams bp;
-  bp.num_buckets = 8;
-  bp.rebalance_every = 0;
-  bp.bucket_seed = 7;
+  bp.max_bucket_items = 4;
   auto engine = ingest::IngestionEngine::with_rotation(dim, 42, 1, bp);
   ASSERT_EQ(engine.ingest(reader).vectors_ingested, n);
+  EXPECT_GE(engine.store().buckets().num_buckets(), 2u);
 
   auto qe = query::QueryEngine::with_rotation(engine.store(), dim, 42);
   query::QueryParams params;
@@ -272,10 +288,9 @@ TEST(ClusterBucketsTest, SelfHitWithProbeFraction) {
   EXPECT_EQ(hits.front().id, 0u);
 }
 
-TEST(ClusterBucketsTest, EmptyListsSkippedInProbe) {
+TEST(ClusterBucketsTest, ProbeSingleBucket) {
   const std::size_t dim = 8;
-  index::ClusterCentroids cc(8, dim, 3);
-  // Only populate one bucket.
+  index::ClusterCentroids cc(dim);
   auto v = unit_axis(dim, 0);
   const auto key = cc.assign_and_update(v);
   std::vector<std::uint64_t> keys = {key};

@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <numeric>
-#include <random>
 #include <utility>
 #include <vector>
 
@@ -13,31 +11,7 @@
 namespace vectorcache::index {
 namespace {
 
-void fill_random_unit_rows(AlignedVector<float>& out, std::size_t rows, std::size_t dim,
-                           std::uint64_t seed) {
-  out.assign(rows * dim, 0.0f);
-  std::mt19937_64 rng(seed);
-  std::normal_distribution<float> gauss(0.0f, 1.0f);
-  for (std::size_t j = 0; j < rows; ++j) {
-    float* row = out.data() + j * dim;
-    double energy = 0.0;
-    for (std::size_t d = 0; d < dim; ++d) {
-      row[d] = gauss(rng);
-      energy += static_cast<double>(row[d]) * static_cast<double>(row[d]);
-    }
-    if (energy <= 0.0) {
-      row[0] = 1.0f;
-      for (std::size_t d = 1; d < dim; ++d) {
-        row[d] = 0.0f;
-      }
-    } else {
-      const float inv = static_cast<float>(1.0 / std::sqrt(energy));
-      for (std::size_t d = 0; d < dim; ++d) {
-        row[d] *= inv;
-      }
-    }
-  }
-}
+constexpr int kSplitIters = 5;
 
 float dot(std::span<const float> a, std::span<const float> b) {
   double sum = 0.0;
@@ -45,6 +19,24 @@ float dot(std::span<const float> a, std::span<const float> b) {
     sum += static_cast<double>(a[i]) * static_cast<double>(b[i]);
   }
   return static_cast<float>(sum);
+}
+
+void normalize_row(float* row, std::size_t dim) {
+  double energy = 0.0;
+  for (std::size_t d = 0; d < dim; ++d) {
+    energy += static_cast<double>(row[d]) * static_cast<double>(row[d]);
+  }
+  if (energy <= 0.0) {
+    row[0] = 1.0f;
+    for (std::size_t d = 1; d < dim; ++d) {
+      row[d] = 0.0f;
+    }
+    return;
+  }
+  const float inv = static_cast<float>(1.0 / std::sqrt(energy));
+  for (std::size_t d = 0; d < dim; ++d) {
+    row[d] *= inv;
+  }
 }
 
 }  // namespace
@@ -55,17 +47,10 @@ void validate_probe_fraction(float probe_fraction) {
   }
 }
 
-ClusterCentroids::ClusterCentroids(std::size_t num_buckets, std::size_t dim, std::uint64_t seed)
-    : num_buckets_(num_buckets), dim_(dim) {
-  if (num_buckets_ == 0 || num_buckets_ > kMaxBuckets) {
-    throw Error("ClusterCentroids: num_buckets must be in 1..kMaxBuckets");
-  }
+ClusterCentroids::ClusterCentroids(std::size_t dim) : dim_(dim) {
   if (dim_ == 0) {
     throw Error("ClusterCentroids: dim must be > 0");
   }
-  fill_random_unit_rows(centroids_, num_buckets_, dim_, seed);
-  sums_.assign(num_buckets_ * dim_, 0.0f);
-  counts_.assign(num_buckets_, 0);
 }
 
 std::span<const float> ClusterCentroids::centroid(std::size_t j) const {
@@ -103,6 +88,19 @@ void ClusterCentroids::normalize_centroid(std::size_t j) {
   }
 }
 
+void ClusterCentroids::grow_one_bucket() {
+  const std::size_t old = num_buckets_;
+  ++num_buckets_;
+  centroids_.resize(num_buckets_ * dim_, 0.0f);
+  sums_.resize(num_buckets_ * dim_, 0.0f);
+  counts_.resize(num_buckets_, 0);
+  if (old == 0) {
+    return;
+  }
+  // New row already zero-filled; caller fills sums/centroid.
+  (void)old;
+}
+
 std::uint64_t ClusterCentroids::nearest(std::span<const float> x) const {
   if (empty()) {
     throw Error("ClusterCentroids::nearest: empty");
@@ -123,6 +121,26 @@ std::uint64_t ClusterCentroids::nearest(std::span<const float> x) const {
 }
 
 std::uint64_t ClusterCentroids::assign_and_update(std::span<const float> x) {
+  if (dim_ == 0) {
+    throw Error("ClusterCentroids::assign_and_update: uninitialized");
+  }
+  if (x.size() != dim_) {
+    throw Error("ClusterCentroids::assign_and_update: dim mismatch");
+  }
+
+  if (empty()) {
+    grow_one_bucket();
+    float* s = sums_.data();
+    float* c = centroids_.data();
+    for (std::size_t d = 0; d < dim_; ++d) {
+      s[d] = x[d];
+      c[d] = x[d];
+    }
+    normalize_row(c, dim_);
+    counts_[0] = 1;
+    return 0;
+  }
+
   const std::uint64_t key = nearest(x);
   const std::size_t j = static_cast<std::size_t>(key);
   float* s = sums_.data() + j * dim_;
@@ -134,39 +152,131 @@ std::uint64_t ClusterCentroids::assign_and_update(std::span<const float> x) {
   return key;
 }
 
-void ClusterCentroids::rebalance(std::span<const float> vectors, std::span<std::uint64_t> cell_keys) {
-  if (empty()) {
-    throw Error("ClusterCentroids::rebalance: empty");
+void ClusterCentroids::split_bucket(std::size_t j, std::span<const float> vectors,
+                                    std::span<std::uint64_t> cell_keys) {
+  if (j >= num_buckets_) {
+    throw Error("ClusterCentroids::split_bucket: index out of range");
   }
   if (cell_keys.empty()) {
     return;
   }
   if (vectors.size() != cell_keys.size() * dim_) {
-    throw Error("ClusterCentroids::rebalance: vectors size mismatch");
+    throw Error("ClusterCentroids::split_bucket: vectors size mismatch");
   }
 
-  // Clear sums/counts then rebuild from nearest ĉ.
-  sums_.assign(num_buckets_ * dim_, 0.0f);
-  counts_.assign(num_buckets_, 0);
-
+  std::vector<std::size_t> members;
+  members.reserve(counts_[j]);
   for (std::size_t i = 0; i < cell_keys.size(); ++i) {
-    const std::span<const float> x(vectors.data() + i * dim_, dim_);
-    const std::uint64_t key = nearest(x);
-    const std::size_t j = static_cast<std::size_t>(key);
-    cell_keys[i] = key;
-    float* s = sums_.data() + j * dim_;
-    for (std::size_t d = 0; d < dim_; ++d) {
-      s[d] += x[d];
+    if (cell_keys[i] == static_cast<std::uint64_t>(j)) {
+      members.push_back(i);
     }
-    ++counts_[j];
+  }
+  if (members.size() < 2) {
+    return;
   }
 
-  for (std::size_t j = 0; j < num_buckets_; ++j) {
-    if (counts_[j] > 0) {
-      normalize_centroid(j);
+  // Init: c0 = current ĉ, c1 = farthest member from ĉ (min IP).
+  std::vector<float> c0(centroids_.data() + j * dim_, centroids_.data() + (j + 1) * dim_);
+  std::vector<float> c1(dim_, 0.0f);
+  {
+    float worst_ip = 2.0f;
+    std::size_t farthest = members[0];
+    for (std::size_t mi : members) {
+      const std::span<const float> x(vectors.data() + mi * dim_, dim_);
+      const float ip = dot(c0, x);
+      if (ip < worst_ip) {
+        worst_ip = ip;
+        farthest = mi;
+      }
     }
-    // Empty buckets: keep prior ĉ (already in centroids_).
+    const float* src = vectors.data() + farthest * dim_;
+    std::copy(src, src + dim_, c1.begin());
+    normalize_row(c1.data(), dim_);
   }
+
+  std::vector<std::uint8_t> side(members.size(), 0);
+  for (int iter = 0; iter < kSplitIters; ++iter) {
+    for (std::size_t m = 0; m < members.size(); ++m) {
+      const std::span<const float> x(vectors.data() + members[m] * dim_, dim_);
+      const float ip0 = dot(c0, x);
+      const float ip1 = dot(c1, x);
+      side[m] = (ip1 > ip0) ? 1 : 0;
+    }
+
+    std::fill(c0.begin(), c0.end(), 0.0f);
+    std::fill(c1.begin(), c1.end(), 0.0f);
+    std::size_t n0 = 0;
+    std::size_t n1 = 0;
+    for (std::size_t m = 0; m < members.size(); ++m) {
+      const float* x = vectors.data() + members[m] * dim_;
+      float* dst = (side[m] == 0) ? c0.data() : c1.data();
+      for (std::size_t d = 0; d < dim_; ++d) {
+        dst[d] += x[d];
+      }
+      if (side[m] == 0) {
+        ++n0;
+      } else {
+        ++n1;
+      }
+    }
+    if (n0 == 0 || n1 == 0) {
+      // Degenerate: force a 50/50 cut by index order.
+      std::fill(c0.begin(), c0.end(), 0.0f);
+      std::fill(c1.begin(), c1.end(), 0.0f);
+      n0 = 0;
+      n1 = 0;
+      for (std::size_t m = 0; m < members.size(); ++m) {
+        side[m] = (m * 2 < members.size()) ? 0 : 1;
+        const float* x = vectors.data() + members[m] * dim_;
+        float* dst = (side[m] == 0) ? c0.data() : c1.data();
+        for (std::size_t d = 0; d < dim_; ++d) {
+          dst[d] += x[d];
+        }
+        if (side[m] == 0) {
+          ++n0;
+        } else {
+          ++n1;
+        }
+      }
+    }
+    normalize_row(c0.data(), dim_);
+    normalize_row(c1.data(), dim_);
+    if (n0 == 0 || n1 == 0) {
+      return;
+    }
+  }
+
+  const std::size_t j_new = num_buckets_;
+  grow_one_bucket();
+
+  // Rebuild sums/counts for j and j_new from final assignment.
+  float* s0 = sums_.data() + j * dim_;
+  float* s1 = sums_.data() + j_new * dim_;
+  std::fill(s0, s0 + dim_, 0.0f);
+  std::fill(s1, s1 + dim_, 0.0f);
+  counts_[j] = 0;
+  counts_[j_new] = 0;
+
+  for (std::size_t m = 0; m < members.size(); ++m) {
+    const std::size_t i = members[m];
+    const float* x = vectors.data() + i * dim_;
+    if (side[m] == 0) {
+      cell_keys[i] = static_cast<std::uint64_t>(j);
+      for (std::size_t d = 0; d < dim_; ++d) {
+        s0[d] += x[d];
+      }
+      ++counts_[j];
+    } else {
+      cell_keys[i] = static_cast<std::uint64_t>(j_new);
+      for (std::size_t d = 0; d < dim_; ++d) {
+        s1[d] += x[d];
+      }
+      ++counts_[j_new];
+    }
+  }
+
+  normalize_centroid(j);
+  normalize_centroid(j_new);
 }
 
 BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys,

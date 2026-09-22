@@ -78,13 +78,11 @@ std::pair<std::unique_ptr<vectorcache::datasets::DatasetReader>, std::string> op
 vectorcache::ingest::IngestionEngine ingest_index(vectorcache::datasets::DatasetReader& reader,
                                                   std::size_t dim, std::uint64_t seed,
                                                   std::size_t limit, std::size_t bits,
-                                                  std::size_t num_buckets,
-                                                  std::size_t rebalance_every,
+                                                  std::size_t max_bucket_items,
                                                   std::uint64_t bucket_seed) {
   vectorcache::datasets::LimitedReader limited(reader, limit);
   vectorcache::ingest::BucketParams buckets;
-  buckets.num_buckets = num_buckets;
-  buckets.rebalance_every = rebalance_every;
+  buckets.max_bucket_items = max_bucket_items;
   buckets.bucket_seed = bucket_seed;
   auto engine = vectorcache::ingest::IngestionEngine::with_rotation(dim, seed, bits, buckets);
   engine.reserve_vectors(limit);
@@ -496,8 +494,7 @@ int main(int argc, char** argv) {
   std::uint64_t seed = 42;
   std::size_t k = 10;
   std::size_t bits = 1;
-  std::size_t num_buckets = 256;
-  std::size_t rebalance_every = 10000;
+  std::size_t max_bucket_items = 1024;
   float probe_fraction = 0.1f;
   std::uint64_t bucket_seed = 0;
   bool calibrate = false;
@@ -514,12 +511,11 @@ int main(int argc, char** argv) {
   app.add_option("--seed", seed, "SRHT / holdout seed");
   app.add_option("--k", k, "Top-k");
   app.add_option("--bits", bits, "TurboQuantMSE bits per dim (1-8)");
-  app.add_option("--num-buckets", num_buckets, "Cluster IVF bucket count B");
-  app.add_option("--rebalance-every", rebalance_every,
-                 "Lloyd rebalance every N vectors (0 = finalize only)");
+  app.add_option("--max-bucket-items", max_bucket_items,
+                 "Split a cluster cell when its online count exceeds this");
   app.add_option("--probe-fraction", probe_fraction,
                  "Index coverage fraction: probe high-IP lists until this share of vectors");
-  app.add_option("--bucket-seed", bucket_seed, "Cluster centroid seed (0 = derive from --seed)");
+  app.add_option("--bucket-seed", bucket_seed, "Reserved cluster seed (first centroid is data-driven)");
   app.add_flag("--calibrate", calibrate,
                "Print rotated_dim / bits / hit count for the first query");
   app.add_flag("--recall", recall,
@@ -533,8 +529,8 @@ int main(int argc, char** argv) {
       throw vectorcache::Error("pass --dataset or --npy");
     }
     vectorcache::quantize::validate_bits_per_dim(bits);
-    if (num_buckets == 0 || num_buckets > vectorcache::index::kMaxBuckets) {
-      throw vectorcache::Error("num-buckets must be in 1..kMaxBuckets");
+    if (max_bucket_items == 0) {
+      throw vectorcache::Error("max-bucket-items must be >= 1");
     }
     vectorcache::index::validate_probe_fraction(probe_fraction);
 
@@ -556,7 +552,7 @@ int main(int argc, char** argv) {
               << " srht_dim=" << meta.dim << " index_n=" << actual_index
               << " query_n=" << query_limit << " query_split=" << query_split
               << " bits=" << bits
-              << " B=" << num_buckets << " rebalance_every=" << rebalance_every
+              << " max_bucket_items=" << max_bucket_items
               << " probe_fraction=" << probe_fraction << '\n';
     if (limit && *limit < meta.count) {
       std::cout << "  (index capped from " << meta.count << " vectors in dataset)\n";
@@ -564,8 +560,8 @@ int main(int argc, char** argv) {
 
     vectorcache::datasets::LimitedReader index_limited(*index_reader, actual_index);
     auto ingest_engine =
-        ingest_index(index_limited, meta.dim, seed, actual_index, bits, num_buckets,
-                     rebalance_every, bucket_seed);
+        ingest_index(index_limited, meta.dim, seed, actual_index, bits, max_bucket_items,
+                     bucket_seed);
     {
       const auto& store = ingest_engine.store();
       std::cout << "  stored_vectors=" << store.size()

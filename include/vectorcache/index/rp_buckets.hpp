@@ -9,8 +9,6 @@
 
 namespace vectorcache::index {
 
-inline constexpr std::size_t kMaxBuckets = 65536;
-
 /// Validate coverage fraction: (0, 1].
 void validate_probe_fraction(float probe_fraction);
 
@@ -19,11 +17,12 @@ struct BucketRange {
   std::size_t length = 0;
 };
 
-/// Spherical online clustering: random unit centroids, assign by max IP, exact running mean.
+/// Spherical online clustering: grow from empty via assign + max-count splits.
 class ClusterCentroids {
  public:
   ClusterCentroids() = default;
-  ClusterCentroids(std::size_t num_buckets, std::size_t dim, std::uint64_t seed);
+  /// Starts with zero buckets; first `assign_and_update` seeds bucket 0 from data.
+  explicit ClusterCentroids(std::size_t dim);
 
   std::size_t num_buckets() const { return num_buckets_; }
   std::size_t dim() const { return dim_; }
@@ -34,19 +33,22 @@ class ClusterCentroids {
   std::span<const float> centroids() const { return centroids_; }
   std::size_t count(std::size_t j) const;
 
-  /// Argmax_j ⟨x, ĉ_j⟩; update S_j += x, n_j++, ĉ_j = S_j/||S_j||. Returns cell key = j.
+  /// If empty, seed bucket 0 from `x`. Else argmax_j ⟨x, ĉ_j⟩; update S_j += x, n_j++,
+  /// ĉ_j = S_j/||S_j||. Returns cell key = j.
   std::uint64_t assign_and_update(std::span<const float> x);
 
   /// Nearest centroid without updating (Voronoi assign).
   std::uint64_t nearest(std::span<const float> x) const;
 
-  /// Reassign all rows to nearest ĉ and recompute S/n/ĉ from members (empty buckets keep
-  /// prior ĉ). `vectors` is row-major N * dim; `cell_keys` length N is overwritten.
-  void rebalance(std::span<const float> vectors, std::span<std::uint64_t> cell_keys);
+  /// Binary-split cell `j` via spherical 2-means on its members. Grows `num_buckets` by 1.
+  /// `vectors` is row-major N * dim; `cell_keys` length N is updated for members of `j`.
+  void split_bucket(std::size_t j, std::span<const float> vectors,
+                    std::span<std::uint64_t> cell_keys);
 
  private:
   void normalize_centroid(std::size_t j);
   float ip_centroid(std::size_t j, std::span<const float> x) const;
+  void grow_one_bucket();
 
   std::size_t num_buckets_ = 0;
   std::size_t dim_ = 0;

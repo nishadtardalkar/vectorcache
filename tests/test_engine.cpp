@@ -164,7 +164,36 @@ TEST(EngineTest, IngestWithoutFinalizeThenFinalizeBuckets) {
   EXPECT_FALSE(work.has_buckets());
   EXPECT_EQ(work.size(), n);
 
-  index::ClusterCentroids centroids(4, work.srht_dim(), 123);
+  index::ClusterCentroids centroids(work.srht_dim());
+  // Seed enough buckets for keys 0..3 via online assign + unit-count splits.
+  {
+    std::vector<float> rotated;
+    std::vector<std::uint64_t> grow_keys;
+    const std::size_t dim = work.srht_dim();
+    std::size_t axis = 0;
+    while (centroids.num_buckets() < 4) {
+      std::vector<float> v(dim, 0.0f);
+      v[axis % dim] = 1.0f;
+      ++axis;
+      grow_keys.push_back(centroids.assign_and_update(v));
+      rotated.insert(rotated.end(), v.begin(), v.end());
+      bool split = true;
+      while (split) {
+        split = false;
+        for (std::size_t j = 0; j < centroids.num_buckets(); ++j) {
+          if (centroids.count(j) > 1) {
+            centroids.split_bucket(j, rotated, grow_keys);
+            split = true;
+            break;
+          }
+        }
+      }
+      if (axis > 64) {
+        break;
+      }
+    }
+    ASSERT_GE(centroids.num_buckets(), 4u);
+  }
   std::vector<std::uint64_t> keys(n, 0);
   for (std::size_t i = 0; i < n; ++i) {
     keys[i] = static_cast<std::uint64_t>(i % 4);
