@@ -71,8 +71,11 @@ ctest --output-on-failure
 ```bash
 ./query-bench --dataset glove --bits 4 --k 10
 ./query-bench --dataset glove --bits 4 --calibrate --recall
+./query-bench --dataset openai-1536 --bits 2 --k 64
 ./query-bench --npy data/glove-train-100k.npy --limit 100000 --query-limit 1000
 ```
+
+OpenAI NPY corpora have no HDF5-style `test` split; `--query-split` defaults to `holdout` (last `--query-limit` rows) for them. GloVe defaults to `test`.
 
 Reports median batch search latency (`ms_per_query`) and optional **Recall@1@k** / **Recall@k**.
 

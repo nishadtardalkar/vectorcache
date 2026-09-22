@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
   std::string npy;
   std::string data_dir = "data";
   std::string split = "train";
-  std::string query_split = "test";
+  std::string query_split;  // default: test for glove, holdout for OpenAI / --npy
   std::size_t limit = 100000;
   std::size_t query_limit = 1000;
   std::size_t bits = 4;
@@ -127,8 +127,9 @@ int main(int argc, char** argv) {
   app.add_option("--dataset", dataset, "Named dataset (glove, openai-1536, openai-3072)");
   app.add_option("--npy", npy, "Path to .npy matrix (overrides --dataset)");
   app.add_option("--data-dir", data_dir, "Dataset directory");
-  app.add_option("--split", split, "Index split (train/test)");
-  app.add_option("--query-split", query_split, "Query split");
+  app.add_option("--split", split, "Index split (train/test; HDF5 only)");
+  app.add_option("--query-split", query_split,
+                 "Query split: test (GloVe) or holdout (OpenAI/NPY); default by dataset");
   app.add_option("--limit", limit, "Max index vectors (0 = all)");
   app.add_option("--query-limit", query_limit, "Max queries (0 = all)");
   app.add_option("--bits", bits, "Bits per dim (2-4)")->check(CLI::Range(2, 4));
@@ -145,28 +146,50 @@ int main(int argc, char** argv) {
                          : vectorcache::datasets::DatasetSplit::Train;
     };
 
-    Matrix db;
-    Matrix queries;
-    if (!npy.empty()) {
-      db = load_npy(npy, limit);
-      // Use last query_limit rows as queries if single file, else reuse head.
-      if (db.rows > query_limit && query_limit > 0) {
+    auto holdout_queries = [](Matrix& db, std::size_t qlimit) -> Matrix {
+      Matrix queries;
+      if (qlimit > 0 && db.rows > qlimit) {
         queries.cols = db.cols;
-        queries.rows = query_limit;
-        queries.data.assign(db.data.end() - static_cast<std::ptrdiff_t>(query_limit * db.cols),
+        queries.rows = qlimit;
+        queries.data.assign(db.data.end() - static_cast<std::ptrdiff_t>(qlimit * db.cols),
                             db.data.end());
-        db.rows -= query_limit;
+        db.rows -= qlimit;
         db.data.resize(db.rows * db.cols);
       } else {
         queries = db;
-        if (query_limit > 0 && queries.rows > query_limit) {
-          queries.rows = query_limit;
-          queries.data.resize(query_limit * queries.cols);
+        if (qlimit > 0 && queries.rows > qlimit) {
+          queries.rows = qlimit;
+          queries.data.resize(qlimit * queries.cols);
         }
       }
-    } else {
+      return queries;
+    };
+
+    if (query_split.empty()) {
+      query_split = (dataset == "glove" && npy.empty()) ? "test" : "holdout";
+    }
+
+    Matrix db;
+    Matrix queries;
+    if (!npy.empty()) {
+      if (query_split != "holdout") {
+        throw std::runtime_error("--npy only supports --query-split holdout");
+      }
+      const std::size_t load_n =
+          (limit == 0 || query_limit == 0) ? limit : limit + query_limit;
+      db = load_npy(npy, load_n);
+      queries = holdout_queries(db, query_limit);
+    } else if (query_split == "holdout") {
+      const std::size_t load_n =
+          (limit == 0 || query_limit == 0) ? limit : limit + query_limit;
+      db = load_dataset(dataset, data_dir, to_split(split), load_n);
+      queries = holdout_queries(db, query_limit);
+    } else if (query_split == "test" || query_split == "train") {
       db = load_dataset(dataset, data_dir, to_split(split), limit);
       queries = load_dataset(dataset, data_dir, to_split(query_split), query_limit);
+    } else {
+      throw std::runtime_error("unknown --query-split '" + query_split +
+                               "'; use test, train, or holdout");
     }
 
     if (db.rows == 0 || queries.rows == 0) {
