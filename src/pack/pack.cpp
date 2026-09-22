@@ -227,7 +227,11 @@ std::string search_backend_name(std::size_t bits, std::size_t dim) {
   const std::size_t codes_per_byte = 8 / bits;
   const std::size_t n_byte_groups = dim / codes_per_byte;
   if (vector_major_for(bits, n_byte_groups)) {
+#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
     return "avx512_vnni";
+#else
+    return (bits == 4) ? "avx512_permute_dot" : "avx512_vnni";
+#endif
   }
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__) || defined(__clang__)

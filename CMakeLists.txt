@@ -55,7 +55,6 @@ else()
     -mavx2 -mfma
   )
   # Compile SIMD search TUs with broader ISA; runtime dispatch selects path.
-  # Use COMPILE_OPTIONS (not COMPILE_FLAGS) so flags survive modern CMake generators.
   set_source_files_properties(src/search/search_avx2.cpp PROPERTIES
     COMPILE_OPTIONS "-mavx2;-mfma")
   set_source_files_properties(src/search/search_vnni.cpp PROPERTIES

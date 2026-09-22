@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include "vectorcache/constants.hpp"
@@ -17,8 +19,18 @@
 #endif
 #endif
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace vectorcache {
 namespace {
+
+constexpr std::size_t kNqBatch = 8;
+constexpr std::size_t kTilesPerThread = 32;
+constexpr std::size_t kMinTileBlocks = 1024;
+constexpr std::size_t kMinTileBlocksX86 = kMinTileBlocks * 3;
+constexpr std::size_t kSingleQueryParallelMinBlocks = 1024;
 
 struct QueryLut {
   std::vector<std::uint8_t> uint8_luts;
@@ -109,7 +121,7 @@ void heap_push_or_replace(float* heap_s, std::uint64_t* heap_i, std::size_t& hea
       heap_min = heap_s[0];
       heap_mi = 0;
       for (std::size_t i = 1; i < k; ++i) {
-        if (heap_s[i] < heap_min) {
+        if (heap_s[i] < heap_min || (heap_s[i] == heap_min && heap_i[i] > heap_i[heap_mi])) {
           heap_min = heap_s[i];
           heap_mi = i;
         }
@@ -121,7 +133,7 @@ void heap_push_or_replace(float* heap_s, std::uint64_t* heap_i, std::size_t& hea
     heap_min = heap_s[0];
     heap_mi = 0;
     for (std::size_t i = 1; i < k; ++i) {
-      if (heap_s[i] < heap_min) {
+      if (heap_s[i] < heap_min || (heap_s[i] == heap_min && heap_i[i] > heap_i[heap_mi])) {
         heap_min = heap_s[i];
         heap_mi = i;
       }
@@ -171,6 +183,240 @@ bool cpu_has_avx2() {
 }
 #endif
 
+bool single_query_parallelizes(std::size_t n_vectors) {
+  const std::size_t n_blocks = (n_vectors + kBlock - 1) / kBlock;
+  return n_blocks >= kSingleQueryParallelMinBlocks;
+}
+
+std::size_t range_cap_for_k(std::size_t n_vectors, std::size_t k) {
+  constexpr std::size_t kMinVectorsPerRangePerK = 512;
+  return std::max<std::size_t>(1, (n_vectors + kMinVectorsPerRangePerK * std::max(k, std::size_t{1}) -
+                                   1) /
+                                      (kMinVectorsPerRangePerK * std::max(k, std::size_t{1})));
+}
+
+std::size_t n_block_ranges(std::size_t nq, std::size_t n_quads, std::size_t n_blocks,
+                           std::size_t n_vectors, std::size_t k, std::size_t n_threads,
+                           std::size_t tiles_per_thread, std::size_t min_tile_blocks, bool serial) {
+  if (n_threads <= 1 || serial || (nq == 1 && !single_query_parallelizes(n_vectors))) {
+    return 1;
+  }
+  const std::size_t by_threads = (n_threads * tiles_per_thread + n_quads - 1) / n_quads;
+  const std::size_t by_blocks = (n_blocks + min_tile_blocks - 1) / min_tile_blocks;
+  return std::max<std::size_t>(
+      1, std::min({by_threads, by_blocks, range_cap_for_k(n_vectors, k)}));
+}
+
+std::size_t smooth_tile_count(std::size_t n_ranges, std::size_t n_quads, std::size_t n_threads) {
+  const std::size_t tiles = n_quads * n_ranges;
+  if (tiles > n_threads && tiles < 2 * n_threads) {
+    return std::max<std::size_t>(1, n_threads / n_quads);
+  }
+  return n_ranges;
+}
+
+struct TileCand {
+  float score;
+  std::uint64_t id;
+};
+
+void write_sorted_topk(SearchResults& out, std::size_t qi, std::size_t effective_k,
+                       std::vector<float>& heap_s, std::vector<std::uint64_t>& heap_i,
+                       std::size_t heap_sz) {
+  std::vector<std::size_t> order(heap_sz);
+  for (std::size_t i = 0; i < heap_sz; ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    if (heap_s[a] != heap_s[b]) return heap_s[a] > heap_s[b];
+    return heap_i[a] < heap_i[b];
+  });
+  for (std::size_t i = 0; i < heap_sz; ++i) {
+    out.scores[qi * effective_k + i] = heap_s[order[i]];
+    out.ids[qi * effective_k + i] = heap_i[order[i]];
+  }
+}
+
+SearchResults search_flat_vm(std::span<const float> q_rot, std::span<const float> bias_corrs,
+                             std::size_t nq, std::size_t dim, std::size_t effective_k,
+                             std::span<const float> centroids, std::size_t bits,
+                             std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                             std::span<const float> scales, std::size_t n_byte_groups) {
+  const std::size_t n_vectors = scales.size();
+  // MinGW on Win64 miscompiles permute-dot (aligned ZMM spills to bad
+  // frame offsets). Use classic split-LUT VNNI there; Linux/MSVC keep PD.
+#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
+  const bool use_pd = false;
+#else
+  const bool use_pd = (bits == 4);
+#endif
+
+  SearchResults out;
+  out.nq = nq;
+  out.k = effective_k;
+  out.scores.assign(nq * effective_k, 0.f);
+  out.ids.assign(nq * effective_k, 0);
+
+  std::vector<QueryPermuteDot> pds;
+  std::vector<std::vector<std::uint8_t>> split_luts;
+  std::vector<float> lut_scales;
+  std::vector<float> lut_biases;
+
+  if (use_pd) {
+    pds.resize(nq);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+      auto qrow = std::span<const float>(q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
+      pds[static_cast<std::size_t>(qi)] = build_permute_dot(qrow, centroids, dim);
+      pds[static_cast<std::size_t>(qi)].bias += bias_corrs[static_cast<std::size_t>(qi)];
+    }
+  } else {
+    split_luts.resize(nq);
+    lut_scales.resize(nq);
+    lut_biases.resize(nq);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+      auto qrow = std::span<const float>(q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
+      QueryLut lut = build_query_lut(qrow, centroids, bits, dim);
+      split_luts[static_cast<std::size_t>(qi)] = split_lut_for_vnni(lut.uint8_luts, n_byte_groups);
+      lut_scales[static_cast<std::size_t>(qi)] = lut.scale;
+      lut_biases[static_cast<std::size_t>(qi)] =
+          lut.bias + bias_corrs[static_cast<std::size_t>(qi)];
+    }
+  }
+
+  std::size_t n_threads = 1;
+#ifdef _OPENMP
+  n_threads = static_cast<std::size_t>(std::max(1, omp_get_max_threads()));
+#endif
+
+  const std::size_t n_quads = (nq + kNqBatch - 1) / kNqBatch;
+  std::size_t n_ranges =
+      n_block_ranges(nq, n_quads, n_blocks, n_vectors, effective_k, n_threads, kTilesPerThread,
+                     kMinTileBlocksX86, false);
+  n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
+  const std::size_t blocks_per_range = (n_blocks + n_ranges - 1) / n_ranges;
+
+  struct Tile {
+    std::size_t qi_start;
+    std::size_t block_start;
+  };
+  std::vector<Tile> tiles;
+  tiles.reserve(n_quads * n_ranges);
+  for (std::size_t block_start = 0; block_start < n_blocks; block_start += blocks_per_range) {
+    for (std::size_t qi_start = 0; qi_start < nq; qi_start += kNqBatch) {
+      tiles.push_back(Tile{qi_start, block_start});
+    }
+  }
+
+  // Per-query list of candidates from each tile (qi -> cands).
+  std::vector<std::vector<TileCand>> all_cands(nq);
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
+    std::vector<std::vector<TileCand>> local_cands(nq);
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic)
+#endif
+    for (int ti = 0; ti < static_cast<int>(tiles.size()); ++ti) {
+      const Tile tile = tiles[static_cast<std::size_t>(ti)];
+      const std::size_t qi_end = std::min(tile.qi_start + kNqBatch, nq);
+      const std::size_t batch_nq = qi_end - tile.qi_start;
+      const std::size_t block_end = std::min(tile.block_start + blocks_per_range, n_blocks);
+      const std::size_t range_blocks = block_end - tile.block_start;
+      if (range_blocks == 0 || batch_nq == 0) continue;
+
+      const std::size_t vec_start = tile.block_start * kBlock;
+      const std::size_t vec_end = std::min(block_end * kBlock, n_vectors);
+      const std::size_t range_n = vec_end - vec_start;
+      const std::size_t block_bytes = n_byte_groups * kBlock;
+      const std::size_t code_off = tile.block_start * block_bytes;
+      const std::size_t code_len = range_blocks * block_bytes;
+
+      auto codes_span = blocked_codes.subspan(code_off, code_len);
+      auto scales_span = scales.subspan(vec_start, range_n);
+
+      std::vector<float> heap_s_store(batch_nq * effective_k);
+      std::vector<std::uint64_t> heap_i_store(batch_nq * effective_k);
+      std::vector<std::size_t> heap_sz(batch_nq, 0);
+      std::vector<float> heap_min(batch_nq, 0.f);
+      std::vector<std::size_t> heap_mi(batch_nq, 0);
+      std::vector<float*> heap_s_ptrs(batch_nq);
+      std::vector<std::uint64_t*> heap_i_ptrs(batch_nq);
+      for (std::size_t i = 0; i < batch_nq; ++i) {
+        heap_s_ptrs[i] = heap_s_store.data() + i * effective_k;
+        heap_i_ptrs[i] = heap_i_store.data() + i * effective_k;
+      }
+
+      if (use_pd) {
+        std::vector<const QueryPermuteDot*> pd_ptrs(batch_nq);
+        for (std::size_t i = 0; i < batch_nq; ++i) {
+          pd_ptrs[i] = &pds[tile.qi_start + i];
+        }
+        score_queries_permute_dot(pd_ptrs.data(), batch_nq, codes_span, scales_span, n_byte_groups,
+                                  range_n, range_blocks, effective_k, heap_s_ptrs.data(),
+                                  heap_i_ptrs.data(), heap_sz.data(), heap_min.data(),
+                                  heap_mi.data());
+      } else {
+        std::vector<const std::uint8_t*> lut_ptrs(batch_nq);
+        std::vector<float> scales_batch(batch_nq);
+        std::vector<float> biases_batch(batch_nq);
+        for (std::size_t i = 0; i < batch_nq; ++i) {
+          lut_ptrs[i] = split_luts[tile.qi_start + i].data();
+          scales_batch[i] = lut_scales[tile.qi_start + i];
+          biases_batch[i] = lut_biases[tile.qi_start + i];
+        }
+        score_queries_vnni(lut_ptrs.data(), scales_batch.data(), biases_batch.data(), batch_nq,
+                           codes_span, scales_span, n_byte_groups, range_n, range_blocks, effective_k,
+                           heap_s_ptrs.data(), heap_i_ptrs.data(), heap_sz.data(), heap_min.data(),
+                           heap_mi.data());
+      }
+
+      for (std::size_t i = 0; i < batch_nq; ++i) {
+        const std::size_t qi = tile.qi_start + i;
+        auto& dest = local_cands[qi];
+        dest.reserve(dest.size() + heap_sz[i]);
+        for (std::size_t j = 0; j < heap_sz[i]; ++j) {
+          dest.push_back(TileCand{heap_s_ptrs[i][j],
+                                  heap_i_ptrs[i][j] + static_cast<std::uint64_t>(vec_start)});
+        }
+      }
+    }
+
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+    {
+      for (std::size_t qi = 0; qi < nq; ++qi) {
+        if (!local_cands[qi].empty()) {
+          all_cands[qi].insert(all_cands[qi].end(), local_cands[qi].begin(),
+                               local_cands[qi].end());
+        }
+      }
+    }
+  }
+
+  for (std::size_t qi = 0; qi < nq; ++qi) {
+    auto& cands = all_cands[qi];
+    const std::size_t kk = std::min(effective_k, cands.size());
+    std::partial_sort(cands.begin(), cands.begin() + static_cast<std::ptrdiff_t>(kk), cands.end(),
+                      [](const TileCand& a, const TileCand& b) {
+                        if (a.score != b.score) return a.score > b.score;
+                        return a.id < b.id;
+                      });
+    for (std::size_t j = 0; j < kk; ++j) {
+      out.scores[qi * effective_k + j] = cands[j].score;
+      out.ids[qi * effective_k + j] = cands[j].id;
+    }
+  }
+
+  return out;
+}
+
 }  // namespace
 
 SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::size_t dim,
@@ -183,12 +429,6 @@ SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::s
   const std::size_t codes_per_byte = 8 / bits;
   const std::size_t n_byte_groups = dim / codes_per_byte;
   const std::size_t effective_k = std::min(k, n_vectors);
-
-  SearchResults out;
-  out.nq = nq;
-  out.k = effective_k;
-  out.scores.assign(nq * effective_k, 0.f);
-  out.ids.assign(nq * effective_k, 0);
 
   std::vector<float> q_rot(nq * dim);
   std::vector<float> bias_corrs(nq, 0.f);
@@ -223,11 +463,21 @@ SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::s
 
   const bool use_vm = vector_major_for(bits, n_byte_groups);
 #if defined(__x86_64__) || defined(_M_X64)
-  const bool use_avx2 = !use_vm && cpu_has_avx2();
+  if (use_vm) {
+    return search_flat_vm(q_rot, bias_corrs, nq, dim, effective_k, centroids, bits, blocked_codes,
+                          n_blocks, scales, n_byte_groups);
+  }
+  const bool use_avx2 = cpu_has_avx2();
 #else
   const bool use_avx2 = false;
   (void)use_vm;
 #endif
+
+  SearchResults out;
+  out.nq = nq;
+  out.k = effective_k;
+  out.scores.assign(nq * effective_k, 0.f);
+  out.ids.assign(nq * effective_k, 0);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
@@ -241,13 +491,7 @@ SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::s
     float heap_min = 0.f;
     std::size_t heap_mi = 0;
 #if defined(__x86_64__) || defined(_M_X64)
-    if (use_vm) {
-      auto split = split_lut_for_vnni(lut.uint8_luts, n_byte_groups);
-      QueryLutView view{split.data(), lut.scale, lut.bias};
-      score_query_vnni(view, blocked_codes, scales, n_byte_groups, n_vectors, n_blocks, effective_k,
-                       heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
-                       bias_corrs[static_cast<std::size_t>(qi)]);
-    } else if (use_avx2) {
+    if (use_avx2) {
       QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
       score_query_avx2_perm0(view, blocked_codes, scales, n_byte_groups, n_vectors, n_blocks,
                              effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
@@ -259,15 +503,7 @@ SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::s
                          effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
                          bias_corrs[static_cast<std::size_t>(qi)]);
     }
-
-    std::vector<std::size_t> order(heap_sz);
-    for (std::size_t i = 0; i < heap_sz; ++i) order[i] = i;
-    std::sort(order.begin(), order.end(),
-              [&](std::size_t a, std::size_t b) { return heap_s[a] > heap_s[b]; });
-    for (std::size_t i = 0; i < heap_sz; ++i) {
-      out.scores[static_cast<std::size_t>(qi) * effective_k + i] = heap_s[order[i]];
-      out.ids[static_cast<std::size_t>(qi) * effective_k + i] = heap_i[order[i]];
-    }
+    write_sorted_topk(out, static_cast<std::size_t>(qi), effective_k, heap_s, heap_i, heap_sz);
   }
 
   return out;
