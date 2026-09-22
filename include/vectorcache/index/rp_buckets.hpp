@@ -40,8 +40,9 @@ class ClusterCentroids {
   /// Nearest centroid without updating (Voronoi assign).
   std::uint64_t nearest(std::span<const float> x) const;
 
-  /// Binary-split cell `j` via diametral median cut, then local Lloyd on the two children
-  /// and neighbor steal within a top-M centroid set. Grows `num_buckets` by 1.
+  /// Binary-split cell `j` via diametral median cut, then local Lloyd on the two children,
+  /// neighbor steal within a top-M centroid set, and global nearest eject from both children
+  /// (skip moves that would empty a child). Grows `num_buckets` by 1.
   /// `vectors` is row-major N * dim; `cell_keys` length N is updated for affected members.
   void split_bucket(std::size_t j, std::span<const float> vectors,
                     std::span<std::uint64_t> cell_keys, std::size_t lloyd_iters = 1,

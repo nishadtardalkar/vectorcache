@@ -159,14 +159,15 @@ TEST(ClusterBucketsTest, SplitMedianBalanced) {
 
   EXPECT_EQ(cc.num_buckets(), 1u);
   EXPECT_EQ(cc.count(0), n);
-  // Median init only — no Lloyd/steal so size balance is meaningful.
+  // Median cut + global eject (B=2 → sibling-only); near-line geometry stays ~balanced.
   cc.split_bucket(0, vectors, keys, /*lloyd_iters=*/0, /*steal_neighbors=*/0);
 
   EXPECT_EQ(cc.num_buckets(), 2u);
   const std::size_t n0 = cc.count(0);
   const std::size_t n1 = cc.count(1);
   EXPECT_EQ(n0 + n1, n);
-  EXPECT_LE(n0 > n1 ? n0 - n1 : n1 - n0, 1u);
+  EXPECT_GE(n0, 1u);
+  EXPECT_GE(n1, 1u);
   EXPECT_NEAR(std::sqrt(dot(cc.centroid(0), cc.centroid(0))), 1.0f, 1e-5f);
   EXPECT_NEAR(std::sqrt(dot(cc.centroid(1), cc.centroid(1))), 1.0f, 1e-5f);
 }
@@ -174,7 +175,7 @@ TEST(ClusterBucketsTest, SplitMedianBalanced) {
 TEST(ClusterBucketsTest, SplitLocalVoronoiReassigns) {
   const std::size_t dim = 8;
   // Asymmetric tilts: after a median cut, the near-cut point on the sparse side is closer
-  // to the dense-side child centroid; Lloyd should move it.
+  // to the dense-side child centroid; Lloyd and/or global eject should move it.
   const std::vector<float> tilts = {-1.0f, -0.95f, -0.9f, -0.05f, 0.2f, 0.25f, 0.3f, 0.35f};
 
   auto run_split = [&](std::size_t lloyd) {
@@ -195,28 +196,19 @@ TEST(ClusterBucketsTest, SplitLocalVoronoiReassigns) {
   ASSERT_EQ(cc0.num_buckets(), 2u);
   ASSERT_EQ(cc1.num_buckets(), 2u);
 
-  // With Lloyd, every member prefers its assigned child among {0,1}.
+  // Global eject (lloyd=0) and Lloyd both leave members preferring their child among {0,1}.
+  for (std::size_t i = 0; i < keys0.size(); ++i) {
+    const std::span<const float> x(vec0.data() + i * dim, dim);
+    const std::size_t k = static_cast<std::size_t>(keys0[i]);
+    const std::size_t other = k == 0 ? 1 : 0;
+    EXPECT_GE(dot(cc0.centroid(k), x), dot(cc0.centroid(other), x));
+  }
   for (std::size_t i = 0; i < keys1.size(); ++i) {
     const std::span<const float> x(vec1.data() + i * dim, dim);
     const std::size_t k = static_cast<std::size_t>(keys1[i]);
     const std::size_t other = k == 0 ? 1 : 0;
     EXPECT_GE(dot(cc1.centroid(k), x), dot(cc1.centroid(other), x));
   }
-
-  // Median-only leaves at least one point that violates the two-child Voronoi rule.
-  bool median_violation = false;
-  for (std::size_t i = 0; i < keys0.size(); ++i) {
-    const std::span<const float> x(vec0.data() + i * dim, dim);
-    const std::size_t k = static_cast<std::size_t>(keys0[i]);
-    const std::size_t other = k == 0 ? 1 : 0;
-    if (dot(cc0.centroid(k), x) < dot(cc0.centroid(other), x)) {
-      median_violation = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(median_violation);
-  // And Lloyd assignment differs from pure median for that geometry.
-  EXPECT_NE(keys0, keys1);
 }
 
 TEST(ClusterBucketsTest, SplitNeighborStealMovesBoundary) {
@@ -305,6 +297,127 @@ TEST(ClusterBucketsTest, SplitNeighborStealMovesBoundary) {
   std::uint64_t after1 = 0;
   ASSERT_TRUE(run(/*steal=*/4, &bkey1, &after1));
   EXPECT_NE(after1, bkey1);
+}
+
+TEST(ClusterBucketsTest, SplitGlobalEjectMovesFromChildren) {
+  const std::size_t dim = 4;
+
+  auto seed_axes = [&](index::ClusterCentroids& cc, std::vector<float>& vectors,
+                       std::vector<std::uint64_t>& keys) {
+    for (std::size_t a = 0; a < 3; ++a) {
+      auto v = unit_axis(dim, a);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+      for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
+        if (cc.count(j) > 1) {
+          cc.split_bucket(j, vectors, keys, /*lloyd_iters=*/0, /*steal_neighbors=*/0);
+          break;
+        }
+      }
+    }
+  };
+
+  auto find_axis = [&](const index::ClusterCentroids& cc, std::size_t axis) {
+    auto ax = unit_axis(dim, axis);
+    std::size_t best = 0;
+    float best_ip = -2.0f;
+    for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
+      const float ip = dot(cc.centroid(j), ax);
+      if (ip > best_ip) {
+        best_ip = ip;
+        best = j;
+      }
+    }
+    return best;
+  };
+
+  // Pre-tilt e0 so a strong e1-leaning outlier still inserts into e0; dilute with pure
+  // axis0 so global nearest becomes e1 while the sticky key stays e0; split then ejects.
+  // Diametral A is the outlier (far from axis0 ĉ) → lands on median side 0 (j).
+  {
+    index::ClusterCentroids cc(dim);
+    std::vector<float> vectors;
+    std::vector<std::uint64_t> keys;
+    seed_axes(cc, vectors, keys);
+    ASSERT_EQ(cc.num_buckets(), 3u);
+    const std::size_t e0 = find_axis(cc, 0);
+    const std::size_t e1 = find_axis(cc, 1);
+    ASSERT_NE(e0, e1);
+
+    // Pre-tilt stays on e0 (x0-dominant) so the later e1-leaning outlier still inserts there.
+    for (int i = 0; i < 10; ++i) {
+      auto v = unit2(dim, 0.75f, 0.66f);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+    }
+
+    auto outlier = unit2(dim, 0.50f, 0.87f);
+    keys.push_back(cc.assign_and_update(outlier));
+    vectors.insert(vectors.end(), outlier.begin(), outlier.end());
+    const std::size_t oidx = keys.size() - 1;
+    ASSERT_EQ(keys[oidx], static_cast<std::uint64_t>(e0));
+
+    for (int i = 0; i < 24; ++i) {
+      auto v = unit_axis(dim, 0);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+    }
+    ASSERT_EQ(keys[oidx], static_cast<std::uint64_t>(e0));
+    ASSERT_EQ(static_cast<std::size_t>(cc.nearest(outlier)), e1);
+
+    const std::size_t j = e0;
+    cc.split_bucket(j, vectors, keys, /*lloyd_iters=*/0, /*steal_neighbors=*/0);
+    EXPECT_EQ(keys[oidx], static_cast<std::uint64_t>(e1));
+    EXPECT_EQ(cc.nearest(outlier), keys[oidx]);
+  }
+
+  // Same sticky setup, but add an opposite extreme so the outlier becomes diametral B
+  // (high s → median side 1 / j_new) while still diluted enough for e1 to win.
+  {
+    index::ClusterCentroids cc(dim);
+    std::vector<float> vectors;
+    std::vector<std::uint64_t> keys;
+    seed_axes(cc, vectors, keys);
+    ASSERT_EQ(cc.num_buckets(), 3u);
+    const std::size_t e0 = find_axis(cc, 0);
+    const std::size_t e1 = find_axis(cc, 1);
+    ASSERT_NE(e0, e1);
+
+    for (int i = 0; i < 10; ++i) {
+      auto v = unit2(dim, 0.75f, 0.66f);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+    }
+
+    auto outlier = unit2(dim, 0.50f, 0.87f);
+    keys.push_back(cc.assign_and_update(outlier));
+    vectors.insert(vectors.end(), outlier.begin(), outlier.end());
+    const std::size_t oidx = keys.size() - 1;
+    ASSERT_EQ(keys[oidx], static_cast<std::uint64_t>(e0));
+
+    // Opposite extreme on axis1 so A/B span negatives ↔ outlier; outlier tends to B / j_new.
+    for (int i = 0; i < 6; ++i) {
+      auto v = unit2(dim, 0.75f, -0.66f);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+    }
+
+    for (int i = 0; i < 24; ++i) {
+      auto v = unit_axis(dim, 0);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+    }
+    ASSERT_EQ(keys[oidx], static_cast<std::uint64_t>(e0));
+    ASSERT_EQ(static_cast<std::size_t>(cc.nearest(outlier)), e1);
+
+    const std::size_t j_before = e0;
+    const std::size_t b_before = cc.num_buckets();
+    cc.split_bucket(j_before, vectors, keys, /*lloyd_iters=*/0, /*steal_neighbors=*/0);
+    ASSERT_EQ(cc.num_buckets(), b_before + 1);
+    // Landed on the new child before eject, then moved to e1.
+    EXPECT_EQ(keys[oidx], static_cast<std::uint64_t>(e1));
+    EXPECT_EQ(cc.nearest(outlier), keys[oidx]);
+  }
 }
 
 TEST(ClusterBucketsTest, SplitGrowsAndCapsCount) {

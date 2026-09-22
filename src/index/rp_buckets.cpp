@@ -373,33 +373,73 @@ void ClusterCentroids::split_bucket(std::size_t j, std::span<const float> vector
 
   // Neighbor steal: reassign members of S among S only.
   auto neighbors = select_neighbor_buckets(j, j_new, steal_neighbors);
-  if (neighbors.empty()) {
-    return;
+  if (!neighbors.empty()) {
+    std::vector<std::size_t> S;
+    S.reserve(2 + neighbors.size());
+    S.push_back(j);
+    S.push_back(j_new);
+    S.insert(S.end(), neighbors.begin(), neighbors.end());
+
+    auto in_S = [&](std::size_t key) {
+      for (std::size_t b : S) {
+        if (b == key) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    for (std::size_t i = 0; i < cell_keys.size(); ++i) {
+      const std::size_t old_key = static_cast<std::size_t>(cell_keys[i]);
+      if (!in_S(old_key)) {
+        continue;
+      }
+      const std::span<const float> x(vectors.data() + i * dim_, dim_);
+      const std::size_t best = assign_among(x, S);
+      const std::size_t new_key = S[best];
+      if (new_key == old_key) {
+        continue;
+      }
+      const float* xv = vectors.data() + i * dim_;
+      float* s_old = sums_.data() + old_key * dim_;
+      float* s_new = sums_.data() + new_key * dim_;
+      for (std::size_t d = 0; d < dim_; ++d) {
+        s_old[d] -= xv[d];
+        s_new[d] += xv[d];
+      }
+      if (counts_[old_key] > 0) {
+        --counts_[old_key];
+      }
+      ++counts_[new_key];
+      cell_keys[i] = static_cast<std::uint64_t>(new_key);
+    }
+
+    for (std::size_t b : S) {
+      normalize_centroid(b);
+    }
   }
 
-  std::vector<std::size_t> S;
-  S.reserve(2 + neighbors.size());
-  S.push_back(j);
-  S.push_back(j_new);
-  S.insert(S.end(), neighbors.begin(), neighbors.end());
-
-  auto in_S = [&](std::size_t key) {
-    for (std::size_t b : S) {
-      if (b == key) {
-        return true;
+  // Global nearest eject: children members leave if some other bucket is nearer.
+  std::vector<std::size_t> touched;
+  auto mark_touched = [&](std::size_t b) {
+    for (std::size_t t : touched) {
+      if (t == b) {
+        return;
       }
     }
-    return false;
+    touched.push_back(b);
   };
 
   for (std::size_t i = 0; i < cell_keys.size(); ++i) {
     const std::size_t old_key = static_cast<std::size_t>(cell_keys[i]);
-    if (!in_S(old_key)) {
+    if (old_key != j && old_key != j_new) {
+      continue;
+    }
+    if (counts_[old_key] <= 1) {
       continue;
     }
     const std::span<const float> x(vectors.data() + i * dim_, dim_);
-    const std::size_t best = assign_among(x, S);
-    const std::size_t new_key = S[best];
+    const std::size_t new_key = static_cast<std::size_t>(nearest(x));
     if (new_key == old_key) {
       continue;
     }
@@ -410,14 +450,14 @@ void ClusterCentroids::split_bucket(std::size_t j, std::span<const float> vector
       s_old[d] -= xv[d];
       s_new[d] += xv[d];
     }
-    if (counts_[old_key] > 0) {
-      --counts_[old_key];
-    }
+    --counts_[old_key];
     ++counts_[new_key];
     cell_keys[i] = static_cast<std::uint64_t>(new_key);
+    mark_touched(old_key);
+    mark_touched(new_key);
   }
 
-  for (std::size_t b : S) {
+  for (std::size_t b : touched) {
     normalize_centroid(b);
   }
 }
