@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,6 +25,9 @@ BlockedGeometry blocked_geometry(std::size_t n_vectors, std::size_t bits, std::s
 
 bool use_vector_major();
 bool vector_major_for(std::size_t bits, std::size_t n_byte_groups);
+
+/// Runtime search kernel name: "avx512_vnni", "avx2_perm0", or "scalar".
+std::string search_backend_name(std::size_t bits, std::size_t dim);
 
 /// Pack bit-plane codes into native search layout (x86: PERM0 or vector-major).
 std::pair<std::vector<std::uint8_t>, std::size_t> repack(std::span<const std::uint8_t> packed_codes,

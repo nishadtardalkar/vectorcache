@@ -4,13 +4,66 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(__x86_64__))
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
 #include <intrin.h>
+#else
+#include <cpuid.h>
+#include <immintrin.h>
+#endif
 #endif
 
 namespace vectorcache {
 namespace {
+
+#if defined(__x86_64__) || defined(_M_X64)
+bool cpu_has_avx512_vnni_vbmi() {
+#if defined(_MSC_VER)
+  int info[4] = {};
+  __cpuid(info, 0);
+  if (info[0] < 7) {
+    return false;
+  }
+  __cpuidex(info, 1, 0);
+  if ((info[2] & (1 << 27)) == 0) {
+    return false;  // OSXSAVE
+  }
+  const unsigned long long xcr0 = _xgetbv(0);
+  // XCR0 bits 1,2,5,6,7: XMM, YMM, opmask, ZMM_hi256, ZMM_hi16
+  if ((xcr0 & 0xE6ull) != 0xE6ull) {
+    return false;
+  }
+  __cpuidex(info, 7, 0);
+  const bool avx512f = (info[1] & (1 << 16)) != 0;
+  const bool avx512bw = (info[1] & (1 << 30)) != 0;
+  const bool avx512vbmi = (info[2] & (1 << 1)) != 0;
+  const bool avx512vnni = (info[2] & (1 << 11)) != 0;
+  return avx512f && avx512bw && avx512vbmi && avx512vnni;
+#else
+  unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+  if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) == 0) {
+    return false;
+  }
+  if ((ecx & (1u << 27)) == 0) {
+    return false;  // OSXSAVE
+  }
+  const unsigned long long xcr0 = _xgetbv(0);
+  if ((xcr0 & 0xE6ull) != 0xE6ull) {
+    return false;
+  }
+  if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 0) {
+    return false;
+  }
+  const bool avx512f = (ebx & (1u << 16)) != 0;
+  const bool avx512bw = (ebx & (1u << 30)) != 0;
+  const bool avx512vbmi = (ecx & (1u << 1)) != 0;
+  const bool avx512vnni = (ecx & (1u << 11)) != 0;
+  return avx512f && avx512bw && avx512vbmi && avx512vnni;
+#endif
+}
+#endif
 
 std::array<std::array<std::uint32_t, 256>, 4> build_extract_lut(std::size_t bits) {
   const std::size_t codes_per_byte = 8 / bits;
@@ -151,35 +204,9 @@ bool use_vector_major() {
     return cpu_ok != 0;
   }
 #if defined(__x86_64__) || defined(_M_X64)
-#if defined(__GNUC__) || defined(__clang__)
-  cpu_ok = (__builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vnni") &&
-            __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512f"))
-               ? 1
-               : 0;
-#elif defined(_MSC_VER)
-  int info[4] = {};
-  __cpuid(info, 0);
-  if (info[0] >= 7) {
-    __cpuidex(info, 1, 0);
-    const bool osxsave = (info[2] & (1 << 27)) != 0;
-    unsigned long long xcr0 = 0;
-    if (osxsave) {
-      xcr0 = _xgetbv(0);
-    }
-    // XCR0 bits 1,2,5,6,7: XMM, YMM, opmask, ZMM_hi256, ZMM_hi16
-    const bool zmm_ok = (xcr0 & 0xE6) == 0xE6;
-    __cpuidex(info, 7, 0);
-    const bool avx512f = (info[1] & (1 << 16)) != 0;
-    const bool avx512bw = (info[1] & (1 << 30)) != 0;
-    const bool avx512vbmi = (info[2] & (1 << 1)) != 0;
-    const bool avx512vnni = (info[2] & (1 << 11)) != 0;
-    cpu_ok = (zmm_ok && avx512f && avx512bw && avx512vbmi && avx512vnni) ? 1 : 0;
-  } else {
-    cpu_ok = 0;
-  }
-#else
-  cpu_ok = 0;
-#endif
+  // Prefer CPUID over __builtin_cpu_supports: GCC often reports false for
+  // AVX-512 VNNI/VBMI when the TU is compiled with only -mavx2.
+  cpu_ok = cpu_has_avx512_vnni_vbmi() ? 1 : 0;
 #else
   cpu_ok = 0;
 #endif
@@ -193,6 +220,31 @@ bool vector_major_for([[maybe_unused]] std::size_t bits, std::size_t n_byte_grou
   const bool kernel_exists = (bits == 4);
 #endif
   return kernel_exists && use_vector_major() && (n_byte_groups % 4 == 0);
+}
+
+std::string search_backend_name(std::size_t bits, std::size_t dim) {
+  const std::size_t codes_per_byte = 8 / bits;
+  const std::size_t n_byte_groups = dim / codes_per_byte;
+  if (vector_major_for(bits, n_byte_groups)) {
+    return "avx512_vnni";
+  }
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+  if (__builtin_cpu_supports("avx2")) {
+    return "avx2_perm0";
+  }
+#elif defined(_MSC_VER)
+  int info[4] = {};
+  __cpuid(info, 0);
+  if (info[0] >= 7) {
+    __cpuidex(info, 7, 0);
+    if ((info[1] & (1 << 5)) != 0) {
+      return "avx2_perm0";
+    }
+  }
+#endif
+#endif
+  return "scalar";
 }
 
 void vector_major_chunk(std::span<std::uint8_t> buf) {

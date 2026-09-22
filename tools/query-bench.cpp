@@ -11,6 +11,7 @@
 #include "vectorcache/datasets/datasets.hpp"
 #include "vectorcache/datasets/npy.hpp"
 #include "vectorcache/index.hpp"
+#include "vectorcache/pack/pack.hpp"
 
 namespace fs = std::filesystem;
 
@@ -181,7 +182,8 @@ int main(int argc, char** argv) {
     l2_normalize_rows(queries);
 
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
-              << " bits=" << bits << " k=" << k << "\n";
+              << " bits=" << bits << " k=" << k
+              << " search_backend=" << vectorcache::search_backend_name(bits, db.cols) << "\n";
 
     vectorcache::TurboQuantIndex index(db.cols, bits);
     if (calibrate) {
