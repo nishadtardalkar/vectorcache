@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <sstream>
 #include <string>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -245,6 +246,95 @@ std::string search_backend_name(std::size_t bits, std::size_t dim) {
 #endif
 #endif
   return "scalar";
+}
+
+std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
+  std::ostringstream out;
+  const std::size_t codes_per_byte = (bits == 0) ? 0 : (8 / bits);
+  const std::size_t n_byte_groups = (codes_per_byte == 0) ? 0 : (dim / codes_per_byte);
+  const char* env_no_vm = std::getenv("TURBOVEC_NO_VECTOR_MAJOR");
+  const char* env_no_vnni = std::getenv("TURBOVEC_NO_VNNI");
+
+  out << "=== search_backend_diagnostics ===\n";
+  out << "bits=" << bits << " dim=" << dim << " codes_per_byte=" << codes_per_byte
+      << " n_byte_groups=" << n_byte_groups << " n_byte_groups%4=" << (n_byte_groups % 4) << "\n";
+  out << "TURBOVEC_NO_VECTOR_MAJOR=" << (env_no_vm ? env_no_vm : "(unset)") << "\n";
+  out << "TURBOVEC_NO_VNNI=" << (env_no_vnni ? env_no_vnni : "(unset)") << "\n";
+  out << "use_vector_major()=" << (use_vector_major() ? 1 : 0) << "\n";
+  out << "vector_major_for()=" << (vector_major_for(bits, n_byte_groups) ? 1 : 0) << "\n";
+  out << "search_backend=" << search_backend_name(bits, dim) << "\n";
+
+#if defined(__x86_64__) || defined(_M_X64)
+  unsigned leaf7_ebx = 0, leaf7_ecx = 0;
+  unsigned long long xcr0 = 0;
+  bool osxsave = false;
+  bool leaf7_ok = false;
+  unsigned max_leaf = 0;
+#if defined(_MSC_VER)
+  int info[4] = {};
+  __cpuid(info, 0);
+  max_leaf = static_cast<unsigned>(info[0]);
+  out << "cpuid_max_leaf=" << max_leaf << "\n";
+  if (max_leaf >= 1) {
+    __cpuidex(info, 1, 0);
+    osxsave = (info[2] & (1 << 27)) != 0;
+  }
+  if (osxsave) {
+    xcr0 = _xgetbv(0);
+  }
+  if (max_leaf >= 7) {
+    __cpuidex(info, 7, 0);
+    leaf7_ebx = static_cast<unsigned>(info[1]);
+    leaf7_ecx = static_cast<unsigned>(info[2]);
+    leaf7_ok = true;
+  }
+#else
+  unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+  if (__get_cpuid(0, &eax, &ebx, &ecx, &edx)) {
+    max_leaf = eax;
+  }
+  out << "cpuid_max_leaf=" << max_leaf << "\n";
+  if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+    osxsave = (ecx & (1u << 27)) != 0;
+  }
+  if (osxsave) {
+    xcr0 = _xgetbv(0);
+  }
+  if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+    leaf7_ebx = ebx;
+    leaf7_ecx = ecx;
+    leaf7_ok = true;
+  }
+#endif
+  out << "osxsave=" << (osxsave ? 1 : 0) << " xcr0=0x" << std::hex << xcr0 << std::dec << "\n";
+  out << "xcr0_xmm_ymm=" << (((xcr0 & 0x6ull) == 0x6ull) ? 1 : 0)
+      << " xcr0_opmask_zmm=" << (((xcr0 & 0xe0ull) == 0xe0ull) ? 1 : 0)
+      << " xcr0_avx512_ok=" << (((xcr0 & 0xe6ull) == 0xe6ull) ? 1 : 0) << "\n";
+  if (leaf7_ok) {
+    const int avx512f = (leaf7_ebx & (1u << 16)) != 0;
+    const int avx512bw = (leaf7_ebx & (1u << 30)) != 0;
+    const int avx512vbmi = (leaf7_ecx & (1u << 1)) != 0;
+    const int avx512vnni = (leaf7_ecx & (1u << 11)) != 0;
+    const int avx2 = (leaf7_ebx & (1u << 5)) != 0;
+    out << "leaf7_ebx=0x" << std::hex << leaf7_ebx << " leaf7_ecx=0x" << leaf7_ecx << std::dec
+        << "\n";
+    out << "cpuid_avx2=" << avx2 << " cpuid_avx512f=" << avx512f << " cpuid_avx512bw=" << avx512bw
+        << " cpuid_avx512vbmi=" << avx512vbmi << " cpuid_avx512vnni=" << avx512vnni << "\n";
+  } else {
+    out << "leaf7_ok=0 (CPUID leaf 7 unavailable)\n";
+  }
+#if defined(__GNUC__) || defined(__clang__)
+  out << "builtin_avx2=" << (__builtin_cpu_supports("avx2") ? 1 : 0)
+      << " builtin_avx512f=" << (__builtin_cpu_supports("avx512f") ? 1 : 0)
+      << " builtin_avx512bw=" << (__builtin_cpu_supports("avx512bw") ? 1 : 0)
+      << " builtin_avx512vbmi=" << (__builtin_cpu_supports("avx512vbmi") ? 1 : 0)
+      << " builtin_avx512vnni=" << (__builtin_cpu_supports("avx512vnni") ? 1 : 0) << "\n";
+#endif
+#else
+  out << "arch=non-x86_64\n";
+#endif
+  out << "=== end diagnostics ===\n";
+  return out.str();
 }
 
 void vector_major_chunk(std::span<std::uint8_t> buf) {

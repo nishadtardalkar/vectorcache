@@ -184,6 +184,7 @@ int main(int argc, char** argv) {
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
               << " bits=" << bits << " k=" << k
               << " search_backend=" << vectorcache::search_backend_name(bits, db.cols) << "\n";
+    std::cout << vectorcache::search_backend_diagnostics(bits, db.cols);
 
     vectorcache::TurboQuantIndex index(db.cols, bits);
     if (calibrate) {
