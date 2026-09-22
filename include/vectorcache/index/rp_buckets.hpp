@@ -40,7 +40,7 @@ class ClusterCentroids {
   /// Nearest centroid without updating (Voronoi assign).
   std::uint64_t nearest(std::span<const float> x) const;
 
-  /// Binary-split cell `j` via spherical 2-means on its members. Grows `num_buckets` by 1.
+  /// Binary-split cell `j` via diametral median cut on its members. Grows `num_buckets` by 1.
   /// `vectors` is row-major N * dim; `cell_keys` length N is updated for members of `j`.
   void split_bucket(std::size_t j, std::span<const float> vectors,
                     std::span<std::uint64_t> cell_keys);

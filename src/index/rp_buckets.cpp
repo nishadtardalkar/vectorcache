@@ -11,8 +11,6 @@
 namespace vectorcache::index {
 namespace {
 
-constexpr int kSplitIters = 5;
-
 float dot(std::span<const float> a, std::span<const float> b) {
   double sum = 0.0;
   for (std::size_t i = 0; i < a.size(); ++i) {
@@ -175,81 +173,62 @@ void ClusterCentroids::split_bucket(std::size_t j, std::span<const float> vector
     return;
   }
 
-  // Init: c0 = current ĉ, c1 = farthest member from ĉ (min IP).
-  std::vector<float> c0(centroids_.data() + j * dim_, centroids_.data() + (j + 1) * dim_);
-  std::vector<float> c1(dim_, 0.0f);
+  // Diametral axis: A = farthest from ĉ, B = farthest from A.
+  const std::span<const float> c(centroids_.data() + j * dim_, dim_);
+  std::size_t i_a = members[0];
   {
     float worst_ip = 2.0f;
-    std::size_t farthest = members[0];
     for (std::size_t mi : members) {
       const std::span<const float> x(vectors.data() + mi * dim_, dim_);
-      const float ip = dot(c0, x);
+      const float ip = dot(c, x);
       if (ip < worst_ip) {
         worst_ip = ip;
-        farthest = mi;
+        i_a = mi;
       }
-    }
-    const float* src = vectors.data() + farthest * dim_;
-    std::copy(src, src + dim_, c1.begin());
-    normalize_row(c1.data(), dim_);
-  }
-
-  std::vector<std::uint8_t> side(members.size(), 0);
-  for (int iter = 0; iter < kSplitIters; ++iter) {
-    for (std::size_t m = 0; m < members.size(); ++m) {
-      const std::span<const float> x(vectors.data() + members[m] * dim_, dim_);
-      const float ip0 = dot(c0, x);
-      const float ip1 = dot(c1, x);
-      side[m] = (ip1 > ip0) ? 1 : 0;
-    }
-
-    std::fill(c0.begin(), c0.end(), 0.0f);
-    std::fill(c1.begin(), c1.end(), 0.0f);
-    std::size_t n0 = 0;
-    std::size_t n1 = 0;
-    for (std::size_t m = 0; m < members.size(); ++m) {
-      const float* x = vectors.data() + members[m] * dim_;
-      float* dst = (side[m] == 0) ? c0.data() : c1.data();
-      for (std::size_t d = 0; d < dim_; ++d) {
-        dst[d] += x[d];
-      }
-      if (side[m] == 0) {
-        ++n0;
-      } else {
-        ++n1;
-      }
-    }
-    if (n0 == 0 || n1 == 0) {
-      // Degenerate: force a 50/50 cut by index order.
-      std::fill(c0.begin(), c0.end(), 0.0f);
-      std::fill(c1.begin(), c1.end(), 0.0f);
-      n0 = 0;
-      n1 = 0;
-      for (std::size_t m = 0; m < members.size(); ++m) {
-        side[m] = (m * 2 < members.size()) ? 0 : 1;
-        const float* x = vectors.data() + members[m] * dim_;
-        float* dst = (side[m] == 0) ? c0.data() : c1.data();
-        for (std::size_t d = 0; d < dim_; ++d) {
-          dst[d] += x[d];
-        }
-        if (side[m] == 0) {
-          ++n0;
-        } else {
-          ++n1;
-        }
-      }
-    }
-    normalize_row(c0.data(), dim_);
-    normalize_row(c1.data(), dim_);
-    if (n0 == 0 || n1 == 0) {
-      return;
     }
   }
+  const std::span<const float> a(vectors.data() + i_a * dim_, dim_);
+  std::size_t i_b = members[0] == i_a ? members[1] : members[0];
+  {
+    float worst_ip = 2.0f;
+    for (std::size_t mi : members) {
+      if (mi == i_a) {
+        continue;
+      }
+      const std::span<const float> x(vectors.data() + mi * dim_, dim_);
+      const float ip = dot(a, x);
+      if (ip < worst_ip) {
+        worst_ip = ip;
+        i_b = mi;
+      }
+    }
+  }
+  const std::span<const float> b(vectors.data() + i_b * dim_, dim_);
+
+  // Score s = ⟨x, B⟩ − ⟨x, A⟩; median-cut for ~50/50 sides.
+  struct Scored {
+    float s;
+    std::size_t idx;  // global vector index
+  };
+  std::vector<Scored> scored;
+  scored.reserve(members.size());
+  for (std::size_t mi : members) {
+    const std::span<const float> x(vectors.data() + mi * dim_, dim_);
+    scored.push_back({dot(x, b) - dot(x, a), mi});
+  }
+  std::sort(scored.begin(), scored.end(), [](const Scored& u, const Scored& v) {
+    if (u.s != v.s) {
+      return u.s < v.s;
+    }
+    return u.idx < v.idx;
+  });
+
+  const std::size_t n = scored.size();
+  const std::size_t n0 = n / 2;  // lower ⌊N/2⌋ → side 0; upper ⌈N/2⌉ → side 1
 
   const std::size_t j_new = num_buckets_;
   grow_one_bucket();
 
-  // Rebuild sums/counts for j and j_new from final assignment.
   float* s0 = sums_.data() + j * dim_;
   float* s1 = sums_.data() + j_new * dim_;
   std::fill(s0, s0 + dim_, 0.0f);
@@ -257,10 +236,10 @@ void ClusterCentroids::split_bucket(std::size_t j, std::span<const float> vector
   counts_[j] = 0;
   counts_[j_new] = 0;
 
-  for (std::size_t m = 0; m < members.size(); ++m) {
-    const std::size_t i = members[m];
+  for (std::size_t m = 0; m < n; ++m) {
+    const std::size_t i = scored[m].idx;
     const float* x = vectors.data() + i * dim_;
-    if (side[m] == 0) {
+    if (m < n0) {
       cell_keys[i] = static_cast<std::uint64_t>(j);
       for (std::size_t d = 0; d < dim_; ++d) {
         s0[d] += x[d];

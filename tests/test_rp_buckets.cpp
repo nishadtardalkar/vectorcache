@@ -129,6 +129,43 @@ TEST(ClusterBucketsTest, AssignAndUpdateMatchesBatchMean) {
   EXPECT_NEAR(dot(cc.centroid(j), mean), 1.0f, 1e-5f);
 }
 
+TEST(ClusterBucketsTest, SplitMedianBalanced) {
+  const std::size_t dim = 8;
+  index::ClusterCentroids cc(dim);
+  std::vector<float> vectors;
+  std::vector<std::uint64_t> keys;
+
+  // Near-duplicates along axis 0 (with a slight axis-1 tilt so A/B are distinct).
+  const std::size_t n = 8;
+  for (std::size_t i = 0; i < n; ++i) {
+    std::vector<float> v(dim, 0.0f);
+    v[0] = 1.0f;
+    v[1] = 0.05f * static_cast<float>(static_cast<int>(i) - 3);
+    double energy = 0.0;
+    for (float x : v) {
+      energy += static_cast<double>(x) * static_cast<double>(x);
+    }
+    const float inv = static_cast<float>(1.0 / std::sqrt(energy));
+    for (float& x : v) {
+      x *= inv;
+    }
+    keys.push_back(cc.assign_and_update(v));
+    vectors.insert(vectors.end(), v.begin(), v.end());
+  }
+
+  EXPECT_EQ(cc.num_buckets(), 1u);
+  EXPECT_EQ(cc.count(0), n);
+  cc.split_bucket(0, vectors, keys);
+
+  EXPECT_EQ(cc.num_buckets(), 2u);
+  const std::size_t n0 = cc.count(0);
+  const std::size_t n1 = cc.count(1);
+  EXPECT_EQ(n0 + n1, n);
+  EXPECT_LE(n0 > n1 ? n0 - n1 : n1 - n0, 1u);
+  EXPECT_NEAR(std::sqrt(dot(cc.centroid(0), cc.centroid(0))), 1.0f, 1e-5f);
+  EXPECT_NEAR(std::sqrt(dot(cc.centroid(1), cc.centroid(1))), 1.0f, 1e-5f);
+}
+
 TEST(ClusterBucketsTest, SplitGrowsAndCapsCount) {
   const std::size_t dim = 4;
   index::ClusterCentroids cc(dim);
