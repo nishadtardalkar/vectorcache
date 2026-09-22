@@ -320,6 +320,10 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
         << "\n";
     out << "cpuid_avx2=" << avx2 << " cpuid_avx512f=" << avx512f << " cpuid_avx512bw=" << avx512bw
         << " cpuid_avx512vbmi=" << avx512vbmi << " cpuid_avx512vnni=" << avx512vnni << "\n";
+    if (avx512vnni && !avx512vbmi) {
+      out << "vnni_note=AVX512VNNI present but AVX512VBMI missing; "
+             "vector-major VNNI path requires VBMI (vpermb). Using AVX2 PERM0 SIMD.\n";
+    }
   } else {
     out << "leaf7_ok=0 (CPUID leaf 7 unavailable)\n";
   }

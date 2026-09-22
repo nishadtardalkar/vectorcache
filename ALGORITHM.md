@@ -37,7 +37,7 @@ Flat approximate nearest-neighbor search matching turbovec's TurboQuant core (no
 - Bit-plane packed codes → blocked layout
 - x86 without AVX-512 VNNI: FAISS `PERM0` hi/lo nibble interleave
 - x86 with AVX-512 VNNI+VBMI: vector-major units of 4 byte-groups × 32 vectors
-- Search dispatch: AVX-512 VNNI (`vpermb`+`vpdpbusd`) on vector-major when available; else AVX2 PERM0 FastScan; else scalar `read_code`
+- Search dispatch: AVX-512 VNNI (`vpermb`+`vpdpbusd`) on vector-major when VNNI+VBMI available; else AVX2 PERM0 FastScan (`vpshufb`); else scalar `read_code`
 
 ## Sources
 
