@@ -182,7 +182,8 @@ TEST(EngineTest, IngestWithoutFinalizeThenFinalizeBuckets) {
         split = false;
         for (std::size_t j = 0; j < centroids.num_buckets(); ++j) {
           if (centroids.count(j) > 1) {
-            centroids.split_bucket(j, rotated, grow_keys);
+            centroids.split_bucket(j, rotated, grow_keys, /*lloyd_iters=*/0,
+                                   /*steal_neighbors=*/0);
             split = true;
             break;
           }

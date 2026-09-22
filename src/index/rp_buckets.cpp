@@ -150,8 +150,98 @@ std::uint64_t ClusterCentroids::assign_and_update(std::span<const float> x) {
   return key;
 }
 
+std::size_t ClusterCentroids::assign_among(std::span<const float> x,
+                                           std::span<const std::size_t> candidates) const {
+  if (candidates.empty()) {
+    throw Error("ClusterCentroids::assign_among: empty candidates");
+  }
+  std::size_t best = 0;
+  float best_ip = ip_centroid(candidates[0], x);
+  for (std::size_t c = 1; c < candidates.size(); ++c) {
+    const float ip = ip_centroid(candidates[c], x);
+    if (ip > best_ip) {
+      best_ip = ip;
+      best = c;
+    }
+  }
+  return best;
+}
+
+void ClusterCentroids::rebuild_sums_for_buckets(std::span<const float> vectors,
+                                                std::span<const std::uint64_t> cell_keys,
+                                                std::span<const std::size_t> buckets) {
+  for (std::size_t b : buckets) {
+    float* s = sums_.data() + b * dim_;
+    std::fill(s, s + dim_, 0.0f);
+    counts_[b] = 0;
+  }
+  // Membership scan once; accumulate only for requested buckets.
+  for (std::size_t i = 0; i < cell_keys.size(); ++i) {
+    const std::size_t key = static_cast<std::size_t>(cell_keys[i]);
+    bool wanted = false;
+    for (std::size_t b : buckets) {
+      if (b == key) {
+        wanted = true;
+        break;
+      }
+    }
+    if (!wanted) {
+      continue;
+    }
+    const float* x = vectors.data() + i * dim_;
+    float* s = sums_.data() + key * dim_;
+    for (std::size_t d = 0; d < dim_; ++d) {
+      s[d] += x[d];
+    }
+    ++counts_[key];
+  }
+  for (std::size_t b : buckets) {
+    normalize_centroid(b);
+  }
+}
+
+std::vector<std::size_t> ClusterCentroids::select_neighbor_buckets(
+    std::size_t j, std::size_t j_new, std::size_t steal_neighbors) const {
+  if (steal_neighbors == 0 || num_buckets_ <= 2) {
+    return {};
+  }
+  struct Scored {
+    float score;
+    std::size_t idx;
+  };
+  std::vector<Scored> scored;
+  scored.reserve(num_buckets_ >= 2 ? num_buckets_ - 2 : 0);
+  for (std::size_t n = 0; n < num_buckets_; ++n) {
+    if (n == j || n == j_new) {
+      continue;
+    }
+    const float ip_j = dot(centroid(n), centroid(j));
+    const float ip_new = dot(centroid(n), centroid(j_new));
+    scored.push_back({std::max(ip_j, ip_new), n});
+  }
+  const std::size_t take = std::min(steal_neighbors, scored.size());
+  if (take == 0) {
+    return {};
+  }
+  std::partial_sort(scored.begin(), scored.begin() + static_cast<std::ptrdiff_t>(take),
+                    scored.end(),
+                    [](const Scored& a, const Scored& b) {
+                      if (a.score != b.score) {
+                        return a.score > b.score;
+                      }
+                      return a.idx < b.idx;
+                    });
+  std::vector<std::size_t> out;
+  out.reserve(take);
+  for (std::size_t i = 0; i < take; ++i) {
+    out.push_back(scored[i].idx);
+  }
+  return out;
+}
+
 void ClusterCentroids::split_bucket(std::size_t j, std::span<const float> vectors,
-                                    std::span<std::uint64_t> cell_keys) {
+                                    std::span<std::uint64_t> cell_keys, std::size_t lloyd_iters,
+                                    std::size_t steal_neighbors) {
   if (j >= num_buckets_) {
     throw Error("ClusterCentroids::split_bucket: index out of range");
   }
@@ -256,6 +346,80 @@ void ClusterCentroids::split_bucket(std::size_t j, std::span<const float> vector
 
   normalize_centroid(j);
   normalize_centroid(j_new);
+
+  if (counts_[j] < 1 || counts_[j_new] < 1) {
+    return;
+  }
+
+  const std::size_t children_arr[2] = {j, j_new};
+  const std::span<const std::size_t> children(children_arr, 2);
+
+  // Local Lloyd: reassign children members among {j, j_new}.
+  for (std::size_t iter = 0; iter < lloyd_iters; ++iter) {
+    for (std::size_t i = 0; i < cell_keys.size(); ++i) {
+      const std::size_t key = static_cast<std::size_t>(cell_keys[i]);
+      if (key != j && key != j_new) {
+        continue;
+      }
+      const std::span<const float> x(vectors.data() + i * dim_, dim_);
+      const std::size_t best = assign_among(x, children);
+      cell_keys[i] = static_cast<std::uint64_t>(children[best]);
+    }
+    rebuild_sums_for_buckets(vectors, cell_keys, children);
+    if (counts_[j] < 1 || counts_[j_new] < 1) {
+      return;
+    }
+  }
+
+  // Neighbor steal: reassign members of S among S only.
+  auto neighbors = select_neighbor_buckets(j, j_new, steal_neighbors);
+  if (neighbors.empty()) {
+    return;
+  }
+
+  std::vector<std::size_t> S;
+  S.reserve(2 + neighbors.size());
+  S.push_back(j);
+  S.push_back(j_new);
+  S.insert(S.end(), neighbors.begin(), neighbors.end());
+
+  auto in_S = [&](std::size_t key) {
+    for (std::size_t b : S) {
+      if (b == key) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (std::size_t i = 0; i < cell_keys.size(); ++i) {
+    const std::size_t old_key = static_cast<std::size_t>(cell_keys[i]);
+    if (!in_S(old_key)) {
+      continue;
+    }
+    const std::span<const float> x(vectors.data() + i * dim_, dim_);
+    const std::size_t best = assign_among(x, S);
+    const std::size_t new_key = S[best];
+    if (new_key == old_key) {
+      continue;
+    }
+    const float* xv = vectors.data() + i * dim_;
+    float* s_old = sums_.data() + old_key * dim_;
+    float* s_new = sums_.data() + new_key * dim_;
+    for (std::size_t d = 0; d < dim_; ++d) {
+      s_old[d] -= xv[d];
+      s_new[d] += xv[d];
+    }
+    if (counts_[old_key] > 0) {
+      --counts_[old_key];
+    }
+    ++counts_[new_key];
+    cell_keys[i] = static_cast<std::uint64_t>(new_key);
+  }
+
+  for (std::size_t b : S) {
+    normalize_centroid(b);
+  }
 }
 
 BucketIndex BucketIndex::build(std::span<const std::uint64_t> sorted_keys,

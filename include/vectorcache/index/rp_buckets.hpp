@@ -40,15 +40,25 @@ class ClusterCentroids {
   /// Nearest centroid without updating (Voronoi assign).
   std::uint64_t nearest(std::span<const float> x) const;
 
-  /// Binary-split cell `j` via diametral median cut on its members. Grows `num_buckets` by 1.
-  /// `vectors` is row-major N * dim; `cell_keys` length N is updated for members of `j`.
+  /// Binary-split cell `j` via diametral median cut, then local Lloyd on the two children
+  /// and neighbor steal within a top-M centroid set. Grows `num_buckets` by 1.
+  /// `vectors` is row-major N * dim; `cell_keys` length N is updated for affected members.
   void split_bucket(std::size_t j, std::span<const float> vectors,
-                    std::span<std::uint64_t> cell_keys);
+                    std::span<std::uint64_t> cell_keys, std::size_t lloyd_iters = 1,
+                    std::size_t steal_neighbors = 4);
 
  private:
   void normalize_centroid(std::size_t j);
   float ip_centroid(std::size_t j, std::span<const float> x) const;
   void grow_one_bucket();
+  /// Argmax IP among `candidates` (non-empty). Returns candidate index into `candidates`.
+  std::size_t assign_among(std::span<const float> x,
+                           std::span<const std::size_t> candidates) const;
+  void rebuild_sums_for_buckets(std::span<const float> vectors,
+                                std::span<const std::uint64_t> cell_keys,
+                                std::span<const std::size_t> buckets);
+  std::vector<std::size_t> select_neighbor_buckets(std::size_t j, std::size_t j_new,
+                                                   std::size_t steal_neighbors) const;
 
   std::size_t num_buckets_ = 0;
   std::size_t dim_ = 0;

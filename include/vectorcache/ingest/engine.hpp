@@ -26,6 +26,10 @@ struct BucketParams {
   /// Split a cell when its online count exceeds this (must be >= 1).
   std::size_t max_bucket_items = 1024;
   std::uint64_t bucket_seed = 0;  // reserved; first centroid is data-driven
+  /// Local Lloyd iterations on the two children after a median split.
+  std::size_t split_lloyd_iters = 1;
+  /// Top-M neighbor buckets considered for post-split steal (0 disables).
+  std::size_t steal_neighbors = 4;
 };
 
 class IngestionEngine {

@@ -136,7 +136,8 @@ void IngestionEngine::maybe_split(std::vector<std::uint64_t>& cell_keys) {
     grew = false;
     for (std::size_t j = 0; j < centroids_.num_buckets(); ++j) {
       if (centroids_.count(j) > max_items) {
-        centroids_.split_bucket(j, vectors, keys);
+        centroids_.split_bucket(j, vectors, keys, bucket_params_.split_lloyd_iters,
+                                bucket_params_.steal_neighbors);
         grew = true;
         break;
       }

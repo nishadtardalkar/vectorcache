@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <tuple>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -56,6 +57,26 @@ std::vector<float> unit_axis(std::size_t dim, std::size_t axis) {
   return v;
 }
 
+/// L2-normalize a vector in place (assumes non-zero).
+void normalize_inplace(std::vector<float>& v) {
+  double energy = 0.0;
+  for (float x : v) {
+    energy += static_cast<double>(x) * static_cast<double>(x);
+  }
+  const float inv = static_cast<float>(1.0 / std::sqrt(energy));
+  for (float& x : v) {
+    x *= inv;
+  }
+}
+
+std::vector<float> unit2(std::size_t dim, float a0, float a1) {
+  std::vector<float> v(dim, 0.0f);
+  v[0] = a0;
+  v[1] = a1;
+  normalize_inplace(v);
+  return v;
+}
+
 /// Grow centroids to at least `min_buckets` by assigning distinct axes and splitting at max=1.
 void grow_buckets(index::ClusterCentroids& cc, std::size_t min_buckets,
                   std::vector<float>& vectors, std::vector<std::uint64_t>& keys) {
@@ -70,7 +91,7 @@ void grow_buckets(index::ClusterCentroids& cc, std::size_t min_buckets,
       split = false;
       for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
         if (cc.count(j) > 1) {
-          cc.split_bucket(j, vectors, keys);
+          cc.split_bucket(j, vectors, keys, /*lloyd_iters=*/0, /*steal_neighbors=*/0);
           split = true;
           break;
         }
@@ -118,14 +139,7 @@ TEST(ClusterBucketsTest, AssignAndUpdateMatchesBatchMean) {
   for (std::size_t d = 0; d < dim; ++d) {
     mean[d] = 0.5f * (x0[d] + x1[d]);
   }
-  double energy = 0.0;
-  for (float v : mean) {
-    energy += static_cast<double>(v) * static_cast<double>(v);
-  }
-  const float inv = static_cast<float>(1.0 / std::sqrt(energy));
-  for (float& v : mean) {
-    v *= inv;
-  }
+  normalize_inplace(mean);
   EXPECT_NEAR(dot(cc.centroid(j), mean), 1.0f, 1e-5f);
 }
 
@@ -138,24 +152,15 @@ TEST(ClusterBucketsTest, SplitMedianBalanced) {
   // Near-duplicates along axis 0 (with a slight axis-1 tilt so A/B are distinct).
   const std::size_t n = 8;
   for (std::size_t i = 0; i < n; ++i) {
-    std::vector<float> v(dim, 0.0f);
-    v[0] = 1.0f;
-    v[1] = 0.05f * static_cast<float>(static_cast<int>(i) - 3);
-    double energy = 0.0;
-    for (float x : v) {
-      energy += static_cast<double>(x) * static_cast<double>(x);
-    }
-    const float inv = static_cast<float>(1.0 / std::sqrt(energy));
-    for (float& x : v) {
-      x *= inv;
-    }
+    auto v = unit2(dim, 1.0f, 0.05f * static_cast<float>(static_cast<int>(i) - 3));
     keys.push_back(cc.assign_and_update(v));
     vectors.insert(vectors.end(), v.begin(), v.end());
   }
 
   EXPECT_EQ(cc.num_buckets(), 1u);
   EXPECT_EQ(cc.count(0), n);
-  cc.split_bucket(0, vectors, keys);
+  // Median init only — no Lloyd/steal so size balance is meaningful.
+  cc.split_bucket(0, vectors, keys, /*lloyd_iters=*/0, /*steal_neighbors=*/0);
 
   EXPECT_EQ(cc.num_buckets(), 2u);
   const std::size_t n0 = cc.count(0);
@@ -164,6 +169,142 @@ TEST(ClusterBucketsTest, SplitMedianBalanced) {
   EXPECT_LE(n0 > n1 ? n0 - n1 : n1 - n0, 1u);
   EXPECT_NEAR(std::sqrt(dot(cc.centroid(0), cc.centroid(0))), 1.0f, 1e-5f);
   EXPECT_NEAR(std::sqrt(dot(cc.centroid(1), cc.centroid(1))), 1.0f, 1e-5f);
+}
+
+TEST(ClusterBucketsTest, SplitLocalVoronoiReassigns) {
+  const std::size_t dim = 8;
+  // Asymmetric tilts: after a median cut, the near-cut point on the sparse side is closer
+  // to the dense-side child centroid; Lloyd should move it.
+  const std::vector<float> tilts = {-1.0f, -0.95f, -0.9f, -0.05f, 0.2f, 0.25f, 0.3f, 0.35f};
+
+  auto run_split = [&](std::size_t lloyd) {
+    index::ClusterCentroids cc(dim);
+    std::vector<float> vectors;
+    std::vector<std::uint64_t> keys;
+    for (float t : tilts) {
+      auto v = unit2(dim, 1.0f, t);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+    }
+    cc.split_bucket(0, vectors, keys, lloyd, /*steal_neighbors=*/0);
+    return std::make_tuple(std::move(cc), std::move(vectors), std::move(keys));
+  };
+
+  auto [cc0, vec0, keys0] = run_split(0);
+  auto [cc1, vec1, keys1] = run_split(1);
+  ASSERT_EQ(cc0.num_buckets(), 2u);
+  ASSERT_EQ(cc1.num_buckets(), 2u);
+
+  // With Lloyd, every member prefers its assigned child among {0,1}.
+  for (std::size_t i = 0; i < keys1.size(); ++i) {
+    const std::span<const float> x(vec1.data() + i * dim, dim);
+    const std::size_t k = static_cast<std::size_t>(keys1[i]);
+    const std::size_t other = k == 0 ? 1 : 0;
+    EXPECT_GE(dot(cc1.centroid(k), x), dot(cc1.centroid(other), x));
+  }
+
+  // Median-only leaves at least one point that violates the two-child Voronoi rule.
+  bool median_violation = false;
+  for (std::size_t i = 0; i < keys0.size(); ++i) {
+    const std::span<const float> x(vec0.data() + i * dim, dim);
+    const std::size_t k = static_cast<std::size_t>(keys0[i]);
+    const std::size_t other = k == 0 ? 1 : 0;
+    if (dot(cc0.centroid(k), x) < dot(cc0.centroid(other), x)) {
+      median_violation = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(median_violation);
+  // And Lloyd assignment differs from pure median for that geometry.
+  EXPECT_NE(keys0, keys1);
+}
+
+TEST(ClusterBucketsTest, SplitNeighborStealMovesBoundary) {
+  const std::size_t dim = 4;
+
+  auto run = [&](std::size_t steal, std::uint64_t* out_bkey, std::uint64_t* out_after) {
+    index::ClusterCentroids cc(dim);
+    std::vector<float> vectors;
+    std::vector<std::uint64_t> keys;
+
+    for (std::size_t a = 0; a < 3; ++a) {
+      auto v = unit_axis(dim, a);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+      for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
+        if (cc.count(j) > 1) {
+          cc.split_bucket(j, vectors, keys, /*lloyd_iters=*/0, /*steal_neighbors=*/0);
+          break;
+        }
+      }
+    }
+    if (cc.num_buckets() != 3) {
+      *out_bkey = 0;
+      *out_after = 0;
+      return false;
+    }
+
+    auto find_axis = [&](std::size_t axis) {
+      auto ax = unit_axis(dim, axis);
+      std::size_t best = 0;
+      float best_ip = -2.0f;
+      for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
+        const float ip = dot(cc.centroid(j), ax);
+        if (ip > best_ip) {
+          best_ip = ip;
+          best = j;
+        }
+      }
+      return best;
+    };
+    const std::size_t e0 = find_axis(0);
+    const std::size_t e1 = find_axis(1);
+    if (e0 == e1) {
+      return false;
+    }
+
+    // Anchor e1 near the axis so a later boundary point cannot dominate ĉ_e1.
+    for (int i = 0; i < 6; ++i) {
+      auto v = unit_axis(dim, 1);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+    }
+
+    // Boundary leans e1 (lives in e1) but is closer to a +tilt e0-child after split.
+    auto boundary = unit2(dim, 0.90f, 0.95f);
+    keys.push_back(cc.assign_and_update(boundary));
+    vectors.insert(vectors.end(), boundary.begin(), boundary.end());
+    const std::size_t bidx = keys.size() - 1;
+    if (keys[bidx] != static_cast<std::uint64_t>(e1)) {
+      return false;
+    }
+
+    // Overcrowd e0 along a diametral tilt; positive half becomes the attractor.
+    for (int i = 0; i < 12; ++i) {
+      const float t = -0.5f + 0.1f * static_cast<float>(i);
+      auto v = unit2(dim, 1.0f, t);
+      keys.push_back(cc.assign_and_update(v));
+      vectors.insert(vectors.end(), v.begin(), v.end());
+    }
+    if (cc.count(e0) <= 2 || keys[bidx] != static_cast<std::uint64_t>(e1)) {
+      return false;
+    }
+
+    cc.split_bucket(e0, vectors, keys, /*lloyd_iters=*/1, steal);
+    *out_bkey = static_cast<std::uint64_t>(e1);
+    *out_after = keys[bidx];
+    return true;
+  };
+
+  std::uint64_t bkey0 = 0;
+  std::uint64_t after0 = 0;
+  ASSERT_TRUE(run(/*steal=*/0, &bkey0, &after0));
+  EXPECT_EQ(after0, bkey0);
+
+  std::uint64_t bkey1 = 0;
+  std::uint64_t after1 = 0;
+  ASSERT_TRUE(run(/*steal=*/4, &bkey1, &after1));
+  EXPECT_NE(after1, bkey1);
 }
 
 TEST(ClusterBucketsTest, SplitGrowsAndCapsCount) {
@@ -178,7 +319,8 @@ TEST(ClusterBucketsTest, SplitGrowsAndCapsCount) {
     keys.push_back(cc.assign_and_update(v));
     vectors.insert(vectors.end(), v.begin(), v.end());
     if (cc.count(static_cast<std::size_t>(keys.back())) > 1) {
-      cc.split_bucket(static_cast<std::size_t>(keys.back()), vectors, keys);
+      cc.split_bucket(static_cast<std::size_t>(keys.back()), vectors, keys,
+                      /*lloyd_iters=*/0, /*steal_neighbors=*/0);
     }
   }
   // Force splits until every cell has count <= 1.
@@ -187,7 +329,7 @@ TEST(ClusterBucketsTest, SplitGrowsAndCapsCount) {
     split = false;
     for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
       if (cc.count(j) > 1) {
-        cc.split_bucket(j, vectors, keys);
+        cc.split_bucket(j, vectors, keys, /*lloyd_iters=*/0, /*steal_neighbors=*/0);
         split = true;
         break;
       }
@@ -219,7 +361,7 @@ TEST(ClusterBucketsTest, ProbeCoverageStopsAtFraction) {
         split = false;
         for (std::size_t j = 0; j < cc.num_buckets(); ++j) {
           if (cc.count(j) > 2) {
-            cc.split_bucket(j, vectors, keys);
+            cc.split_bucket(j, vectors, keys, /*lloyd_iters=*/0, /*steal_neighbors=*/0);
             split = true;
             break;
           }
