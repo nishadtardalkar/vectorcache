@@ -5,6 +5,10 @@
 #include <cstring>
 #include <mutex>
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(__x86_64__))
+#include <intrin.h>
+#endif
+
 namespace vectorcache {
 namespace {
 
@@ -136,31 +140,50 @@ BlockedGeometry blocked_geometry(std::size_t n_vectors, std::size_t bits, std::s
 }
 
 bool use_vector_major() {
-  static int cached = -1;
-  if (cached >= 0) {
-    return cached != 0;
-  }
   if (const char* v = std::getenv("TURBOVEC_NO_VECTOR_MAJOR"); v && v[0] != '0') {
-    cached = 0;
     return false;
   }
   if (const char* v = std::getenv("TURBOVEC_NO_VNNI"); v && v[0] != '0') {
-    cached = 0;
     return false;
+  }
+  static int cpu_ok = -1;
+  if (cpu_ok >= 0) {
+    return cpu_ok != 0;
   }
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__GNUC__) || defined(__clang__)
-  cached = (__builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vnni") &&
+  cpu_ok = (__builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("avx512vnni") &&
             __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512f"))
                ? 1
                : 0;
+#elif defined(_MSC_VER)
+  int info[4] = {};
+  __cpuid(info, 0);
+  if (info[0] >= 7) {
+    __cpuidex(info, 1, 0);
+    const bool osxsave = (info[2] & (1 << 27)) != 0;
+    unsigned long long xcr0 = 0;
+    if (osxsave) {
+      xcr0 = _xgetbv(0);
+    }
+    // XCR0 bits 1,2,5,6,7: XMM, YMM, opmask, ZMM_hi256, ZMM_hi16
+    const bool zmm_ok = (xcr0 & 0xE6) == 0xE6;
+    __cpuidex(info, 7, 0);
+    const bool avx512f = (info[1] & (1 << 16)) != 0;
+    const bool avx512bw = (info[1] & (1 << 30)) != 0;
+    const bool avx512vbmi = (info[2] & (1 << 1)) != 0;
+    const bool avx512vnni = (info[2] & (1 << 11)) != 0;
+    cpu_ok = (zmm_ok && avx512f && avx512bw && avx512vbmi && avx512vnni) ? 1 : 0;
+  } else {
+    cpu_ok = 0;
+  }
 #else
-  cached = 0;
+  cpu_ok = 0;
 #endif
 #else
-  cached = 0;
+  cpu_ok = 0;
 #endif
-  return cached != 0;
+  return cpu_ok != 0;
 }
 
 bool vector_major_for([[maybe_unused]] std::size_t bits, std::size_t n_byte_groups) {

@@ -31,6 +31,7 @@ set(VECTORCACHE_SOURCES
   src/pack/pack.cpp
   src/search/search.cpp
   src/search/search_avx2.cpp
+  src/search/search_vnni.cpp
   src/index.cpp
   src/datasets/npy.cpp
   src/datasets/datasets.cpp
@@ -46,14 +47,18 @@ target_compile_features(vectorcache PUBLIC cxx_std_20)
 
 if(MSVC)
   target_compile_options(vectorcache PRIVATE /W4 /arch:AVX2)
+  set_source_files_properties(src/search/search_vnni.cpp PROPERTIES
+    COMPILE_FLAGS "/arch:AVX512")
 else()
   target_compile_options(vectorcache PRIVATE
     -Wall -Wextra
     -mavx2 -mfma
   )
-  # Compile AVX2 search TU with broader ISA; runtime dispatch selects path.
+  # Compile SIMD search TUs with broader ISA; runtime dispatch selects path.
   set_source_files_properties(src/search/search_avx2.cpp PROPERTIES
     COMPILE_FLAGS "-mavx2 -mfma")
+  set_source_files_properties(src/search/search_vnni.cpp PROPERTIES
+    COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vbmi -mavx512vnni -mfma")
 endif()
 
 if(VECTORCACHE_OPENMP)
@@ -141,6 +146,7 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_codebook.cpp
     tests/test_pack.cpp
     tests/test_index.cpp
+    tests/test_search_vnni.cpp
   )
   target_link_libraries(vectorcache_tests PRIVATE vectorcache GTest::gtest)
   include(GoogleTest)

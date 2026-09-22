@@ -9,6 +9,7 @@
 #include "vectorcache/encode/encode.hpp"
 #include "vectorcache/pack/pack.hpp"
 #include "vectorcache/search/search_avx2.hpp"
+#include "vectorcache/search/search_vnni.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(_MSC_VER)
@@ -240,7 +241,13 @@ SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::s
     float heap_min = 0.f;
     std::size_t heap_mi = 0;
 #if defined(__x86_64__) || defined(_M_X64)
-    if (use_avx2) {
+    if (use_vm) {
+      auto split = split_lut_for_vnni(lut.uint8_luts, n_byte_groups);
+      QueryLutView view{split.data(), lut.scale, lut.bias};
+      score_query_vnni(view, blocked_codes, scales, n_byte_groups, n_vectors, n_blocks, effective_k,
+                       heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
+                       bias_corrs[static_cast<std::size_t>(qi)]);
+    } else if (use_avx2) {
       QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
       score_query_avx2_perm0(view, blocked_codes, scales, n_byte_groups, n_vectors, n_blocks,
                              effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
