@@ -62,6 +62,21 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint64_t> id_map = {},
                              std::span<const std::size_t> query_indices = {});
 
+/// Continue scoring into existing per-query top-k heaps (length `prep.nq`, indexed by global qi).
+/// Only `query_indices` are updated. Heaps may already be partially filled.
+/// When `id_map` is non-empty, pushes `id_map[local]` (required for multi-bucket IVF).
+void score_prepared_into(const PreparedQueries& prep, std::size_t k,
+                         std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                         std::span<const float> scales, std::span<const std::uint64_t> id_map,
+                         std::span<const std::size_t> query_indices, float* heap_s,
+                         std::uint64_t* heap_i, std::size_t* heap_sz, float* heap_min,
+                         std::size_t* heap_mi);
+
+/// Sort unordered top-k heaps (min-heap layout) into descending SearchResults.
+void heaps_to_search_results(SearchResults& out, std::size_t nq, std::size_t k,
+                             const float* heap_s, const std::uint64_t* heap_i,
+                             const std::size_t* heap_sz);
+
 SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::size_t dim,
                           std::size_t k, const Rotation& rotation,
                           std::span<const float> centroids, std::size_t bits,

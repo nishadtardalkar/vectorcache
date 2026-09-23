@@ -150,6 +150,7 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_index.cpp
     tests/test_search_vnni.cpp
     tests/test_kmeans_buckets.cpp
+    tests/test_topk_heap.cpp
   )
   target_link_libraries(vectorcache_tests PRIVATE vectorcache GTest::gtest)
   include(GoogleTest)

@@ -460,45 +460,23 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
     }
   }
 
-  std::vector<SearchResults> locals(nq);
+  const std::size_t kk = merged.k;
+  std::vector<float> heap_s(nq * kk, 0.f);
+  std::vector<std::uint64_t> heap_i(nq * kk, 0);
+  std::vector<std::size_t> heap_sz(nq, 0);
+  std::vector<float> heap_min(nq, 0.f);
+  std::vector<std::size_t> heap_mi(nq, 0);
+
   for (std::size_t bi = 0; bi < nc; ++bi) {
     const auto& qis = queries_for_bucket[bi];
     if (qis.empty()) continue;
     const Bucket& b = buckets_[bi];
-    SearchResults partial =
-        score_prepared(prep, merged.k, b.blocked, b.n_blocks, b.scales, b.ids, qis);
-    if (partial.k == 0) continue;
-
-    for (std::size_t i = 0; i < qis.size(); ++i) {
-      const std::size_t qi = qis[i];
-      SearchResults one;
-      one.nq = 1;
-      one.k = partial.k;
-      one.scores.assign(partial.scores.begin() + static_cast<std::ptrdiff_t>(i * partial.k),
-                        partial.scores.begin() + static_cast<std::ptrdiff_t>((i + 1) * partial.k));
-      one.ids.assign(partial.ids.begin() + static_cast<std::ptrdiff_t>(i * partial.k),
-                     partial.ids.begin() + static_cast<std::ptrdiff_t>((i + 1) * partial.k));
-      if (locals[qi].nq == 0) {
-        locals[qi] = std::move(one);
-      } else {
-        if (locals[qi].k < merged.k) {
-          locals[qi].scores.resize(merged.k, 0.f);
-          locals[qi].ids.resize(merged.k, 0);
-          locals[qi].k = merged.k;
-        }
-        merge_search_results(locals[qi], one);
-      }
-    }
+    if (b.count == 0) continue;
+    score_prepared_into(prep, kk, b.blocked, b.n_blocks, b.scales, b.ids, qis, heap_s.data(),
+                        heap_i.data(), heap_sz.data(), heap_min.data(), heap_mi.data());
   }
 
-  for (std::size_t qi = 0; qi < nq; ++qi) {
-    const std::size_t kk = std::min(merged.k, locals[qi].k);
-    for (std::size_t j = 0; j < kk; ++j) {
-      merged.scores[qi * merged.k + j] = locals[qi].scores[j];
-      merged.ids[qi * merged.k + j] = locals[qi].ids[j];
-    }
-  }
-
+  heaps_to_search_results(merged, nq, kk, heap_s.data(), heap_i.data(), heap_sz.data());
   return merged;
 }
 

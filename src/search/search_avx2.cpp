@@ -5,6 +5,7 @@
 
 #include "vectorcache/constants.hpp"
 #include "vectorcache/pack/pack.hpp"
+#include "vectorcache/search/topk_heap.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -12,37 +13,6 @@
 
 namespace vectorcache {
 namespace {
-
-void heap_push_or_replace(float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
-                          float& heap_min, std::size_t& heap_mi, std::size_t k, float score,
-                          std::uint64_t id) {
-  if (heap_sz < k) {
-    heap_s[heap_sz] = score;
-    heap_i[heap_sz] = id;
-    ++heap_sz;
-    if (heap_sz == k) {
-      heap_min = heap_s[0];
-      heap_mi = 0;
-      for (std::size_t i = 1; i < k; ++i) {
-        if (heap_s[i] < heap_min) {
-          heap_min = heap_s[i];
-          heap_mi = i;
-        }
-      }
-    }
-  } else if (score > heap_min) {
-    heap_s[heap_mi] = score;
-    heap_i[heap_mi] = id;
-    heap_min = heap_s[0];
-    heap_mi = 0;
-    for (std::size_t i = 1; i < k; ++i) {
-      if (heap_s[i] < heap_min) {
-        heap_min = heap_s[i];
-        heap_mi = i;
-      }
-    }
-  }
-}
 
 #if defined(__x86_64__) || defined(_M_X64)
 
@@ -77,7 +47,8 @@ void score_query_avx2_perm0_impl(QueryLutView lut, std::span<const std::uint8_t>
                                  std::span<const float> vec_scales, std::size_t n_byte_groups,
                                  std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                                  float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
-                                 float& heap_min, std::size_t& heap_mi, float bias_corr) {
+                                 float& heap_min, std::size_t& heap_mi, float bias_corr,
+                                 const std::uint64_t* id_map) {
   const __m256i nibble_mask = _mm256_set1_epi8(static_cast<char>(0x0F));
   const __m256 v_scale = _mm256_set1_ps(lut.scale);
   const float bias = lut.bias + bias_corr;
@@ -146,7 +117,7 @@ void score_query_avx2_perm0_impl(QueryLutView lut, std::span<const std::uint8_t>
 
     for (std::size_t lane = 0; lane < end - base_vec; ++lane) {
       heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, block_out[lane],
-                           static_cast<std::uint64_t>(base_vec + lane));
+                           topk_map_id(id_map, base_vec + lane));
     }
   }
 }
@@ -159,10 +130,11 @@ void score_query_avx2_perm0(QueryLutView lut, std::span<const std::uint8_t> bloc
                             std::span<const float> vec_scales, std::size_t n_byte_groups,
                             std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                             float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
-                            float& heap_min, std::size_t& heap_mi, float bias_corr) {
+                            float& heap_min, std::size_t& heap_mi, float bias_corr,
+                            const std::uint64_t* id_map) {
 #if defined(__x86_64__) || defined(_M_X64)
   score_query_avx2_perm0_impl(lut, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k,
-                              heap_s, heap_i, heap_sz, heap_min, heap_mi, bias_corr);
+                              heap_s, heap_i, heap_sz, heap_min, heap_mi, bias_corr, id_map);
 #else
   (void)lut;
   (void)blocked_codes;
@@ -177,6 +149,7 @@ void score_query_avx2_perm0(QueryLutView lut, std::span<const std::uint8_t> bloc
   (void)heap_min;
   (void)heap_mi;
   (void)bias_corr;
+  (void)id_map;
 #endif
 }
 

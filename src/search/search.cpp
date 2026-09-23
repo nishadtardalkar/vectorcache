@@ -13,6 +13,7 @@
 #include "vectorcache/pack/pack.hpp"
 #include "vectorcache/search/search_avx2.hpp"
 #include "vectorcache/search/search_vnni.hpp"
+#include "vectorcache/search/topk_heap.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(_MSC_VER)
@@ -105,42 +106,12 @@ PreparedQueryLut build_query_lut(std::span<const float> q_rot_row, std::span<con
   return out;
 }
 
-void heap_push_or_replace(float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
-                          float& heap_min, std::size_t& heap_mi, std::size_t k, float score,
-                          std::uint64_t id) {
-  if (heap_sz < k) {
-    heap_s[heap_sz] = score;
-    heap_i[heap_sz] = id;
-    ++heap_sz;
-    if (heap_sz == k) {
-      heap_min = heap_s[0];
-      heap_mi = 0;
-      for (std::size_t i = 1; i < k; ++i) {
-        if (heap_s[i] < heap_min || (heap_s[i] == heap_min && heap_i[i] > heap_i[heap_mi])) {
-          heap_min = heap_s[i];
-          heap_mi = i;
-        }
-      }
-    }
-  } else if (score > heap_min) {
-    heap_s[heap_mi] = score;
-    heap_i[heap_mi] = id;
-    heap_min = heap_s[0];
-    heap_mi = 0;
-    for (std::size_t i = 1; i < k; ++i) {
-      if (heap_s[i] < heap_min || (heap_s[i] == heap_min && heap_i[i] > heap_i[heap_mi])) {
-        heap_min = heap_s[i];
-        heap_mi = i;
-      }
-    }
-  }
-}
-
 void score_query_scalar(const PreparedQueryLut& lut, std::span<const std::uint8_t> blocked_codes,
                         std::span<const float> vec_scales, std::size_t bits,
                         std::size_t n_byte_groups, std::size_t n_vectors, std::size_t n_blocks,
                         std::size_t k, float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
-                        float& heap_min, std::size_t& heap_mi, float bias_corr) {
+                        float& heap_min, std::size_t& heap_mi, float bias_corr,
+                        const std::uint64_t* id_map) {
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t base_vec = b * kBlock;
     for (std::size_t lane = 0; lane < kBlock; ++lane) {
@@ -155,7 +126,7 @@ void score_query_scalar(const PreparedQueryLut& lut, std::span<const std::uint8_
       }
       score *= vec_scales[vi];
       heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, score,
-                           static_cast<std::uint64_t>(vi));
+                           topk_map_id(id_map, vi));
     }
   }
 }
@@ -423,7 +394,7 @@ SearchResults score_prepared_perm0(const PreparedQueries& prep, std::size_t effe
       QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
       score_query_avx2_perm0(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks,
                              effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
-                             prep.bias_corrs[gqi]);
+                             prep.bias_corrs[gqi], nullptr);
     } else
 #else
     (void)use_avx2;
@@ -431,7 +402,7 @@ SearchResults score_prepared_perm0(const PreparedQueries& prep, std::size_t effe
     {
       score_query_scalar(lut, blocked_codes, scales, prep.bits, prep.n_byte_groups, n_vectors,
                          n_blocks, effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min,
-                         heap_mi, prep.bias_corrs[gqi]);
+                         heap_mi, prep.bias_corrs[gqi], nullptr);
     }
     write_sorted_topk(out, static_cast<std::size_t>(qi), effective_k, heap_s, heap_i, heap_sz);
   }
@@ -599,6 +570,87 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
   }
   remap_ids(out, id_map);
   return out;
+}
+
+void score_prepared_into(const PreparedQueries& prep, std::size_t k,
+                         std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                         std::span<const float> scales, std::span<const std::uint64_t> id_map,
+                         std::span<const std::size_t> query_indices, float* heap_s,
+                         std::uint64_t* heap_i, std::size_t* heap_sz, float* heap_min,
+                         std::size_t* heap_mi) {
+  if (query_indices.empty()) {
+    throw std::invalid_argument("score_prepared_into requires non-empty query_indices");
+  }
+  for (std::size_t qi : query_indices) {
+    if (qi >= prep.nq) {
+      throw std::out_of_range("score_prepared_into: query_indices out of range");
+    }
+  }
+  const std::size_t n_vectors = scales.size();
+  if (n_vectors == 0 || k == 0) return;
+  if (!id_map.empty() && id_map.size() != n_vectors) {
+    throw std::invalid_argument("id_map size must equal number of vectors in range");
+  }
+  const std::uint64_t* id_ptr = id_map.empty() ? nullptr : id_map.data();
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+  for (int ii = 0; ii < static_cast<int>(query_indices.size()); ++ii) {
+    const std::size_t gqi = query_indices[static_cast<std::size_t>(ii)];
+    float* hs = heap_s + gqi * k;
+    std::uint64_t* hi = heap_i + gqi * k;
+    std::size_t& hsz = heap_sz[gqi];
+    float& hmin = heap_min[gqi];
+    std::size_t& hmi = heap_mi[gqi];
+
+    if (prep.backend == SearchBackendKind::VmPermuteDot) {
+      score_query_permute_dot(prep.pds[gqi], blocked_codes, scales, prep.n_byte_groups, n_vectors,
+                              n_blocks, k, hs, hi, hsz, hmin, hmi, id_ptr);
+    } else if (prep.backend == SearchBackendKind::VmVnni) {
+      QueryLutView view{prep.split_luts[gqi].data(), prep.lut_scales[gqi], prep.lut_biases[gqi]};
+      score_query_vnni(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks, k, hs,
+                       hi, hsz, hmin, hmi, 0.f, id_ptr);
+    } else {
+#if defined(__x86_64__) || defined(_M_X64)
+      if (prep.backend == SearchBackendKind::Avx2) {
+        const auto& lut = prep.luts[gqi];
+        QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
+        score_query_avx2_perm0(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks,
+                               k, hs, hi, hsz, hmin, hmi, prep.bias_corrs[gqi], id_ptr);
+      } else
+#endif
+      {
+        score_query_scalar(prep.luts[gqi], blocked_codes, scales, prep.bits, prep.n_byte_groups,
+                           n_vectors, n_blocks, k, hs, hi, hsz, hmin, hmi, prep.bias_corrs[gqi],
+                           id_ptr);
+      }
+    }
+  }
+}
+
+void heaps_to_search_results(SearchResults& out, std::size_t nq, std::size_t k,
+                             const float* heap_s, const std::uint64_t* heap_i,
+                             const std::size_t* heap_sz) {
+  out.nq = nq;
+  out.k = k;
+  out.scores.assign(nq * k, 0.f);
+  out.ids.assign(nq * k, 0);
+  for (std::size_t qi = 0; qi < nq; ++qi) {
+    const std::size_t hsz = heap_sz[qi];
+    std::vector<std::size_t> order(hsz);
+    for (std::size_t i = 0; i < hsz; ++i) order[i] = i;
+    const float* hs = heap_s + qi * k;
+    const std::uint64_t* hi = heap_i + qi * k;
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+      if (hs[a] != hs[b]) return hs[a] > hs[b];
+      return hi[a] < hi[b];
+    });
+    for (std::size_t i = 0; i < hsz; ++i) {
+      out.scores[qi * k + i] = hs[order[i]];
+      out.ids[qi * k + i] = hi[order[i]];
+    }
+  }
 }
 
 SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::size_t dim,
