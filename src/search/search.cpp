@@ -529,6 +529,31 @@ PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, 
   return prep;
 }
 
+PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi) {
+  if (qi >= prep.nq) {
+    throw std::out_of_range("prepared_query_at: qi out of range");
+  }
+  PreparedQueries one;
+  one.nq = 1;
+  one.dim = prep.dim;
+  one.bits = prep.bits;
+  one.n_byte_groups = prep.n_byte_groups;
+  one.backend = prep.backend;
+  if (!prep.q_rot.empty()) {
+    one.q_rot.assign(prep.q_rot.begin() + static_cast<std::ptrdiff_t>(qi * prep.dim),
+                     prep.q_rot.begin() + static_cast<std::ptrdiff_t>((qi + 1) * prep.dim));
+  }
+  if (!prep.bias_corrs.empty()) one.bias_corrs = {prep.bias_corrs[qi]};
+  if (!prep.pds.empty()) one.pds = {prep.pds[qi]};
+  if (!prep.split_luts.empty()) {
+    one.split_luts = {prep.split_luts[qi]};
+    one.lut_scales = {prep.lut_scales[qi]};
+    one.lut_biases = {prep.lut_biases[qi]};
+  }
+  if (!prep.luts.empty()) one.luts = {prep.luts[qi]};
+  return one;
+}
+
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                              std::span<const float> scales, std::span<const std::uint64_t> id_map) {

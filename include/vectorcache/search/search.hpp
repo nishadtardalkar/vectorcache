@@ -49,6 +49,9 @@ PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, 
                                 std::size_t bits, std::span<const float> tqplus_shift,
                                 std::span<const float> tqplus_scale);
 
+/// Copy prepared state for a single query index (for per-query IVF probing).
+PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
+
 /// Score a contiguous blocked range using prepared query state.
 /// If `id_map` is non-empty it must have `scales.size()` entries; local ids are remapped.
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,

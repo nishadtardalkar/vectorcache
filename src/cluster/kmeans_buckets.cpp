@@ -431,25 +431,9 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
   merged.scores.assign(nq * merged.k, 0.f);
   merged.ids.assign(nq * merged.k, 0);
 
-  // Per-query probe order can differ; for batch efficiency we union opened buckets across
-  // the batch, then score each opened bucket once and merge. To match per-query budgets
-  // exactly, open per query independently when nq is small, else union.
-  // Correctness-first: per-query open lists, score each needed bucket (cache by bucket).
-  std::vector<SearchResults> bucket_results(nc);
-  std::vector<char> scored(nc, 0);
-
-  auto score_bucket = [&](std::size_t bi) {
-    if (scored[bi]) return;
-    const Bucket& b = buckets_[bi];
-    if (b.count == 0) {
-      scored[bi] = 1;
-      return;
-    }
-    bucket_results[bi] =
-        score_prepared(prep, merged.k, b.blocked, b.n_blocks, b.scales, b.ids);
-    scored[bi] = 1;
-  };
-
+  // IVF semantics: each query opens buckets until scan_fraction * N vectors, and only
+  // that query is scored against those buckets. Scoring the full batch when any query
+  // opens a bucket turns the union into ~full scan and is slower than flat.
   for (std::size_t qi = 0; qi < nq; ++qi) {
     std::vector<std::size_t> order(nc);
     std::iota(order.begin(), order.end(), 0);
@@ -460,32 +444,23 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
       return a < b;
     });
 
+    PreparedQueries qprep = prepared_query_at(prep, qi);
     std::size_t opened = 0;
     SearchResults local;
 
     for (std::size_t bi : order) {
-      if (buckets_[bi].count == 0) continue;
-      score_bucket(bi);
-      SearchResults one;
-      one.nq = 1;
-      one.k = bucket_results[bi].k;
+      const Bucket& b = buckets_[bi];
+      if (b.count == 0) continue;
+      SearchResults one =
+          score_prepared(qprep, merged.k, b.blocked, b.n_blocks, b.scales, b.ids);
       if (one.k == 0) {
-        opened += buckets_[bi].count;
+        opened += b.count;
         if (opened >= budget) break;
         continue;
       }
-      one.scores.assign(bucket_results[bi].scores.begin() +
-                            static_cast<std::ptrdiff_t>(qi * bucket_results[bi].k),
-                        bucket_results[bi].scores.begin() +
-                            static_cast<std::ptrdiff_t>((qi + 1) * bucket_results[bi].k));
-      one.ids.assign(bucket_results[bi].ids.begin() +
-                         static_cast<std::ptrdiff_t>(qi * bucket_results[bi].k),
-                     bucket_results[bi].ids.begin() +
-                         static_cast<std::ptrdiff_t>((qi + 1) * bucket_results[bi].k));
       if (local.nq == 0) {
         local = std::move(one);
       } else {
-        // Expand local.k if needed so merge keeps merged.k candidates.
         if (local.k < merged.k) {
           local.scores.resize(merged.k, 0.f);
           local.ids.resize(merged.k, 0);
@@ -493,7 +468,7 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
         }
         merge_search_results(local, one);
       }
-      opened += buckets_[bi].count;
+      opened += b.count;
       if (opened >= budget) break;
     }
 
