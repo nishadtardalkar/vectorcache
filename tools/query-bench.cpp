@@ -15,6 +15,7 @@
 
 #include "vectorcache/datasets/datasets.hpp"
 #include "vectorcache/datasets/npy.hpp"
+#include "vectorcache/cluster/kmeans_buckets.hpp"
 #include "vectorcache/index.hpp"
 #include "vectorcache/pack/pack.hpp"
 
@@ -306,7 +307,7 @@ bool save_exact_topk(const fs::path& path, const ExactTopkCacheKey& key,
 }  // namespace
 
 int main(int argc, char** argv) {
-  CLI::App app{"Query engine benchmark (TurboQuant flat index)"};
+  CLI::App app{"Query engine benchmark (TurboQuant flat / bucketed index)"};
 
   std::string dataset = "glove";
   std::string npy;
@@ -319,6 +320,11 @@ int main(int argc, char** argv) {
   std::size_t k = 10;
   bool calibrate = false;
   bool recall = false;
+  bool bucketed = false;
+  float scan_fraction = 0.1f;
+  float var_threshold = 0.5f;
+  std::size_t min_split_size = 256;
+  std::size_t split_iters = 5;
   std::size_t timing_runs = 5;
 
   app.add_option("--dataset", dataset, "Named dataset (glove, openai-1536, openai-3072)");
@@ -333,6 +339,13 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_flag("--calibrate", calibrate, "Fit TQ+ on first min(1000, n) index vectors before add");
   app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
+  app.add_flag("--bucketed", bucketed, "Use streaming cosine k-means bucketed index");
+  app.add_option("--scan-fraction", scan_fraction,
+                 "Fraction of index to open at query time (bucketed)")
+      ->check(CLI::Range(0.0f, 1.0f));
+  app.add_option("--var-threshold", var_threshold, "Cluster variance split threshold (bucketed)");
+  app.add_option("--min-split-size", min_split_size, "Min cluster size before split (bucketed)");
+  app.add_option("--split-iters", split_iters, "Lloyd iterations on split (bucketed)");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
   CLI11_PARSE(app, argc, argv);
@@ -403,32 +416,61 @@ int main(int argc, char** argv) {
 
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
               << " bits=" << bits << " k=" << k
+              << " mode=" << (bucketed ? "bucketed" : "flat")
               << " search_backend=" << vectorcache::search_backend_name(bits, db.cols) << "\n";
     std::cout << vectorcache::search_backend_diagnostics(bits, db.cols);
 
-    vectorcache::TurboQuantIndex index(db.cols, bits);
-    if (calibrate) {
-      const std::size_t n_cal =
-          std::min(db.rows, static_cast<std::size_t>(vectorcache::kRecommendedCalibrationRows));
-      index.calibrate(std::span<const float>(db.data.data(), n_cal * db.cols));
-      std::cout << "calibrated on " << n_cal << " rows\n";
-    }
-
-    const auto t0 = std::chrono::steady_clock::now();
-    index.add(db.data);
-    index.prepare();
-    const auto t1 = std::chrono::steady_clock::now();
-    std::cout << "ingest_ms="
-              << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
-
-    std::vector<double> run_ms;
     vectorcache::SearchResults last;
-    for (std::size_t r = 0; r < timing_runs; ++r) {
-      const auto a = std::chrono::steady_clock::now();
-      last = index.search(queries.data, k);
-      const auto b = std::chrono::steady_clock::now();
-      run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
+    std::vector<double> run_ms;
+
+    auto run_search_loop = [&](auto& index) {
+      for (std::size_t r = 0; r < timing_runs; ++r) {
+        const auto a = std::chrono::steady_clock::now();
+        last = index.search(queries.data, k);
+        const auto b = std::chrono::steady_clock::now();
+        run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
+      }
+    };
+
+    if (bucketed) {
+      vectorcache::BucketParams params;
+      params.scan_fraction = scan_fraction;
+      params.var_threshold = var_threshold;
+      params.min_split_size = min_split_size;
+      params.split_iters = split_iters;
+      vectorcache::BucketedTurboQuantIndex index(db.cols, bits, params);
+      if (calibrate) {
+        const std::size_t n_cal =
+            std::min(db.rows, static_cast<std::size_t>(vectorcache::kRecommendedCalibrationRows));
+        index.calibrate(std::span<const float>(db.data.data(), n_cal * db.cols));
+        std::cout << "calibrated on " << n_cal << " rows\n";
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      index.add(db.data);
+      index.prepare();
+      const auto t1 = std::chrono::steady_clock::now();
+      std::cout << "ingest_ms="
+                << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
+      std::cout << "buckets=" << index.num_buckets() << " scan_fraction=" << scan_fraction
+                << " var_threshold=" << var_threshold << "\n";
+      run_search_loop(index);
+    } else {
+      vectorcache::TurboQuantIndex index(db.cols, bits);
+      if (calibrate) {
+        const std::size_t n_cal =
+            std::min(db.rows, static_cast<std::size_t>(vectorcache::kRecommendedCalibrationRows));
+        index.calibrate(std::span<const float>(db.data.data(), n_cal * db.cols));
+        std::cout << "calibrated on " << n_cal << " rows\n";
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      index.add(db.data);
+      index.prepare();
+      const auto t1 = std::chrono::steady_clock::now();
+      std::cout << "ingest_ms="
+                << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
+      run_search_loop(index);
     }
+
     std::sort(run_ms.begin(), run_ms.end());
     const double median_ms = run_ms[run_ms.size() / 2];
     const double ms_per_query = median_ms / static_cast<double>(queries.rows);

@@ -20,6 +20,9 @@ QUERY_LIMIT   ?=
 K             ?= 10
 CALIBRATE     ?=
 RECALL        ?=
+BUCKETED      ?=
+SCAN_FRACTION ?=
+VAR_THRESHOLD ?=
 FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
@@ -63,7 +66,10 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
 	$(call flag_arg,CALIBRATE,calibrate) \
-	$(call flag_arg,RECALL,recall)
+	$(call flag_arg,RECALL,recall) \
+	$(call flag_arg,BUCKETED,bucketed) \
+	$(call opt_arg,SCAN_FRACTION,scan-fraction) \
+	$(call opt_arg,VAR_THRESHOLD,var-threshold)
 
 .PHONY: help login compute clean
 
@@ -90,12 +96,16 @@ help:
 	@echo "  QUERY_SPLIT     --query-split (test for glove; holdout for openai)"
 	@echo "  CALIBRATE=1     --calibrate (TQ+)"
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
+	@echo "  BUCKETED=1      --bucketed (streaming cosine k-means IVF)"
+	@echo "  SCAN_FRACTION   --scan-fraction (bucketed; default 0.1)"
+	@echo "  VAR_THRESHOLD   --var-threshold (bucketed; default 0.5)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make compute"
 	@echo "Example: make compute DATASET=openai-1536 BITS=2 K=64"
 	@echo "Example: make compute BITS=4 RECALL=1 CALIBRATE=1"
+	@echo "Example: make compute BUCKETED=1 SCAN_FRACTION=0.1"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 
 login: $(LOGIN_READY)

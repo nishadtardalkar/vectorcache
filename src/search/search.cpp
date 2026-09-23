@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -32,20 +33,14 @@ constexpr std::size_t kMinTileBlocks = 1024;
 constexpr std::size_t kMinTileBlocksX86 = kMinTileBlocks * 3;
 constexpr std::size_t kSingleQueryParallelMinBlocks = 1024;
 
-struct QueryLut {
-  std::vector<std::uint8_t> uint8_luts;
-  float scale = 1.f;
-  float bias = 0.f;
-};
-
-QueryLut build_query_lut(std::span<const float> q_rot_row, std::span<const float> centroids,
-                         std::size_t bits, std::size_t dim) {
+PreparedQueryLut build_query_lut(std::span<const float> q_rot_row, std::span<const float> centroids,
+                                 std::size_t bits, std::size_t dim) {
   const std::size_t codes_per_byte = 8 / bits;
   const std::size_t codes_per_nibble = codes_per_byte / 2;
   const std::size_t n_byte_groups = dim / codes_per_byte;
   const std::uint16_t code_mask = static_cast<std::uint16_t>((1u << bits) - 1);
 
-  QueryLut out;
+  PreparedQueryLut out;
   out.uint8_luts.assign(n_byte_groups * 32, 0);
   std::vector<float> float_vals(n_byte_groups * 32);
   std::vector<float> mins(n_byte_groups * 2);
@@ -141,7 +136,7 @@ void heap_push_or_replace(float* heap_s, std::uint64_t* heap_i, std::size_t& hea
   }
 }
 
-void score_query_scalar(const QueryLut& lut, std::span<const std::uint8_t> blocked_codes,
+void score_query_scalar(const PreparedQueryLut& lut, std::span<const std::uint8_t> blocked_codes,
                         std::span<const float> vec_scales, std::size_t bits,
                         std::size_t n_byte_groups, std::size_t n_vectors, std::size_t n_blocks,
                         std::size_t k, float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
@@ -235,57 +230,29 @@ void write_sorted_topk(SearchResults& out, std::size_t qi, std::size_t effective
   }
 }
 
-SearchResults search_flat_vm(std::span<const float> q_rot, std::span<const float> bias_corrs,
-                             std::size_t nq, std::size_t dim, std::size_t effective_k,
-                             std::span<const float> centroids, std::size_t bits,
-                             std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
-                             std::span<const float> scales, std::size_t n_byte_groups) {
+void remap_ids(SearchResults& out, std::span<const std::uint64_t> id_map) {
+  if (id_map.empty()) return;
+  for (std::uint64_t& id : out.ids) {
+    if (id >= id_map.size()) {
+      throw std::out_of_range("score_prepared: local id out of id_map range");
+    }
+    id = id_map[static_cast<std::size_t>(id)];
+  }
+}
+
+SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effective_k,
+                                std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                                std::span<const float> scales) {
+  const std::size_t nq = prep.nq;
   const std::size_t n_vectors = scales.size();
-  // MinGW on Win64 miscompiles permute-dot (aligned ZMM spills to bad
-  // frame offsets). Use classic split-LUT VNNI there; Linux/MSVC keep PD.
-#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
-  const bool use_pd = false;
-#else
-  const bool use_pd = (bits == 4);
-#endif
+  const std::size_t n_byte_groups = prep.n_byte_groups;
+  const bool use_pd = prep.backend == SearchBackendKind::VmPermuteDot;
 
   SearchResults out;
   out.nq = nq;
   out.k = effective_k;
   out.scores.assign(nq * effective_k, 0.f);
   out.ids.assign(nq * effective_k, 0);
-
-  std::vector<QueryPermuteDot> pds;
-  std::vector<std::vector<std::uint8_t>> split_luts;
-  std::vector<float> lut_scales;
-  std::vector<float> lut_biases;
-
-  if (use_pd) {
-    pds.resize(nq);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-      auto qrow = std::span<const float>(q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
-      pds[static_cast<std::size_t>(qi)] = build_permute_dot(qrow, centroids, dim);
-      pds[static_cast<std::size_t>(qi)].bias += bias_corrs[static_cast<std::size_t>(qi)];
-    }
-  } else {
-    split_luts.resize(nq);
-    lut_scales.resize(nq);
-    lut_biases.resize(nq);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-      auto qrow = std::span<const float>(q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
-      QueryLut lut = build_query_lut(qrow, centroids, bits, dim);
-      split_luts[static_cast<std::size_t>(qi)] = split_lut_for_vnni(lut.uint8_luts, n_byte_groups);
-      lut_scales[static_cast<std::size_t>(qi)] = lut.scale;
-      lut_biases[static_cast<std::size_t>(qi)] =
-          lut.bias + bias_corrs[static_cast<std::size_t>(qi)];
-    }
-  }
 
   std::size_t n_threads = 1;
 #ifdef _OPENMP
@@ -311,7 +278,6 @@ SearchResults search_flat_vm(std::span<const float> q_rot, std::span<const float
     }
   }
 
-  // Per-query list of candidates from each tile (qi -> cands).
   std::vector<std::vector<TileCand>> all_cands(nq);
 
 #ifdef _OPENMP
@@ -355,7 +321,7 @@ SearchResults search_flat_vm(std::span<const float> q_rot, std::span<const float
       if (use_pd) {
         std::vector<const QueryPermuteDot*> pd_ptrs(batch_nq);
         for (std::size_t i = 0; i < batch_nq; ++i) {
-          pd_ptrs[i] = &pds[tile.qi_start + i];
+          pd_ptrs[i] = &prep.pds[tile.qi_start + i];
         }
         score_queries_permute_dot(pd_ptrs.data(), batch_nq, codes_span, scales_span, n_byte_groups,
                                   range_n, range_blocks, effective_k, heap_s_ptrs.data(),
@@ -366,9 +332,9 @@ SearchResults search_flat_vm(std::span<const float> q_rot, std::span<const float
         std::vector<float> scales_batch(batch_nq);
         std::vector<float> biases_batch(batch_nq);
         for (std::size_t i = 0; i < batch_nq; ++i) {
-          lut_ptrs[i] = split_luts[tile.qi_start + i].data();
-          scales_batch[i] = lut_scales[tile.qi_start + i];
-          biases_batch[i] = lut_biases[tile.qi_start + i];
+          lut_ptrs[i] = prep.split_luts[tile.qi_start + i].data();
+          scales_batch[i] = prep.lut_scales[tile.qi_start + i];
+          biases_batch[i] = prep.lut_biases[tile.qi_start + i];
         }
         score_queries_vnni(lut_ptrs.data(), scales_batch.data(), biases_batch.data(), batch_nq,
                            codes_span, scales_span, n_byte_groups, range_n, range_blocks, effective_k,
@@ -417,21 +383,66 @@ SearchResults search_flat_vm(std::span<const float> q_rot, std::span<const float
   return out;
 }
 
+SearchResults score_prepared_perm0(const PreparedQueries& prep, std::size_t effective_k,
+                                   std::span<const std::uint8_t> blocked_codes,
+                                   std::size_t n_blocks, std::span<const float> scales) {
+  const std::size_t nq = prep.nq;
+  const std::size_t n_vectors = scales.size();
+  const bool use_avx2 = prep.backend == SearchBackendKind::Avx2;
+
+  SearchResults out;
+  out.nq = nq;
+  out.k = effective_k;
+  out.scores.assign(nq * effective_k, 0.f);
+  out.ids.assign(nq * effective_k, 0);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+  for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+    const auto& lut = prep.luts[static_cast<std::size_t>(qi)];
+    std::vector<float> heap_s(effective_k);
+    std::vector<std::uint64_t> heap_i(effective_k);
+    std::size_t heap_sz = 0;
+    float heap_min = 0.f;
+    std::size_t heap_mi = 0;
+#if defined(__x86_64__) || defined(_M_X64)
+    if (use_avx2) {
+      QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
+      score_query_avx2_perm0(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks,
+                             effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
+                             prep.bias_corrs[static_cast<std::size_t>(qi)]);
+    } else
+#else
+    (void)use_avx2;
+#endif
+    {
+      score_query_scalar(lut, blocked_codes, scales, prep.bits, prep.n_byte_groups, n_vectors,
+                         n_blocks, effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min,
+                         heap_mi, prep.bias_corrs[static_cast<std::size_t>(qi)]);
+    }
+    write_sorted_topk(out, static_cast<std::size_t>(qi), effective_k, heap_s, heap_i, heap_sz);
+  }
+
+  return out;
+}
+
 }  // namespace
 
-SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::size_t dim,
-                          std::size_t k, const Rotation& rotation,
-                          std::span<const float> centroids, std::size_t bits,
-                          std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
-                          std::span<const float> scales, std::span<const float> tqplus_shift,
-                          std::span<const float> tqplus_scale) {
-  const std::size_t n_vectors = scales.size();
+PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, std::size_t dim,
+                                const Rotation& rotation, std::span<const float> centroids,
+                                std::size_t bits, std::span<const float> tqplus_shift,
+                                std::span<const float> tqplus_scale) {
   const std::size_t codes_per_byte = 8 / bits;
   const std::size_t n_byte_groups = dim / codes_per_byte;
-  const std::size_t effective_k = std::min(k, n_vectors);
 
-  std::vector<float> q_rot(nq * dim);
-  std::vector<float> bias_corrs(nq, 0.f);
+  PreparedQueries prep;
+  prep.nq = nq;
+  prep.dim = dim;
+  prep.bits = bits;
+  prep.n_byte_groups = n_byte_groups;
+  prep.q_rot.assign(nq * dim, 0.f);
+  prep.bias_corrs.assign(nq, 0.f);
 
 #ifdef _OPENMP
 #pragma omp parallel
@@ -447,14 +458,14 @@ SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::s
       const float nrm = row_norm(q);
       const float inv = (nrm > kMinInputNorm) ? (1.f / nrm) : 0.f;
       rotation.apply_scaled_into(q, inv, row, scratch);
-      auto dest = std::span<float>(q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
+      auto dest = std::span<float>(prep.q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
       if (!tqplus_shift.empty()) {
         double bc = 0.0;
         for (std::size_t d = 0; d < dim; ++d) {
           dest[d] = row[d] / tqplus_scale[d];
           bc -= static_cast<double>(row[d]) * static_cast<double>(tqplus_shift[d]);
         }
-        bias_corrs[static_cast<std::size_t>(qi)] = static_cast<float>(bc);
+        prep.bias_corrs[static_cast<std::size_t>(qi)] = static_cast<float>(bc);
       } else {
         std::copy(row.begin(), row.end(), dest.begin());
       }
@@ -464,49 +475,146 @@ SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::s
   const bool use_vm = vector_major_for(bits, n_byte_groups);
 #if defined(__x86_64__) || defined(_M_X64)
   if (use_vm) {
-    return search_flat_vm(q_rot, bias_corrs, nq, dim, effective_k, centroids, bits, blocked_codes,
-                          n_blocks, scales, n_byte_groups);
-  }
-  const bool use_avx2 = cpu_has_avx2();
+#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
+    const bool use_pd = false;
 #else
-  const bool use_avx2 = false;
+    const bool use_pd = (bits == 4);
+#endif
+    prep.backend = use_pd ? SearchBackendKind::VmPermuteDot : SearchBackendKind::VmVnni;
+    if (use_pd) {
+      prep.pds.resize(nq);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+        auto qrow =
+            std::span<const float>(prep.q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
+        prep.pds[static_cast<std::size_t>(qi)] = build_permute_dot(qrow, centroids, dim);
+        prep.pds[static_cast<std::size_t>(qi)].bias += prep.bias_corrs[static_cast<std::size_t>(qi)];
+      }
+    } else {
+      prep.split_luts.resize(nq);
+      prep.lut_scales.resize(nq);
+      prep.lut_biases.resize(nq);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+        auto qrow =
+            std::span<const float>(prep.q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
+        PreparedQueryLut lut = build_query_lut(qrow, centroids, bits, dim);
+        prep.split_luts[static_cast<std::size_t>(qi)] =
+            split_lut_for_vnni(lut.uint8_luts, n_byte_groups);
+        prep.lut_scales[static_cast<std::size_t>(qi)] = lut.scale;
+        prep.lut_biases[static_cast<std::size_t>(qi)] =
+            lut.bias + prep.bias_corrs[static_cast<std::size_t>(qi)];
+      }
+    }
+    return prep;
+  }
+  prep.backend = cpu_has_avx2() ? SearchBackendKind::Avx2 : SearchBackendKind::Scalar;
+#else
   (void)use_vm;
+  prep.backend = SearchBackendKind::Scalar;
 #endif
 
-  SearchResults out;
-  out.nq = nq;
-  out.k = effective_k;
-  out.scores.assign(nq * effective_k, 0.f);
-  out.ids.assign(nq * effective_k, 0);
-
+  prep.luts.resize(nq);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(static)
 #endif
   for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-    auto qrow = std::span<const float>(q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
-    QueryLut lut = build_query_lut(qrow, centroids, bits, dim);
-    std::vector<float> heap_s(effective_k);
-    std::vector<std::uint64_t> heap_i(effective_k);
-    std::size_t heap_sz = 0;
-    float heap_min = 0.f;
-    std::size_t heap_mi = 0;
-#if defined(__x86_64__) || defined(_M_X64)
-    if (use_avx2) {
-      QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
-      score_query_avx2_perm0(view, blocked_codes, scales, n_byte_groups, n_vectors, n_blocks,
-                             effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
-                             bias_corrs[static_cast<std::size_t>(qi)]);
-    } else
-#endif
-    {
-      score_query_scalar(lut, blocked_codes, scales, bits, n_byte_groups, n_vectors, n_blocks,
-                         effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
-                         bias_corrs[static_cast<std::size_t>(qi)]);
-    }
-    write_sorted_topk(out, static_cast<std::size_t>(qi), effective_k, heap_s, heap_i, heap_sz);
+    auto qrow = std::span<const float>(prep.q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
+    prep.luts[static_cast<std::size_t>(qi)] = build_query_lut(qrow, centroids, bits, dim);
   }
+  return prep;
+}
 
+SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
+                             std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                             std::span<const float> scales, std::span<const std::uint64_t> id_map) {
+  const std::size_t n_vectors = scales.size();
+  if (n_vectors == 0 || prep.nq == 0) {
+    SearchResults out;
+    out.nq = prep.nq;
+    out.k = 0;
+    return out;
+  }
+  if (!id_map.empty() && id_map.size() != n_vectors) {
+    throw std::invalid_argument("id_map size must equal number of vectors in range");
+  }
+  const std::size_t effective_k = std::min(k, n_vectors);
+
+  SearchResults out;
+  if (prep.backend == SearchBackendKind::VmPermuteDot ||
+      prep.backend == SearchBackendKind::VmVnni) {
+    out = score_prepared_vm(prep, effective_k, blocked_codes, n_blocks, scales);
+  } else {
+    out = score_prepared_perm0(prep, effective_k, blocked_codes, n_blocks, scales);
+  }
+  remap_ids(out, id_map);
   return out;
+}
+
+SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::size_t dim,
+                          std::size_t k, const Rotation& rotation,
+                          std::span<const float> centroids, std::size_t bits,
+                          std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                          std::span<const float> scales, std::span<const float> tqplus_shift,
+                          std::span<const float> tqplus_scale) {
+  auto prep =
+      prepare_queries(queries, nq, dim, rotation, centroids, bits, tqplus_shift, tqplus_scale);
+  return score_prepared(prep, k, blocked_codes, n_blocks, scales);
+}
+
+void merge_search_results(SearchResults& dst, const SearchResults& src) {
+  if (src.nq == 0 || src.k == 0) return;
+  if (dst.nq == 0 || dst.k == 0) {
+    dst = src;
+    return;
+  }
+  if (dst.nq != src.nq) {
+    throw std::invalid_argument("merge_search_results: nq mismatch");
+  }
+  struct Cand {
+    float score;
+    std::uint64_t id;
+  };
+  const std::size_t k = dst.k;
+  for (std::size_t qi = 0; qi < dst.nq; ++qi) {
+    std::vector<Cand> cands;
+    cands.reserve(dst.k + src.k);
+    for (std::size_t j = 0; j < dst.k; ++j) {
+      cands.push_back(Cand{dst.scores[qi * dst.k + j], dst.ids[qi * dst.k + j]});
+    }
+    for (std::size_t j = 0; j < src.k; ++j) {
+      cands.push_back(Cand{src.scores[qi * src.k + j], src.ids[qi * src.k + j]});
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+      if (a.id != b.id) return a.id < b.id;
+      return a.score > b.score;
+    });
+    std::vector<Cand> uniq;
+    uniq.reserve(cands.size());
+    for (const auto& c : cands) {
+      if (uniq.empty() || uniq.back().id != c.id) {
+        uniq.push_back(c);
+      }
+    }
+    const std::size_t kk = std::min(k, uniq.size());
+    std::partial_sort(uniq.begin(), uniq.begin() + static_cast<std::ptrdiff_t>(kk), uniq.end(),
+                      [](const Cand& a, const Cand& b) {
+                        if (a.score != b.score) return a.score > b.score;
+                        return a.id < b.id;
+                      });
+    for (std::size_t j = 0; j < kk; ++j) {
+      dst.scores[qi * k + j] = uniq[j].score;
+      dst.ids[qi * k + j] = uniq[j].id;
+    }
+    for (std::size_t j = kk; j < k; ++j) {
+      dst.scores[qi * k + j] = 0.f;
+      dst.ids[qi * k + j] = 0;
+    }
+  }
 }
 
 }  // namespace vectorcache

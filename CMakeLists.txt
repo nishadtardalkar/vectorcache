@@ -32,6 +32,8 @@ set(VECTORCACHE_SOURCES
   src/search/search.cpp
   src/search/search_avx2.cpp
   src/search/search_vnni.cpp
+  src/cluster/score_centroids.cpp
+  src/cluster/kmeans_buckets.cpp
   src/index.cpp
   src/datasets/npy.cpp
   src/datasets/datasets.cpp
@@ -147,6 +149,7 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_pack.cpp
     tests/test_index.cpp
     tests/test_search_vnni.cpp
+    tests/test_kmeans_buckets.cpp
   )
   target_link_libraries(vectorcache_tests PRIVATE vectorcache GTest::gtest)
   include(GoogleTest)
