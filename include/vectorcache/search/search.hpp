@@ -54,10 +54,13 @@ PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
 
 /// Score a contiguous blocked range using prepared query state.
 /// If `id_map` is non-empty it must have `scales.size()` entries; local ids are remapped.
+/// If `query_indices` is non-empty, only those prepared queries are scored (output nq =
+/// query_indices.size()); otherwise all `prep.nq` queries are scored.
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                              std::span<const float> scales,
-                             std::span<const std::uint64_t> id_map = {});
+                             std::span<const std::uint64_t> id_map = {},
+                             std::span<const std::size_t> query_indices = {});
 
 SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::size_t dim,
                           std::size_t k, const Rotation& rotation,

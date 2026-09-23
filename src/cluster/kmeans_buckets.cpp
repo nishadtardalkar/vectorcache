@@ -431,9 +431,9 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
   merged.scores.assign(nq * merged.k, 0.f);
   merged.ids.assign(nq * merged.k, 0);
 
-  // IVF semantics: each query opens buckets until scan_fraction * N vectors, and only
-  // that query is scored against those buckets. Scoring the full batch when any query
-  // opens a bucket turns the union into ~full scan and is slower than flat.
+  // Per-query open lists (respect scan_fraction), then invert so each bucket is FastScan'd
+  // once for the batch of queries that need it — keeps multi-query SIMD/OpenMP.
+  std::vector<std::vector<std::size_t>> queries_for_bucket(nc);
   for (std::size_t qi = 0; qi < nq; ++qi) {
     std::vector<std::size_t> order(nc);
     std::iota(order.begin(), order.end(), 0);
@@ -444,38 +444,51 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
       return a < b;
     });
 
-    PreparedQueries qprep = prepared_query_at(prep, qi);
     std::size_t opened = 0;
-    SearchResults local;
-
     for (std::size_t bi : order) {
-      const Bucket& b = buckets_[bi];
-      if (b.count == 0) continue;
-      SearchResults one =
-          score_prepared(qprep, merged.k, b.blocked, b.n_blocks, b.scales, b.ids);
-      if (one.k == 0) {
-        opened += b.count;
-        if (opened >= budget) break;
-        continue;
-      }
-      if (local.nq == 0) {
-        local = std::move(one);
-      } else {
-        if (local.k < merged.k) {
-          local.scores.resize(merged.k, 0.f);
-          local.ids.resize(merged.k, 0);
-          local.k = merged.k;
-        }
-        merge_search_results(local, one);
-      }
-      opened += b.count;
+      if (buckets_[bi].count == 0) continue;
+      queries_for_bucket[bi].push_back(qi);
+      opened += buckets_[bi].count;
       if (opened >= budget) break;
     }
+  }
 
-    const std::size_t kk = std::min(merged.k, local.k);
+  std::vector<SearchResults> locals(nq);
+  for (std::size_t bi = 0; bi < nc; ++bi) {
+    const auto& qis = queries_for_bucket[bi];
+    if (qis.empty()) continue;
+    const Bucket& b = buckets_[bi];
+    SearchResults partial =
+        score_prepared(prep, merged.k, b.blocked, b.n_blocks, b.scales, b.ids, qis);
+    if (partial.k == 0) continue;
+
+    for (std::size_t i = 0; i < qis.size(); ++i) {
+      const std::size_t qi = qis[i];
+      SearchResults one;
+      one.nq = 1;
+      one.k = partial.k;
+      one.scores.assign(partial.scores.begin() + static_cast<std::ptrdiff_t>(i * partial.k),
+                        partial.scores.begin() + static_cast<std::ptrdiff_t>((i + 1) * partial.k));
+      one.ids.assign(partial.ids.begin() + static_cast<std::ptrdiff_t>(i * partial.k),
+                     partial.ids.begin() + static_cast<std::ptrdiff_t>((i + 1) * partial.k));
+      if (locals[qi].nq == 0) {
+        locals[qi] = std::move(one);
+      } else {
+        if (locals[qi].k < merged.k) {
+          locals[qi].scores.resize(merged.k, 0.f);
+          locals[qi].ids.resize(merged.k, 0);
+          locals[qi].k = merged.k;
+        }
+        merge_search_results(locals[qi], one);
+      }
+    }
+  }
+
+  for (std::size_t qi = 0; qi < nq; ++qi) {
+    const std::size_t kk = std::min(merged.k, locals[qi].k);
     for (std::size_t j = 0; j < kk; ++j) {
-      merged.scores[qi * merged.k + j] = local.scores[j];
-      merged.ids[qi * merged.k + j] = local.ids[j];
+      merged.scores[qi * merged.k + j] = locals[qi].scores[j];
+      merged.ids[qi * merged.k + j] = locals[qi].ids[j];
     }
   }
 

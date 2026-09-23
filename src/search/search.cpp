@@ -242,8 +242,12 @@ void remap_ids(SearchResults& out, std::span<const std::uint64_t> id_map) {
 
 SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effective_k,
                                 std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
-                                std::span<const float> scales) {
-  const std::size_t nq = prep.nq;
+                                std::span<const float> scales,
+                                std::span<const std::size_t> query_indices) {
+  const std::size_t nq = query_indices.empty() ? prep.nq : query_indices.size();
+  auto global_qi = [&](std::size_t local_i) -> std::size_t {
+    return query_indices.empty() ? local_i : query_indices[local_i];
+  };
   const std::size_t n_vectors = scales.size();
   const std::size_t n_byte_groups = prep.n_byte_groups;
   const bool use_pd = prep.backend == SearchBackendKind::VmPermuteDot;
@@ -253,6 +257,7 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   out.k = effective_k;
   out.scores.assign(nq * effective_k, 0.f);
   out.ids.assign(nq * effective_k, 0);
+  if (nq == 0) return out;
 
   std::size_t n_threads = 1;
 #ifdef _OPENMP
@@ -321,7 +326,7 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       if (use_pd) {
         std::vector<const QueryPermuteDot*> pd_ptrs(batch_nq);
         for (std::size_t i = 0; i < batch_nq; ++i) {
-          pd_ptrs[i] = &prep.pds[tile.qi_start + i];
+          pd_ptrs[i] = &prep.pds[global_qi(tile.qi_start + i)];
         }
         score_queries_permute_dot(pd_ptrs.data(), batch_nq, codes_span, scales_span, n_byte_groups,
                                   range_n, range_blocks, effective_k, heap_s_ptrs.data(),
@@ -332,9 +337,10 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
         std::vector<float> scales_batch(batch_nq);
         std::vector<float> biases_batch(batch_nq);
         for (std::size_t i = 0; i < batch_nq; ++i) {
-          lut_ptrs[i] = prep.split_luts[tile.qi_start + i].data();
-          scales_batch[i] = prep.lut_scales[tile.qi_start + i];
-          biases_batch[i] = prep.lut_biases[tile.qi_start + i];
+          const std::size_t gqi = global_qi(tile.qi_start + i);
+          lut_ptrs[i] = prep.split_luts[gqi].data();
+          scales_batch[i] = prep.lut_scales[gqi];
+          biases_batch[i] = prep.lut_biases[gqi];
         }
         score_queries_vnni(lut_ptrs.data(), scales_batch.data(), biases_batch.data(), batch_nq,
                            codes_span, scales_span, n_byte_groups, range_n, range_blocks, effective_k,
@@ -385,8 +391,12 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
 
 SearchResults score_prepared_perm0(const PreparedQueries& prep, std::size_t effective_k,
                                    std::span<const std::uint8_t> blocked_codes,
-                                   std::size_t n_blocks, std::span<const float> scales) {
-  const std::size_t nq = prep.nq;
+                                   std::size_t n_blocks, std::span<const float> scales,
+                                   std::span<const std::size_t> query_indices) {
+  const std::size_t nq = query_indices.empty() ? prep.nq : query_indices.size();
+  auto global_qi = [&](std::size_t local_i) -> std::size_t {
+    return query_indices.empty() ? local_i : query_indices[local_i];
+  };
   const std::size_t n_vectors = scales.size();
   const bool use_avx2 = prep.backend == SearchBackendKind::Avx2;
 
@@ -395,12 +405,14 @@ SearchResults score_prepared_perm0(const PreparedQueries& prep, std::size_t effe
   out.k = effective_k;
   out.scores.assign(nq * effective_k, 0.f);
   out.ids.assign(nq * effective_k, 0);
+  if (nq == 0) return out;
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
   for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-    const auto& lut = prep.luts[static_cast<std::size_t>(qi)];
+    const std::size_t gqi = global_qi(static_cast<std::size_t>(qi));
+    const auto& lut = prep.luts[gqi];
     std::vector<float> heap_s(effective_k);
     std::vector<std::uint64_t> heap_i(effective_k);
     std::size_t heap_sz = 0;
@@ -411,7 +423,7 @@ SearchResults score_prepared_perm0(const PreparedQueries& prep, std::size_t effe
       QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
       score_query_avx2_perm0(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks,
                              effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
-                             prep.bias_corrs[static_cast<std::size_t>(qi)]);
+                             prep.bias_corrs[gqi]);
     } else
 #else
     (void)use_avx2;
@@ -419,7 +431,7 @@ SearchResults score_prepared_perm0(const PreparedQueries& prep, std::size_t effe
     {
       score_query_scalar(lut, blocked_codes, scales, prep.bits, prep.n_byte_groups, n_vectors,
                          n_blocks, effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min,
-                         heap_mi, prep.bias_corrs[static_cast<std::size_t>(qi)]);
+                         heap_mi, prep.bias_corrs[gqi]);
     }
     write_sorted_topk(out, static_cast<std::size_t>(qi), effective_k, heap_s, heap_i, heap_sz);
   }
@@ -556,11 +568,20 @@ PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi) {
 
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
-                             std::span<const float> scales, std::span<const std::uint64_t> id_map) {
+                             std::span<const float> scales, std::span<const std::uint64_t> id_map,
+                             std::span<const std::size_t> query_indices) {
+  if (!query_indices.empty()) {
+    for (std::size_t qi : query_indices) {
+      if (qi >= prep.nq) {
+        throw std::out_of_range("score_prepared: query_indices out of range");
+      }
+    }
+  }
+  const std::size_t nq_out = query_indices.empty() ? prep.nq : query_indices.size();
   const std::size_t n_vectors = scales.size();
-  if (n_vectors == 0 || prep.nq == 0) {
+  if (n_vectors == 0 || nq_out == 0) {
     SearchResults out;
-    out.nq = prep.nq;
+    out.nq = nq_out;
     out.k = 0;
     return out;
   }
@@ -572,9 +593,9 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
   SearchResults out;
   if (prep.backend == SearchBackendKind::VmPermuteDot ||
       prep.backend == SearchBackendKind::VmVnni) {
-    out = score_prepared_vm(prep, effective_k, blocked_codes, n_blocks, scales);
+    out = score_prepared_vm(prep, effective_k, blocked_codes, n_blocks, scales, query_indices);
   } else {
-    out = score_prepared_perm0(prep, effective_k, blocked_codes, n_blocks, scales);
+    out = score_prepared_perm0(prep, effective_k, blocked_codes, n_blocks, scales, query_indices);
   }
   remap_ids(out, id_map);
   return out;
