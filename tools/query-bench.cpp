@@ -432,6 +432,12 @@ int main(int argc, char** argv) {
       }
     };
 
+    auto release_db_if_unused = [&]() {
+      if (!recall) {
+        db = Matrix{};
+      }
+    };
+
     if (bucketed) {
       vectorcache::BucketParams params;
       params.scan_fraction = scan_fraction;
@@ -443,7 +449,7 @@ int main(int argc, char** argv) {
         const std::size_t n_cal =
             std::min(db.rows, static_cast<std::size_t>(vectorcache::kRecommendedCalibrationRows));
         index.calibrate(std::span<const float>(db.data.data(), n_cal * db.cols));
-        std::cout << "calibrated on " << n_cal << " rows\n";
+        std::cout << "calibrated on " << n_cal << " rows\n" << std::flush;
       }
       const auto t0 = std::chrono::steady_clock::now();
       index.add(db.data);
@@ -452,7 +458,9 @@ int main(int argc, char** argv) {
       std::cout << "ingest_ms="
                 << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
       std::cout << "buckets=" << index.num_buckets() << " scan_fraction=" << scan_fraction
-                << " var_threshold=" << var_threshold << "\n";
+                << " var_threshold=" << var_threshold << "\n"
+                << std::flush;
+      release_db_if_unused();
       run_search_loop(index);
     } else {
       vectorcache::TurboQuantIndex index(db.cols, bits);
@@ -460,14 +468,16 @@ int main(int argc, char** argv) {
         const std::size_t n_cal =
             std::min(db.rows, static_cast<std::size_t>(vectorcache::kRecommendedCalibrationRows));
         index.calibrate(std::span<const float>(db.data.data(), n_cal * db.cols));
-        std::cout << "calibrated on " << n_cal << " rows\n";
+        std::cout << "calibrated on " << n_cal << " rows\n" << std::flush;
       }
       const auto t0 = std::chrono::steady_clock::now();
       index.add(db.data);
       index.prepare();
       const auto t1 = std::chrono::steady_clock::now();
       std::cout << "ingest_ms="
-                << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
+                << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n"
+                << std::flush;
+      release_db_if_unused();
       run_search_loop(index);
     }
 

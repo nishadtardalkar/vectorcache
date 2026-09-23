@@ -181,11 +181,24 @@ void BucketedTurboQuantIndex::split_bucket(std::size_t bi) {
   const std::size_t n = parent.count;
   if (n < 2) return;
 
+  // Take ownership of parent storage so children aren't layered on top of it.
+  std::vector<float> parent_floats = std::move(parent.floats);
+  std::vector<std::uint64_t> parent_ids = std::move(parent.ids);
+  parent.packed.clear();
+  parent.packed.shrink_to_fit();
+  parent.scales.clear();
+  parent.scales.shrink_to_fit();
+  parent.blocked.clear();
+  parent.blocked.shrink_to_fit();
+  parent.blocked_ready = false;
+  parent.n_blocks = 0;
+  const std::vector<float> parent_centroid = parent.centroid;
+
   // Seed: farthest from centroid, then farthest from first seed.
   std::size_t s0 = 0;
   float worst0 = std::numeric_limits<float>::infinity();
   for (std::size_t i = 0; i < n; ++i) {
-    const float cos = dot_row(parent.floats.data() + i * dim_, parent.centroid.data(), dim_);
+    const float cos = dot_row(parent_floats.data() + i * dim_, parent_centroid.data(), dim_);
     if (cos < worst0) {
       worst0 = cos;
       s0 = i;
@@ -193,10 +206,10 @@ void BucketedTurboQuantIndex::split_bucket(std::size_t bi) {
   }
   std::size_t s1 = (s0 + 1) % n;
   float worst1 = std::numeric_limits<float>::infinity();
-  const float* seed0 = parent.floats.data() + s0 * dim_;
+  const float* seed0 = parent_floats.data() + s0 * dim_;
   for (std::size_t i = 0; i < n; ++i) {
     if (i == s0) continue;
-    const float cos = dot_row(parent.floats.data() + i * dim_, seed0, dim_);
+    const float cos = dot_row(parent_floats.data() + i * dim_, seed0, dim_);
     if (cos < worst1) {
       worst1 = cos;
       s1 = i;
@@ -204,10 +217,10 @@ void BucketedTurboQuantIndex::split_bucket(std::size_t bi) {
   }
 
   std::vector<float> c0(dim_), c1(dim_);
-  std::copy(parent.floats.begin() + static_cast<std::ptrdiff_t>(s0 * dim_),
-            parent.floats.begin() + static_cast<std::ptrdiff_t>((s0 + 1) * dim_), c0.begin());
-  std::copy(parent.floats.begin() + static_cast<std::ptrdiff_t>(s1 * dim_),
-            parent.floats.begin() + static_cast<std::ptrdiff_t>((s1 + 1) * dim_), c1.begin());
+  std::copy(parent_floats.begin() + static_cast<std::ptrdiff_t>(s0 * dim_),
+            parent_floats.begin() + static_cast<std::ptrdiff_t>((s0 + 1) * dim_), c0.begin());
+  std::copy(parent_floats.begin() + static_cast<std::ptrdiff_t>(s1 * dim_),
+            parent_floats.begin() + static_cast<std::ptrdiff_t>((s1 + 1) * dim_), c1.begin());
 
   std::vector<std::uint8_t> assign(n, 0);
   for (std::size_t iter = 0; iter < params_.split_iters; ++iter) {
@@ -215,7 +228,7 @@ void BucketedTurboQuantIndex::split_bucket(std::size_t bi) {
 #pragma omp parallel for schedule(static)
 #endif
     for (int i = 0; i < static_cast<int>(n); ++i) {
-      const float* row = parent.floats.data() + static_cast<std::size_t>(i) * dim_;
+      const float* row = parent_floats.data() + static_cast<std::size_t>(i) * dim_;
       const float d0 = dot_row(row, c0.data(), dim_);
       const float d1 = dot_row(row, c1.data(), dim_);
       assign[static_cast<std::size_t>(i)] = (d1 > d0) ? 1 : 0;
@@ -223,7 +236,7 @@ void BucketedTurboQuantIndex::split_bucket(std::size_t bi) {
     std::vector<double> sum0(dim_, 0.0), sum1(dim_, 0.0);
     std::size_t n0 = 0, n1 = 0;
     for (std::size_t i = 0; i < n; ++i) {
-      const float* row = parent.floats.data() + i * dim_;
+      const float* row = parent_floats.data() + i * dim_;
       if (assign[i] == 0) {
         ++n0;
         for (std::size_t d = 0; d < dim_; ++d) sum0[d] += row[d];
@@ -239,7 +252,7 @@ void BucketedTurboQuantIndex::split_bucket(std::size_t bi) {
       std::fill(sum1.begin(), sum1.end(), 0.0);
       n0 = n1 = 0;
       for (std::size_t i = 0; i < n; ++i) {
-        const float* row = parent.floats.data() + i * dim_;
+        const float* row = parent_floats.data() + i * dim_;
         if (assign[i] == 0) {
           ++n0;
           for (std::size_t d = 0; d < dim_; ++d) sum0[d] += row[d];
@@ -258,8 +271,8 @@ void BucketedTurboQuantIndex::split_bucket(std::size_t bi) {
   }
 
   Bucket child0, child1;
-  child0.centroid = c0;
-  child1.centroid = c1;
+  child0.centroid = std::move(c0);
+  child1.centroid = std::move(c1);
   child0.floats.reserve((n / 2 + 1) * dim_);
   child1.floats.reserve((n / 2 + 1) * dim_);
   child0.ids.reserve(n / 2 + 1);
@@ -267,13 +280,20 @@ void BucketedTurboQuantIndex::split_bucket(std::size_t bi) {
 
   for (std::size_t i = 0; i < n; ++i) {
     Bucket& dest = (assign[i] == 0) ? child0 : child1;
-    dest.floats.insert(dest.floats.end(), parent.floats.begin() + static_cast<std::ptrdiff_t>(i * dim_),
-                       parent.floats.begin() + static_cast<std::ptrdiff_t>((i + 1) * dim_));
-    dest.ids.push_back(parent.ids[i]);
+    dest.floats.insert(dest.floats.end(),
+                       parent_floats.begin() + static_cast<std::ptrdiff_t>(i * dim_),
+                       parent_floats.begin() + static_cast<std::ptrdiff_t>((i + 1) * dim_));
+    dest.ids.push_back(parent_ids[i]);
     ++dest.count;
   }
-  child0.sum_sq_dist = mean_sq_dist_to_centroid(child0.floats, child0.count, dim_, child0.centroid.data());
-  child1.sum_sq_dist = mean_sq_dist_to_centroid(child1.floats, child1.count, dim_, child1.centroid.data());
+  {
+    std::vector<float>().swap(parent_floats);
+    std::vector<std::uint64_t>().swap(parent_ids);
+  }
+  child0.sum_sq_dist =
+      mean_sq_dist_to_centroid(child0.floats, child0.count, dim_, child0.centroid.data());
+  child1.sum_sq_dist =
+      mean_sq_dist_to_centroid(child1.floats, child1.count, dim_, child1.centroid.data());
 
   reencode_bucket(child0);
   reencode_bucket(child1);
@@ -295,40 +315,37 @@ void BucketedTurboQuantIndex::maybe_split(std::size_t bi) {
 }
 
 void BucketedTurboQuantIndex::add(std::span<const float> vectors) {
+  if (prepared_) {
+    throw std::runtime_error("add after prepare is not supported for bucketed index");
+  }
   if (vectors.size() % dim_ != 0) {
     throw std::invalid_argument("vectors length must be multiple of dim");
   }
   const std::size_t n = vectors.size() / dim_;
   if (n == 0) return;
 
-  std::vector<float> unit(n * dim_);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-  for (int i = 0; i < static_cast<int>(n); ++i) {
-    copy_normalize_row(vectors.subspan(static_cast<std::size_t>(i) * dim_, dim_),
-                       unit.data() + static_cast<std::size_t>(i) * dim_, dim_);
-  }
-
-  // First vector ever: seed the single empty bucket centroid.
-  if (next_id_ == 0 && buckets_.size() == 1 && buckets_[0].count == 0) {
-    std::copy(unit.begin(), unit.begin() + static_cast<std::ptrdiff_t>(dim_),
-              buckets_[0].centroid.begin());
-    sync_centroid_matrix();
-  }
+  // Normalize one row at a time — avoid a second full n×dim float matrix.
+  std::vector<float> row(dim_);
 
   // Stream one vector at a time so variance splits see an up-to-date centroid matrix.
   for (std::size_t i = 0; i < n; ++i) {
+    copy_normalize_row(vectors.subspan(i * dim_, dim_), row.data(), dim_);
+
+    // First vector ever: seed the single empty bucket centroid.
+    if (next_id_ == 0 && buckets_.size() == 1 && buckets_[0].count == 0) {
+      std::copy(row.begin(), row.end(), buckets_[0].centroid.begin());
+      sync_centroid_matrix();
+    }
+
     const std::size_t nc = buckets_.size();
     std::uint32_t best_j = 0;
     float best = -std::numeric_limits<float>::infinity();
-    const float* row = unit.data() + i * dim_;
     if (next_id_ == 0) {
       best_j = 0;
     } else {
       for (std::size_t j = 0; j < nc; ++j) {
         if (buckets_[j].count == 0) continue;
-        const float s = dot_row(row, centroid_matrix_.data() + j * dim_, dim_);
+        const float s = dot_row(row.data(), centroid_matrix_.data() + j * dim_, dim_);
         if (s > best) {
           best = s;
           best_j = static_cast<std::uint32_t>(j);
@@ -337,7 +354,7 @@ void BucketedTurboQuantIndex::add(std::span<const float> vectors) {
     }
 
     const std::uint64_t id = next_id_++;
-    append_to_bucket(best_j, std::span<const float>(row, dim_), id);
+    append_to_bucket(best_j, std::span<const float>(row.data(), dim_), id);
     std::copy(buckets_[best_j].centroid.begin(), buckets_[best_j].centroid.end(),
               centroid_matrix_.begin() + static_cast<std::ptrdiff_t>(best_j * dim_));
     maybe_split(best_j);
@@ -362,7 +379,14 @@ void BucketedTurboQuantIndex::ensure_bucket_blocked(std::size_t bi) const {
 void BucketedTurboQuantIndex::prepare() {
   for (std::size_t i = 0; i < buckets_.size(); ++i) {
     ensure_bucket_blocked(i);
+    // Search only needs blocked + scales + ids; drop ingest scratch.
+    Bucket& b = buckets_[i];
+    b.floats.clear();
+    b.floats.shrink_to_fit();
+    b.packed.clear();
+    b.packed.shrink_to_fit();
   }
+  prepared_ = true;
 }
 
 SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, std::size_t k) const {

@@ -32,6 +32,7 @@ class BucketedTurboQuantIndex {
 
   void calibrate(std::span<const float> sample);
   void add(std::span<const float> vectors);
+  /// Finalize FastScan layouts and drop ingest-only float / packed scratch.
   void prepare();
 
   SearchResults search(std::span<const float> queries, std::size_t k) const;
@@ -79,6 +80,7 @@ class BucketedTurboQuantIndex {
   std::vector<Bucket> buckets_;
   std::vector<float> centroid_matrix_;  // n_buckets * dim
   std::uint64_t next_id_ = 0;
+  bool prepared_ = false;
 };
 
 }  // namespace vectorcache
