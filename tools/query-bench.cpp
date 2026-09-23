@@ -324,6 +324,7 @@ int main(int argc, char** argv) {
   float scan_fraction = 0.1f;
   float var_threshold = 0.5f;
   std::size_t min_split_size = 256;
+  std::size_t max_bucket_size = 1024;
   std::size_t split_iters = 5;
   std::size_t timing_runs = 5;
 
@@ -345,6 +346,8 @@ int main(int argc, char** argv) {
       ->check(CLI::Range(0.0f, 1.0f));
   app.add_option("--var-threshold", var_threshold, "Cluster variance split threshold (bucketed)");
   app.add_option("--min-split-size", min_split_size, "Min cluster size before split (bucketed)");
+  app.add_option("--max-bucket-size", max_bucket_size,
+                 "Force-split buckets larger than this (0=off; bucketed, default 1024)");
   app.add_option("--split-iters", split_iters, "Lloyd iterations on split (bucketed)");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
@@ -443,6 +446,7 @@ int main(int argc, char** argv) {
       params.scan_fraction = scan_fraction;
       params.var_threshold = var_threshold;
       params.min_split_size = min_split_size;
+      params.max_bucket_size = max_bucket_size;
       params.split_iters = split_iters;
       vectorcache::BucketedTurboQuantIndex index(db.cols, bits, params);
       if (calibrate) {
@@ -455,11 +459,32 @@ int main(int argc, char** argv) {
       index.add(db.data);
       index.prepare();
       const auto t1 = std::chrono::steady_clock::now();
+      std::size_t max_b = 0;
+      std::size_t sum_b = 0;
+      std::vector<std::size_t> bucket_sizes;
+      bucket_sizes.reserve(index.num_buckets());
+      for (std::size_t bi = 0; bi < index.num_buckets(); ++bi) {
+        const std::size_t sz = index.bucket_size(bi);
+        bucket_sizes.push_back(sz);
+        max_b = std::max(max_b, sz);
+        sum_b += sz;
+      }
+      const double mean_b =
+          index.num_buckets() == 0 ? 0.0 : static_cast<double>(sum_b) / static_cast<double>(index.num_buckets());
+      std::sort(bucket_sizes.begin(), bucket_sizes.end(),
+                [](std::size_t a, std::size_t b) { return a > b; });
       std::cout << "ingest_ms="
                 << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
-      std::cout << "buckets=" << index.num_buckets() << " scan_fraction=" << scan_fraction
-                << " var_threshold=" << var_threshold << "\n"
-                << std::flush;
+      std::cout << "buckets=" << index.num_buckets() << " max_bucket=" << max_b
+                << " mean_bucket=" << mean_b << " scan_fraction=" << scan_fraction
+                << " var_threshold=" << var_threshold << " max_bucket_size=" << max_bucket_size
+                << "\n";
+      std::cout << "top_bucket_sizes:";
+      const std::size_t top_n = std::min<std::size_t>(10, bucket_sizes.size());
+      for (std::size_t i = 0; i < top_n; ++i) {
+        std::cout << " " << bucket_sizes[i];
+      }
+      std::cout << "\n" << std::flush;
       release_db_if_unused();
       run_search_loop(index);
     } else {

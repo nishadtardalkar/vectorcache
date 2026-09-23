@@ -39,7 +39,7 @@ Clustering is in **input L2-normalized space** (not TurboQuant rotated space). S
 1. L2-normalize the vector
 2. Assign to nearest cluster centroid by cosine (dot of unit vectors); AVX2 + OpenMP batch scoring
 3. Append unit float + TurboQuant-encode into that bucket; online update centroid and variance `E[‖x−c‖²] = 2(1−E[cos])`
-4. If `count ≥ min_split_size` and `variance ≥ var_threshold`: spherical k-means (k=2) on **that bucket’s floats only**, re-encode both children, replace parent (no full-index rebuild)
+4. If `count ≥ min_split_size` and (`variance ≥ var_threshold` **or** `count > max_bucket_size`): spherical k-means (k=2) on **that bucket’s floats only**, re-encode both children, replace parent (no full-index rebuild). Size-based splits keep buckets fine enough that `scan_fraction` is not dominated by one huge open.
 
 **Query**
 
@@ -48,7 +48,7 @@ Clustering is in **input L2-normalized space** (not TurboQuant rotated space). S
 3. Open buckets in order until cumulative size ≥ `scan_fraction * N` (at least one non-empty)
 4. FastScan each opened bucket; remap local ids via stored global ids; merge heaps to top-k
 
-Defaults: `scan_fraction=0.1`, `var_threshold=0.5`, `min_split_size=256`, `split_iters=5`, start with one cluster.
+Defaults: `scan_fraction=0.1`, `var_threshold=0.5`, `min_split_size=256`, `max_bucket_size=1024`, `split_iters=5`, start with one cluster.
 
 ## Ranking
 

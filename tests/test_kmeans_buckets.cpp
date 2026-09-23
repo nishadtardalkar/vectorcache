@@ -101,6 +101,31 @@ TEST(KMeansBuckets, VarianceSplitGrowsBuckets) {
   EXPECT_EQ(total, n);
 }
 
+TEST(KMeansBuckets, MaxBucketSizeForcesSplit) {
+  constexpr std::size_t dim = 32;
+  constexpr std::size_t n = 800;
+
+  // Tight cluster: variance stays low, so only max_bucket_size should force splits.
+  auto db = random_matrix(n, dim, 42);
+  for (std::size_t i = 0; i < n; ++i) {
+    db[i * dim + 0] += 10.f;  // pull toward same direction
+  }
+
+  vectorcache::BucketParams params;
+  params.scan_fraction = 0.2f;
+  params.var_threshold = 10.f;  // effectively disable variance splits
+  params.min_split_size = 32;
+  params.max_bucket_size = 64;
+  params.split_iters = 5;
+
+  vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
+  index.add(db);
+  EXPECT_GT(index.num_buckets(), 1u);
+  for (std::size_t b = 0; b < index.num_buckets(); ++b) {
+    EXPECT_LE(index.bucket_size(b), params.max_bucket_size);
+  }
+}
+
 TEST(KMeansBuckets, ScanFractionOpensSubset) {
   constexpr std::size_t dim = 32;
   constexpr std::size_t n = 300;

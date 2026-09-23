@@ -84,6 +84,9 @@ BucketedTurboQuantIndex::BucketedTurboQuantIndex(std::size_t dim, std::size_t bi
   if (params_.split_iters < 1) {
     throw std::invalid_argument("split_iters must be >= 1");
   }
+  if (params_.max_bucket_size != 0 && params_.max_bucket_size < params_.min_split_size) {
+    throw std::invalid_argument("max_bucket_size must be 0 (disabled) or >= min_split_size");
+  }
   auto cb = codebook(bits_, dim_);
   boundaries_ = std::move(cb.first);
   codebook_centroids_ = std::move(cb.second);
@@ -304,8 +307,12 @@ void BucketedTurboQuantIndex::split_bucket(std::size_t bi) {
 }
 
 void BucketedTurboQuantIndex::maybe_split(std::size_t bi) {
-  while (bi < buckets_.size() && buckets_[bi].count >= params_.min_split_size &&
-         buckets_[bi].variance() >= params_.var_threshold) {
+  while (bi < buckets_.size() && buckets_[bi].count >= params_.min_split_size) {
+    const Bucket& b = buckets_[bi];
+    const bool var_split = b.variance() >= params_.var_threshold;
+    const bool size_split =
+        params_.max_bucket_size > 0 && b.count > params_.max_bucket_size;
+    if (!var_split && !size_split) break;
     const std::size_t n_before = buckets_.size();
     split_bucket(bi);
     if (buckets_.size() > n_before) {

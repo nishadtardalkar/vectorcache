@@ -23,6 +23,7 @@ RECALL        ?=
 BUCKETED      ?=
 SCAN_FRACTION ?=
 VAR_THRESHOLD ?=
+MAX_BUCKET_SIZE ?=
 FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
@@ -69,7 +70,8 @@ QUERY_BENCH_ARGS = \
 	$(call flag_arg,RECALL,recall) \
 	$(call flag_arg,BUCKETED,bucketed) \
 	$(call opt_arg,SCAN_FRACTION,scan-fraction) \
-	$(call opt_arg,VAR_THRESHOLD,var-threshold)
+	$(call opt_arg,VAR_THRESHOLD,var-threshold) \
+	$(call opt_arg,MAX_BUCKET_SIZE,max-bucket-size)
 
 .PHONY: help login compute clean
 
@@ -99,6 +101,7 @@ help:
 	@echo "  BUCKETED=1      --bucketed (streaming cosine k-means IVF)"
 	@echo "  SCAN_FRACTION   --scan-fraction (bucketed; default 0.1)"
 	@echo "  VAR_THRESHOLD   --var-threshold (bucketed; default 0.5)"
+	@echo "  MAX_BUCKET_SIZE --max-bucket-size (bucketed; default 1024; 0=off)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"

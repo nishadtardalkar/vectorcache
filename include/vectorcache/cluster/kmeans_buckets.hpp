@@ -17,6 +17,9 @@ struct BucketParams {
   float var_threshold = 0.5f;
   std::size_t min_split_size = 256;
   std::size_t split_iters = 5;
+  /// Force-split when a bucket exceeds this many vectors (0 = disable). Keeps IVF
+  /// granularity fine enough that scan_fraction is meaningful on tight clusters.
+  std::size_t max_bucket_size = 1024;
 };
 
 /// Streaming cosine k-means IVF in front of per-bucket TurboQuant FastScan.
