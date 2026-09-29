@@ -8,7 +8,7 @@ TurboQuant ANN engine (C++20) matching [turbovec](https://github.com/RyanCodrai/
 - CMake 3.20+
 - OpenMP (recommended)
 - For `fetch-datasets`: libcurl; Apache Arrow/Parquet for OpenAI datasets
-- For GloVe: HDF5 C library
+- For GloVe / SIFT1M: HDF5 C library
 
 On HPC clusters:
 
@@ -22,11 +22,13 @@ source scripts/envs.sh
 # Login node (internet):
 make login
 make login DATASETS=glove
+make login DATASETS=sift1m
 
 # Compute node (offline):
 make compute
 make compute BITS=4 RECALL=1 CALIBRATE=1
 make compute DATASET=openai-1536 BITS=2 K=64
+make compute DATASET=sift1m LIMIT=0 QUERY_LIMIT=10000
 ```
 
 `make login` configures CMake and downloads datasets into `data/`.  
@@ -61,7 +63,7 @@ ctest --output-on-failure
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `VECTORCACHE_BUILD_GLOVE` | ON | GloVe HDF5 reader |
+| `VECTORCACHE_BUILD_GLOVE` | ON | ann-benchmarks HDF5 reader (GloVe, SIFT1M) |
 | `VECTORCACHE_BUILD_TOOLS` | ON | CLI tools |
 | `VECTORCACHE_BUILD_TESTS` | ON | GoogleTest |
 | `VECTORCACHE_OPENMP` | ON | OpenMP encode/search |
@@ -73,12 +75,13 @@ ctest --output-on-failure
 ```bash
 ./query-bench --dataset glove --bits 4 --k 10
 ./query-bench --dataset glove --bits 4 --calibrate --recall
+./query-bench --dataset sift1m --bits 4 --k 10 --limit 0 --query-limit 10000
 ./query-bench --dataset openai-1536 --bits 2 --k 64
 ./query-bench --npy data/glove-train-100k.npy --limit 100000 --query-limit 1000
 ./query-bench --dataset glove --bucketed --scan-fraction 0.1 --var-threshold 0.5
 ```
 
-OpenAI NPY corpora have no HDF5-style `test` split; `--query-split` defaults to `holdout` (last `--query-limit` rows) for them. GloVe defaults to `test`.
+OpenAI NPY corpora have no HDF5-style `test` split; `--query-split` defaults to `holdout` (last `--query-limit` rows) for them. GloVe and SIFT1M default to `test`.
 
 Reports median batch search latency (`ms_per_query`) and optional **Recall@1@k** / **Recall@k**. Exact top-k IDs are cached under `.cache/exact_topk/` (keyed by dataset/npy, split, index size, query split/limit, and k) and reused on later runs with the same ground-truth parameters.
 

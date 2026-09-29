@@ -14,10 +14,11 @@ namespace vectorcache::datasets {
 
 #ifdef VECTORCACHE_BUILD_GLOVE
 
-/// HDF5 streaming reader for GloVe benchmark files.
+/// HDF5 streaming reader for ann-benchmarks files (GloVe, SIFT1M, …).
 class Hdf5GloveReader : public DatasetReader {
  public:
-  static Hdf5GloveReader open(const std::filesystem::path& path, DatasetSplit split);
+  static Hdf5GloveReader open(const std::filesystem::path& path, DatasetSplit split,
+                              const char* label = "glove");
   ~Hdf5GloveReader();
 
   Hdf5GloveReader(const Hdf5GloveReader&) = delete;
@@ -30,7 +31,7 @@ class Hdf5GloveReader : public DatasetReader {
 
  private:
   Hdf5GloveReader(hid_t file_id, hid_t dataset_id, std::string dataset_name, std::size_t dim,
-                  std::size_t count);
+                  std::size_t count, const char* label);
 
   void ensure_chunk();
   void close();
@@ -38,6 +39,7 @@ class Hdf5GloveReader : public DatasetReader {
   hid_t file_id_;
   hid_t dataset_id_;
   std::string dataset_name_;
+  const char* label_;
   std::size_t dim_;
   std::size_t count_;
   std::size_t index_;

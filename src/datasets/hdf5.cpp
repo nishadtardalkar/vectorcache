@@ -21,10 +21,11 @@ constexpr std::size_t kChunkRows = 1024;
 }  // namespace
 
 Hdf5GloveReader::Hdf5GloveReader(hid_t file_id, hid_t dataset_id, std::string dataset_name,
-                                 std::size_t dim, std::size_t count)
+                                 std::size_t dim, std::size_t count, const char* label)
     : file_id_(file_id),
       dataset_id_(dataset_id),
       dataset_name_(std::move(dataset_name)),
+      label_(label),
       dim_(dim),
       count_(count),
       index_(0),
@@ -37,6 +38,7 @@ Hdf5GloveReader::Hdf5GloveReader(Hdf5GloveReader&& other) noexcept
     : file_id_(other.file_id_),
       dataset_id_(other.dataset_id_),
       dataset_name_(std::move(other.dataset_name_)),
+      label_(other.label_),
       dim_(other.dim_),
       count_(other.count_),
       index_(other.index_),
@@ -53,6 +55,7 @@ Hdf5GloveReader& Hdf5GloveReader::operator=(Hdf5GloveReader&& other) noexcept {
     file_id_ = other.file_id_;
     dataset_id_ = other.dataset_id_;
     dataset_name_ = std::move(other.dataset_name_);
+    label_ = other.label_;
     dim_ = other.dim_;
     count_ = other.count_;
     index_ = other.index_;
@@ -76,17 +79,18 @@ void Hdf5GloveReader::close() {
   file_id_ = H5I_INVALID_HID;
 }
 
-Hdf5GloveReader Hdf5GloveReader::open(const std::filesystem::path& path, DatasetSplit split) {
+Hdf5GloveReader Hdf5GloveReader::open(const std::filesystem::path& path, DatasetSplit split,
+                                      const char* label) {
   const hid_t file_id = H5Fopen(path.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
   if (file_id < 0) {
-    throw Error("failed to open GloVe HDF5 file: " + path.string());
+    throw Error("failed to open HDF5 file: " + path.string());
   }
 
   const char* dataset_name = hdf5_dataset_name(split);
   const hid_t dataset_id = H5Dopen2(file_id, dataset_name, H5P_DEFAULT);
   if (dataset_id < 0) {
     H5Fclose(file_id);
-    throw Error(std::string("missing '") + dataset_name + "' dataset in GloVe HDF5");
+    throw Error(std::string("missing '") + dataset_name + "' dataset in HDF5");
   }
 
   const hid_t space_id = H5Dget_space(dataset_id);
@@ -95,7 +99,7 @@ Hdf5GloveReader Hdf5GloveReader::open(const std::filesystem::path& path, Dataset
     H5Sclose(space_id);
     H5Dclose(dataset_id);
     H5Fclose(file_id);
-    throw Error("expected 2-D GloVe dataset");
+    throw Error("expected 2-D HDF5 dataset");
   }
 
   hsize_t dims[2] = {0, 0};
@@ -103,11 +107,11 @@ Hdf5GloveReader Hdf5GloveReader::open(const std::filesystem::path& path, Dataset
   H5Sclose(space_id);
 
   return Hdf5GloveReader(file_id, dataset_id, dataset_name, static_cast<std::size_t>(dims[1]),
-                         static_cast<std::size_t>(dims[0]));
+                         static_cast<std::size_t>(dims[0]), label);
 }
 
 DatasetMeta Hdf5GloveReader::meta() const {
-  return DatasetMeta{dim_, count_, "glove"};
+  return DatasetMeta{dim_, count_, label_};
 }
 
 void Hdf5GloveReader::ensure_chunk() {
@@ -119,7 +123,7 @@ void Hdf5GloveReader::ensure_chunk() {
   }
 
   if (dataset_id_ < 0 || !H5Iis_valid(dataset_id_)) {
-    throw Error("missing '" + dataset_name_ + "' dataset in GloVe HDF5");
+    throw Error("missing '" + dataset_name_ + "' dataset in HDF5");
   }
 
   const std::size_t remaining = count_ - index_;

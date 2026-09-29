@@ -26,6 +26,9 @@ namespace {
 constexpr const char* kGloveUrl = "http://ann-benchmarks.com/glove-200-angular.hdf5";
 constexpr const char* kGloveFilename = "glove-200-angular.hdf5";
 constexpr std::uint64_t kGloveMinBytes = 100'000'000;
+constexpr const char* kSift1MUrl = "http://ann-benchmarks.com/sift-128-euclidean.hdf5";
+constexpr const char* kSift1MFilename = "sift-128-euclidean.hdf5";
+constexpr std::uint64_t kSift1MMinBytes = 100'000'000;
 constexpr const char* kHfDatasetBase = "https://huggingface.co/datasets";
 
 std::size_t openai_parquet_shard_count(std::size_t dim) {
@@ -83,12 +86,13 @@ void download_url_to_file(const std::string& url, const std::filesystem::path& t
   std::filesystem::rename(tmp, dest);
 }
 
-void validate_glove(const std::filesystem::path& path) {
+void validate_ann_hdf5(const std::filesystem::path& path, std::uint64_t min_bytes,
+                       const char* label) {
   if (!std::filesystem::is_regular_file(path)) {
     throw Error("file does not exist: " + path.string());
   }
-  if (std::filesystem::file_size(path) < kGloveMinBytes) {
-    throw Error("GloVe file is too small");
+  if (std::filesystem::file_size(path) < min_bytes) {
+    throw Error(std::string(label) + " file is too small");
   }
 
   std::ifstream file(path, std::ios::binary);
@@ -100,9 +104,17 @@ void validate_glove(const std::filesystem::path& path) {
   }
 
 #ifdef VECTORCACHE_BUILD_GLOVE
-  Hdf5GloveReader::open(path, DatasetSplit::Train);
-  Hdf5GloveReader::open(path, DatasetSplit::Test);
+  Hdf5GloveReader::open(path, DatasetSplit::Train, label);
+  Hdf5GloveReader::open(path, DatasetSplit::Test, label);
 #endif
+}
+
+void validate_glove(const std::filesystem::path& path) {
+  validate_ann_hdf5(path, kGloveMinBytes, "glove");
+}
+
+void validate_sift1m(const std::filesystem::path& path) {
+  validate_ann_hdf5(path, kSift1MMinBytes, "sift1m");
 }
 
 std::pair<std::size_t, std::size_t> read_openai_shape(const std::filesystem::path& path) {
@@ -210,11 +222,28 @@ void fetch_glove(const std::filesystem::path& data_dir, bool force) {
   }
 
   std::printf("Downloading %s ...\n", kGloveUrl);
-  const auto tmp = dest;
   const auto tmp_path = std::filesystem::path(dest.string() + ".tmp");
   download_url_to_file(kGloveUrl, tmp_path, dest);
   validate_glove(dest);
   print_dataset_status("GloVe", dest, "train + test HDF5 datasets", false);
+}
+
+void fetch_sift1m(const std::filesystem::path& data_dir, bool force) {
+  const auto dest = data_dir / kSift1MFilename;
+  if (!force) {
+    try {
+      validate_sift1m(dest);
+      print_dataset_status("SIFT1M", dest, "train + test HDF5 datasets", true);
+      return;
+    } catch (...) {
+    }
+  }
+
+  std::printf("Downloading %s ...\n", kSift1MUrl);
+  const auto tmp_path = std::filesystem::path(dest.string() + ".tmp");
+  download_url_to_file(kSift1MUrl, tmp_path, dest);
+  validate_sift1m(dest);
+  print_dataset_status("SIFT1M", dest, "train + test HDF5 datasets", false);
 }
 
 #ifdef VECTORCACHE_FETCH_OPENAI
@@ -290,6 +319,9 @@ void fetch(DatasetKind kind, const std::filesystem::path& data_dir, bool force) 
   switch (kind) {
     case DatasetKind::Glove:
       fetch_glove(data_dir, force);
+      break;
+    case DatasetKind::Sift1M:
+      fetch_sift1m(data_dir, force);
       break;
     case DatasetKind::OpenAi1536:
     case DatasetKind::OpenAi3072:

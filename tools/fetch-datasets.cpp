@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
 
   app.add_option("--data-dir", data_dir, "Output directory for downloaded files");
   app.add_flag("--force", force, "Re-download even when a valid file already exists");
-  app.add_option("targets", targets, "Datasets: glove, openai-1536, openai-3072, or all")
+  app.add_option("targets", targets, "Datasets: glove, sift1m, openai-1536, openai-3072, or all")
       ->required();
 
   CLI11_PARSE(app, argc, argv);

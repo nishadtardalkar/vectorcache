@@ -313,7 +313,7 @@ int main(int argc, char** argv) {
   std::string npy;
   std::string data_dir = "data";
   std::string split = "train";
-  std::string query_split;  // default: test for glove, holdout for OpenAI / --npy
+  std::string query_split;  // default: test for glove/sift1m, holdout for OpenAI / --npy
   std::size_t limit = 100000;
   std::size_t query_limit = 1000;
   std::size_t bits = 4;
@@ -328,12 +328,12 @@ int main(int argc, char** argv) {
   std::size_t split_iters = 5;
   std::size_t timing_runs = 5;
 
-  app.add_option("--dataset", dataset, "Named dataset (glove, openai-1536, openai-3072)");
+  app.add_option("--dataset", dataset, "Named dataset (glove, sift1m, openai-1536, openai-3072)");
   app.add_option("--npy", npy, "Path to .npy matrix (overrides --dataset)");
   app.add_option("--data-dir", data_dir, "Dataset directory");
   app.add_option("--split", split, "Index split (train/test; HDF5 only)");
   app.add_option("--query-split", query_split,
-                 "Query split: test (GloVe) or holdout (OpenAI/NPY); default by dataset");
+                 "Query split: test (GloVe/SIFT1M) or holdout (OpenAI/NPY); default by dataset");
   app.add_option("--limit", limit, "Max index vectors (0 = all)");
   app.add_option("--query-limit", query_limit, "Max queries (0 = all)");
   app.add_option("--bits", bits, "Bits per dim (2-4)")->check(CLI::Range(2, 4));
@@ -379,7 +379,9 @@ int main(int argc, char** argv) {
     };
 
     if (query_split.empty()) {
-      query_split = (dataset == "glove" && npy.empty()) ? "test" : "holdout";
+      const bool hdf5_test =
+          npy.empty() && (dataset == "glove" || dataset == "sift1m" || dataset == "sift");
+      query_split = hdf5_test ? "test" : "holdout";
     }
 
     Matrix db;

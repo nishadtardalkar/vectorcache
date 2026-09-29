@@ -10,7 +10,7 @@
 
 namespace vectorcache::datasets {
 
-enum class DatasetKind { Glove, OpenAi1536, OpenAi3072 };
+enum class DatasetKind { Glove, Sift1M, OpenAi1536, OpenAi3072 };
 
 std::optional<DatasetKind> parse_dataset_kind(const std::string& name);
 std::vector<DatasetKind> all_dataset_kinds();
