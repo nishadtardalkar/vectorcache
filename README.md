@@ -43,7 +43,7 @@ make compute DATASET=sift1m LIMIT=0 QUERY_LIMIT=10000
 5. Store RaBitQ-style scale `α = ‖v‖ / ⟨u, x̂⟩`
 6. Flat SIMD search over BLOCK=32 FastScan layout (x86: FAISS `PERM0` or vector-major when AVX-512 VNNI is available)
 
-Optional `BucketedTurboQuantIndex`: streaming cosine k-means assigns each vector to a bucket; variance-triggered local splits; query opens buckets by centroid score until `scan_fraction` of the index is covered, then runs the same FastScan inside each opened bucket.
+Optional `BucketedTurboQuantIndex`: L2-normalize, assign to an existing bucket if cosine to its frozen centroid ≥ `cos_threshold`, else spawn a new cluster with the vector as centroid; query opens buckets by centroid score until `scan_fraction` of the index is covered, then runs the same FastScan inside each opened bucket.
 
 `dim` must be a positive multiple of 8, ≤ 16384.
 
@@ -78,14 +78,14 @@ ctest --output-on-failure
 ./query-bench --dataset sift1m --bits 4 --k 10 --limit 0 --query-limit 10000
 ./query-bench --dataset openai-1536 --bits 2 --k 64
 ./query-bench --npy data/glove-train-100k.npy --limit 100000 --query-limit 1000
-./query-bench --dataset glove --bucketed --scan-fraction 0.1 --var-threshold 0.5
+./query-bench --dataset glove --bucketed --scan-fraction 0.1 --cos-threshold 0.7
 ```
 
 OpenAI NPY corpora have no HDF5-style `test` split; `--query-split` defaults to `holdout` (last `--query-limit` rows) for them. GloVe and SIFT1M default to `test`.
 
 Reports median batch search latency (`ms_per_query`) and optional **Recall@1@k** / **Recall@k**. Exact top-k IDs are cached under `.cache/exact_topk/` (keyed by dataset/npy, split, index size, query split/limit, and k) and reused on later runs with the same ground-truth parameters.
 
-Bucketed mode flags: `--bucketed`, `--scan-fraction`, `--var-threshold`, `--min-split-size`, `--split-iters`.
+Bucketed mode flags: `--bucketed`, `--scan-fraction`, `--cos-threshold`.
 
 ## Library sketch
 
@@ -100,8 +100,8 @@ index.add(database);       // flat float[n * dim]
 index.prepare();
 auto res = index.search(queries, /*k=*/10);
 
-// Bucketed (streaming cosine k-means + per-bucket FastScan)
-vectorcache::BucketParams p;  // scan_fraction, var_threshold, ...
+// Bucketed (online cosine-threshold IVF + per-bucket FastScan)
+vectorcache::BucketParams p;  // scan_fraction, cos_threshold, ...
 vectorcache::BucketedTurboQuantIndex bindex(/*dim=*/1536, /*bits=*/4, p);
 bindex.calibrate(sample);
 bindex.add(database);

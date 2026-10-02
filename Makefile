@@ -22,9 +22,7 @@ CALIBRATE     ?=
 RECALL        ?=
 BUCKETED      ?=
 SCAN_FRACTION ?=
-VAR_THRESHOLD ?=
-MIN_SPLIT_SIZE ?=
-MAX_BUCKET_SIZE ?=
+COS_THRESHOLD ?=
 FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
@@ -71,9 +69,7 @@ QUERY_BENCH_ARGS = \
 	$(call flag_arg,RECALL,recall) \
 	$(call flag_arg,BUCKETED,bucketed) \
 	$(call opt_arg,SCAN_FRACTION,scan-fraction) \
-	$(call opt_arg,VAR_THRESHOLD,var-threshold) \
-	$(call opt_arg,MIN_SPLIT_SIZE,min-split-size) \
-	$(call opt_arg,MAX_BUCKET_SIZE,max-bucket-size)
+	$(call opt_arg,COS_THRESHOLD,cos-threshold)
 
 .PHONY: help login compute clean
 
@@ -100,11 +96,9 @@ help:
 	@echo "  QUERY_SPLIT     --query-split (test for glove/sift1m; holdout for openai)"
 	@echo "  CALIBRATE=1     --calibrate (TQ+)"
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
-	@echo "  BUCKETED=1      --bucketed (streaming cosine k-means IVF)"
+	@echo "  BUCKETED=1      --bucketed (online cosine-threshold IVF)"
 	@echo "  SCAN_FRACTION   --scan-fraction (bucketed; default 0.1)"
-	@echo "  VAR_THRESHOLD   --var-threshold (bucketed; default 0.5)"
-	@echo "  MIN_SPLIT_SIZE  --min-split-size (bucketed; default 256)"
-	@echo "  MAX_BUCKET_SIZE --max-bucket-size (bucketed; default 1024; 0=off)"
+	@echo "  COS_THRESHOLD   --cos-threshold (bucketed; default 0.7)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"

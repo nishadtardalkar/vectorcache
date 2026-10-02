@@ -55,9 +55,7 @@ TEST(KMeansBuckets, AddSearchAndIds) {
 
   vectorcache::BucketParams params;
   params.scan_fraction = 1.f;  // open all buckets → match flat coverage
-  params.var_threshold = 0.3f;
-  params.min_split_size = 64;
-  params.split_iters = 5;
+  params.cos_threshold = 0.7f;
 
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
@@ -78,57 +76,79 @@ TEST(KMeansBuckets, AddSearchAndIds) {
   }
 }
 
-TEST(KMeansBuckets, VarianceSplitGrowsBuckets) {
+TEST(KMeansBuckets, SameDirectionJoinsOneCluster) {
   constexpr std::size_t dim = 32;
-  constexpr std::size_t n = 400;
+  constexpr std::size_t n = 50;
 
-  // Two well-separated clusters so variance force-splits.
+  // All nearly parallel (tiny noise) → one cluster at threshold 0.7.
   std::vector<float> db(n * dim, 0.f);
   for (std::size_t i = 0; i < n; ++i) {
-    db[i * dim + 0] = (i < n / 2) ? 1.f : 0.f;
-    db[i * dim + 1] = (i < n / 2) ? 0.f : 1.f;
-    // Small noise.
-    db[i * dim + 2] = 0.01f * static_cast<float>((i % 7) - 3);
+    db[i * dim + 0] = 1.f;
+    db[i * dim + 1] = 0.01f * static_cast<float>(static_cast<int>(i % 5) - 2);
   }
 
   vectorcache::BucketParams params;
-  params.scan_fraction = 0.5f;
-  params.var_threshold = 0.2f;
-  params.min_split_size = 32;
-  params.split_iters = 8;
-
-  vectorcache::BucketedTurboQuantIndex index(dim, 2, params);
-  index.add(db);
-  EXPECT_GT(index.num_buckets(), 1u);
-  std::size_t total = 0;
-  for (std::size_t b = 0; b < index.num_buckets(); ++b) {
-    total += index.bucket_size(b);
-  }
-  EXPECT_EQ(total, n);
-}
-
-TEST(KMeansBuckets, MaxBucketSizeForcesSplit) {
-  constexpr std::size_t dim = 32;
-  constexpr std::size_t n = 800;
-
-  // Tight cluster: variance stays low, so only max_bucket_size should force splits.
-  auto db = random_matrix(n, dim, 42);
-  for (std::size_t i = 0; i < n; ++i) {
-    db[i * dim + 0] += 10.f;  // pull toward same direction
-  }
-
-  vectorcache::BucketParams params;
-  params.scan_fraction = 0.2f;
-  params.var_threshold = 10.f;  // effectively disable variance splits
-  params.min_split_size = 32;
-  params.max_bucket_size = 64;
-  params.split_iters = 5;
+  params.scan_fraction = 1.f;
+  params.cos_threshold = 0.7f;
 
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
-  EXPECT_GT(index.num_buckets(), 1u);
-  for (std::size_t b = 0; b < index.num_buckets(); ++b) {
-    EXPECT_LE(index.bucket_size(b), params.max_bucket_size);
+  EXPECT_EQ(index.num_buckets(), 1u);
+  EXPECT_EQ(index.bucket_size(0), n);
+}
+
+TEST(KMeansBuckets, OrthogonalSpawnsNewClusters) {
+  constexpr std::size_t dim = 32;
+  constexpr std::size_t n = 4;
+
+  // Pairwise orthogonal unit axes → each vector forms its own cluster.
+  std::vector<float> db(n * dim, 0.f);
+  for (std::size_t i = 0; i < n; ++i) {
+    db[i * dim + i] = 1.f;
+  }
+
+  vectorcache::BucketParams params;
+  params.scan_fraction = 1.f;
+  params.cos_threshold = 0.7f;
+
+  vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
+  index.add(db);
+  EXPECT_EQ(index.num_buckets(), n);
+  for (std::size_t b = 0; b < n; ++b) {
+    EXPECT_EQ(index.bucket_size(b), 1u);
+  }
+}
+
+TEST(KMeansBuckets, CentroidFrozenAfterJoins) {
+  constexpr std::size_t dim = 16;
+
+  // Founding vector along e0; joiners are close enough to pass threshold.
+  std::vector<float> first(dim, 0.f);
+  first[0] = 1.f;
+
+  std::vector<float> joiners(3 * dim, 0.f);
+  for (std::size_t i = 0; i < 3; ++i) {
+    joiners[i * dim + 0] = 1.f;
+    joiners[i * dim + 1] = 0.1f * static_cast<float>(i + 1);
+  }
+
+  vectorcache::BucketParams params;
+  params.scan_fraction = 1.f;
+  params.cos_threshold = 0.7f;
+
+  vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
+  index.add(first);
+  ASSERT_EQ(index.num_buckets(), 1u);
+  auto c0 = index.bucket_centroid(0);
+  std::vector<float> frozen(c0.begin(), c0.end());
+
+  index.add(joiners);
+  EXPECT_EQ(index.num_buckets(), 1u);
+  EXPECT_EQ(index.bucket_size(0), 4u);
+  auto c1 = index.bucket_centroid(0);
+  ASSERT_EQ(c1.size(), frozen.size());
+  for (std::size_t d = 0; d < dim; ++d) {
+    EXPECT_FLOAT_EQ(c1[d], frozen[d]);
   }
 }
 
@@ -136,16 +156,22 @@ TEST(KMeansBuckets, ScanFractionOpensSubset) {
   constexpr std::size_t dim = 32;
   constexpr std::size_t n = 300;
 
-  auto db = random_matrix(n, dim, 99);
+  // Orthogonal-ish batches so many buckets exist and scan_fraction matters.
+  std::vector<float> db(n * dim, 0.f);
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::size_t axis = i % 8;
+    db[i * dim + axis] = 1.f;
+    db[i * dim + ((axis + 1) % dim)] = 0.02f * static_cast<float>(static_cast<int>(i % 5) - 2);
+  }
+
   vectorcache::BucketParams params;
   params.scan_fraction = 0.2f;
-  params.var_threshold = 0.25f;
-  params.min_split_size = 40;
+  params.cos_threshold = 0.7f;
 
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
   index.prepare();
-  ASSERT_GE(index.num_buckets(), 1u);
+  ASSERT_GE(index.num_buckets(), 2u);
 
   auto q = random_matrix(1, dim, 123);
   auto res = index.search(q, 3);
@@ -169,8 +195,7 @@ TEST(KMeansBuckets, FullScanMatchesFlatIdsOften) {
 
   vectorcache::BucketParams params;
   params.scan_fraction = 1.f;
-  params.var_threshold = 0.4f;
-  params.min_split_size = 64;
+  params.cos_threshold = 0.7f;
 
   vectorcache::BucketedTurboQuantIndex bucketed(dim, 4, params);
   bucketed.add(db);
@@ -193,14 +218,12 @@ TEST(KMeansBuckets, SharedHeapFullScanK64Deterministic) {
 
   vectorcache::BucketParams params;
   params.scan_fraction = 1.f;
-  params.var_threshold = 0.3f;
-  params.min_split_size = 64;
-  params.max_bucket_size = 128;
+  params.cos_threshold = 0.7f;
 
   vectorcache::BucketedTurboQuantIndex a(dim, 4, params);
   a.add(db);
   a.prepare();
-  ASSERT_GT(a.num_buckets(), 1u);
+  ASSERT_GE(a.num_buckets(), 1u);
   auto r1 = a.search(queries, k);
   auto r2 = a.search(queries, k);
 

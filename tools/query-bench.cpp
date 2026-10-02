@@ -322,10 +322,7 @@ int main(int argc, char** argv) {
   bool recall = false;
   bool bucketed = false;
   float scan_fraction = 0.1f;
-  float var_threshold = 0.5f;
-  std::size_t min_split_size = 256;
-  std::size_t max_bucket_size = 1024;
-  std::size_t split_iters = 5;
+  float cos_threshold = 0.7f;
   std::size_t timing_runs = 5;
 
   app.add_option("--dataset", dataset, "Named dataset (glove, sift1m, openai-1536, openai-3072)");
@@ -340,15 +337,12 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_flag("--calibrate", calibrate, "Fit TQ+ on first min(1000, n) index vectors before add");
   app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
-  app.add_flag("--bucketed", bucketed, "Use streaming cosine k-means bucketed index");
+  app.add_flag("--bucketed", bucketed, "Use online cosine-threshold bucketed index");
   app.add_option("--scan-fraction", scan_fraction,
                  "Fraction of index to open at query time (bucketed)")
       ->check(CLI::Range(0.0f, 1.0f));
-  app.add_option("--var-threshold", var_threshold, "Cluster variance split threshold (bucketed)");
-  app.add_option("--min-split-size", min_split_size, "Min cluster size before split (bucketed)");
-  app.add_option("--max-bucket-size", max_bucket_size,
-                 "Force-split buckets larger than this (0=off; bucketed, default 1024)");
-  app.add_option("--split-iters", split_iters, "Lloyd iterations on split (bucketed)");
+  app.add_option("--cos-threshold", cos_threshold,
+                 "Min cosine to join existing cluster; else spawn new (bucketed, default 0.7)");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
   CLI11_PARSE(app, argc, argv);
@@ -446,10 +440,7 @@ int main(int argc, char** argv) {
     if (bucketed) {
       vectorcache::BucketParams params;
       params.scan_fraction = scan_fraction;
-      params.var_threshold = var_threshold;
-      params.min_split_size = min_split_size;
-      params.max_bucket_size = max_bucket_size;
-      params.split_iters = split_iters;
+      params.cos_threshold = cos_threshold;
       vectorcache::BucketedTurboQuantIndex index(db.cols, bits, params);
       if (calibrate) {
         const std::size_t n_cal =
@@ -479,8 +470,7 @@ int main(int argc, char** argv) {
                 << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
       std::cout << "buckets=" << index.num_buckets() << " max_bucket=" << max_b
                 << " mean_bucket=" << mean_b << " scan_fraction=" << scan_fraction
-                << " var_threshold=" << var_threshold << " max_bucket_size=" << max_bucket_size
-                << "\n";
+                << " cos_threshold=" << cos_threshold << "\n";
       std::cout << "top_bucket_sizes:";
       const std::size_t top_n = std::min<std::size_t>(10, bucket_sizes.size());
       for (std::size_t i = 0; i < top_n; ++i) {

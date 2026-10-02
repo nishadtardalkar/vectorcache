@@ -14,15 +14,12 @@ namespace vectorcache {
 
 struct BucketParams {
   float scan_fraction = 0.1f;
-  float var_threshold = 0.5f;
-  std::size_t min_split_size = 256;
-  std::size_t split_iters = 5;
-  /// Force-split when a bucket exceeds this many vectors (0 = disable). Keeps IVF
-  /// granularity fine enough that scan_fraction is meaningful on tight clusters.
-  std::size_t max_bucket_size = 1024;
+  /// Join existing cluster if cosine(unit vec, centroid) >= this; else spawn new.
+  float cos_threshold = 0.7f;
 };
 
-/// Streaming cosine k-means IVF in front of per-bucket TurboQuant FastScan.
+/// Online cosine-threshold IVF in front of per-bucket TurboQuant FastScan.
+/// Centroids are frozen at cluster creation (founding unit vector).
 class BucketedTurboQuantIndex {
  public:
   BucketedTurboQuantIndex(std::size_t dim, std::size_t bit_width, BucketParams params = {});
@@ -41,8 +38,9 @@ class BucketedTurboQuantIndex {
   SearchResults search(std::span<const float> queries, std::size_t k) const;
 
   bool has_calibration() const { return calibration_.has_value(); }
-  float bucket_variance(std::size_t bucket) const;
   std::size_t bucket_size(std::size_t bucket) const;
+  /// Unit centroid of bucket (frozen at creation). Length = dim().
+  std::span<const float> bucket_centroid(std::size_t bucket) const;
 
  private:
   struct Bucket {
@@ -54,22 +52,14 @@ class BucketedTurboQuantIndex {
     mutable std::size_t n_blocks = 0;
     mutable bool blocked_ready = false;
 
-    std::vector<float> centroid;  // unit, dim
+    std::vector<float> centroid;  // unit, dim — frozen at create
     std::size_t count = 0;
-    double sum_sq_dist = 0.0;  // Σ ‖x − c‖² with unit vectors = Σ 2(1 − cos)
-
-    float variance() const {
-      return count == 0 ? 0.f : static_cast<float>(sum_sq_dist / static_cast<double>(count));
-    }
   };
 
   void ensure_bucket_blocked(std::size_t bi) const;
   void sync_centroid_matrix();
   void append_to_bucket(std::size_t bi, std::span<const float> unit_row, std::uint64_t id);
-  void update_centroid_online(Bucket& b, std::span<const float> unit_row);
-  void maybe_split(std::size_t bi);
-  void split_bucket(std::size_t bi);
-  void reencode_bucket(Bucket& b);
+  std::size_t spawn_bucket(std::span<const float> unit_row);
 
   std::size_t dim_;
   std::size_t bits_;

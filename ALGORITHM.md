@@ -1,6 +1,6 @@
 # VectorCache Algorithm
 
-Approximate nearest-neighbor search matching turbovec's TurboQuant core, with an optional streaming cosine k-means bucketing layer in front of flat FastScan.
+Approximate nearest-neighbor search matching turbovec's TurboQuant core, with an optional online cosine-threshold bucketing layer in front of flat FastScan.
 
 ## Per-bucket TurboQuant (unchanged core)
 
@@ -30,16 +30,17 @@ Approximate nearest-neighbor search matching turbovec's TurboQuant core, with an
  + store α
 ```
 
-## Streaming cosine k-means bucketing (`BucketedTurboQuantIndex`)
+## Online cosine-threshold bucketing (`BucketedTurboQuantIndex`)
 
-Clustering is in **input L2-normalized space** (not TurboQuant rotated space). Shared rotation/codebook/TQ+ across buckets.
+Clustering is in **input L2-normalized space** (not TurboQuant rotated space). No SRHT on the clustering path. Shared rotation/codebook/TQ+ across buckets for encode/search only.
 
 **Ingest**
 
 1. L2-normalize the vector
-2. Assign to nearest cluster centroid by cosine (dot of unit vectors); AVX2 + OpenMP batch scoring
-3. Append unit float + TurboQuant-encode into that bucket; online update centroid and variance `E[‖x−c‖²] = 2(1−E[cos])`
-4. If `count ≥ min_split_size` and (`variance ≥ var_threshold` **or** `count > max_bucket_size`): spherical k-means (k=2) on **that bucket’s floats only**, re-encode both children, replace parent (no full-index rebuild). Size-based splits keep buckets fine enough that `scan_fraction` is not dominated by one huge open.
+2. Score against all existing cluster centroids by cosine (dot of unit vectors)
+3. If `best_cos ≥ cos_threshold`: append into that bucket (centroid unchanged)
+4. Else: create a new cluster with the current unit vector as the **frozen** centroid, then append
+5. TurboQuant-encode the row into the chosen bucket
 
 **Query**
 
@@ -48,7 +49,7 @@ Clustering is in **input L2-normalized space** (not TurboQuant rotated space). S
 3. Open buckets in order until cumulative size ≥ `scan_fraction * N` (at least one non-empty)
 4. FastScan each opened bucket; remap local ids via stored global ids; merge heaps to top-k
 
-Defaults: `scan_fraction=0.1`, `var_threshold=0.5`, `min_split_size=256`, `max_bucket_size=1024`, `split_iters=5`, start with one cluster.
+Defaults: `scan_fraction=0.1`, `cos_threshold=0.7`, start with zero clusters.
 
 ## Ranking
 
