@@ -111,7 +111,7 @@ void score_query_scalar(const PreparedQueryLut& lut, std::span<const std::uint8_
                         std::size_t n_byte_groups, std::size_t n_vectors, std::size_t n_blocks,
                         std::size_t k, float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                         float& heap_min, std::size_t& heap_mi, float bias_corr,
-                        const std::uint64_t* id_map) {
+                        const std::uint64_t* id_map, float score_offset) {
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t base_vec = b * kBlock;
     for (std::size_t lane = 0; lane < kBlock; ++lane) {
@@ -124,7 +124,7 @@ void score_query_scalar(const PreparedQueryLut& lut, std::span<const std::uint8_
         score += lut.scale * static_cast<float>(lut.uint8_luts[g * 32 + (byte_val >> 4)]);
         score += lut.scale * static_cast<float>(lut.uint8_luts[g * 32 + 16 + (byte_val & 0x0F)]);
       }
-      score *= vec_scales[vi];
+      score = score * vec_scales[vi] + score_offset;
       heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, score,
                            topk_map_id(id_map, vi));
     }
@@ -394,7 +394,7 @@ SearchResults score_prepared_perm0(const PreparedQueries& prep, std::size_t effe
       QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
       score_query_avx2_perm0(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks,
                              effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi,
-                             prep.bias_corrs[gqi], nullptr);
+                             prep.bias_corrs[gqi], nullptr, 0.f);
     } else
 #else
     (void)use_avx2;
@@ -402,7 +402,7 @@ SearchResults score_prepared_perm0(const PreparedQueries& prep, std::size_t effe
     {
       score_query_scalar(lut, blocked_codes, scales, prep.bits, prep.n_byte_groups, n_vectors,
                          n_blocks, effective_k, heap_s.data(), heap_i.data(), heap_sz, heap_min,
-                         heap_mi, prep.bias_corrs[gqi], nullptr);
+                         heap_mi, prep.bias_corrs[gqi], nullptr, 0.f);
     }
     write_sorted_topk(out, static_cast<std::size_t>(qi), effective_k, heap_s, heap_i, heap_sz);
   }
@@ -577,7 +577,7 @@ void score_prepared_into(const PreparedQueries& prep, std::size_t k,
                          std::span<const float> scales, std::span<const std::uint64_t> id_map,
                          std::span<const std::size_t> query_indices, float* heap_s,
                          std::uint64_t* heap_i, std::size_t* heap_sz, float* heap_min,
-                         std::size_t* heap_mi) {
+                         std::size_t* heap_mi, const float* score_offsets) {
   if (query_indices.empty()) {
     throw std::invalid_argument("score_prepared_into requires non-empty query_indices");
   }
@@ -603,27 +603,28 @@ void score_prepared_into(const PreparedQueries& prep, std::size_t k,
     std::size_t& hsz = heap_sz[gqi];
     float& hmin = heap_min[gqi];
     std::size_t& hmi = heap_mi[gqi];
+    const float off = score_offsets ? score_offsets[gqi] : 0.f;
 
     if (prep.backend == SearchBackendKind::VmPermuteDot) {
       score_query_permute_dot(prep.pds[gqi], blocked_codes, scales, prep.n_byte_groups, n_vectors,
-                              n_blocks, k, hs, hi, hsz, hmin, hmi, id_ptr);
+                              n_blocks, k, hs, hi, hsz, hmin, hmi, id_ptr, off);
     } else if (prep.backend == SearchBackendKind::VmVnni) {
       QueryLutView view{prep.split_luts[gqi].data(), prep.lut_scales[gqi], prep.lut_biases[gqi]};
       score_query_vnni(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks, k, hs,
-                       hi, hsz, hmin, hmi, 0.f, id_ptr);
+                       hi, hsz, hmin, hmi, 0.f, id_ptr, off);
     } else {
 #if defined(__x86_64__) || defined(_M_X64)
       if (prep.backend == SearchBackendKind::Avx2) {
         const auto& lut = prep.luts[gqi];
         QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
         score_query_avx2_perm0(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks,
-                               k, hs, hi, hsz, hmin, hmi, prep.bias_corrs[gqi], id_ptr);
+                               k, hs, hi, hsz, hmin, hmi, prep.bias_corrs[gqi], id_ptr, off);
       } else
 #endif
       {
         score_query_scalar(prep.luts[gqi], blocked_codes, scales, prep.bits, prep.n_byte_groups,
                            n_vectors, n_blocks, k, hs, hi, hsz, hmin, hmi, prep.bias_corrs[gqi],
-                           id_ptr);
+                           id_ptr, off);
       }
     }
   }

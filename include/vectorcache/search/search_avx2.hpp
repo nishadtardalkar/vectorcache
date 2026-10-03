@@ -19,6 +19,6 @@ void score_query_avx2_perm0(QueryLutView lut, std::span<const std::uint8_t> bloc
                             std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                             float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                             float& heap_min, std::size_t& heap_mi, float bias_corr,
-                            const std::uint64_t* id_map = nullptr);
+                            const std::uint64_t* id_map = nullptr, float score_offset = 0.f);
 
 }  // namespace vectorcache

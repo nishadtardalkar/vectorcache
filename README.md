@@ -43,7 +43,7 @@ make compute DATASET=sift1m LIMIT=0 QUERY_LIMIT=10000
 5. Store RaBitQ-style scale `α = ‖v‖ / ⟨u, x̂⟩`
 6. Flat SIMD search over BLOCK=32 FastScan layout (x86: FAISS `PERM0` or vector-major when AVX-512 VNNI is available)
 
-Optional `BucketedTurboQuantIndex`: L2-normalize, assign to an existing bucket if cosine to its frozen centroid ≥ `cos_threshold`, else spawn a new cluster with the vector as centroid; query opens buckets by centroid score until `scan_fraction` of the index is covered, then runs the same FastScan inside each opened bucket.
+Optional `BucketedTurboQuantIndex`: L2-normalize, assign to an existing bucket if cosine to its frozen centroid ≥ `cos_threshold`, else spawn a new cluster with the vector as centroid; **encode residual `x̂ − c`** per bucket. Query builds FastScan LUTs once on `q̂`, opens buckets by centroid score until `scan_fraction` of the index is covered, and ranks with `⟨q̂, c⟩ + α · ⟨q̂, r̂⟩`.
 
 `dim` must be a positive multiple of 8, ≤ 16384.
 

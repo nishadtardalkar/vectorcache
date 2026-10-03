@@ -35,7 +35,7 @@ VECTORCACHE_AVX512_FN
 void flush_block_heap(__m512 f0, __m512 f1, std::size_t base_vec, std::size_t n_vectors,
                       const float* vec_scales, std::size_t k, float* heap_s, std::uint64_t* heap_i,
                       std::size_t& heap_sz, float& heap_min, std::size_t& heap_mi,
-                      const std::uint64_t* id_map) {
+                      const std::uint64_t* id_map, float score_offset) {
   alignas(64) float scores[kBlock];
   _mm512_storeu_ps(scores, f0);
   _mm512_storeu_ps(scores + 16, f1);
@@ -43,7 +43,7 @@ void flush_block_heap(__m512 f0, __m512 f1, std::size_t base_vec, std::size_t n_
   for (std::size_t lane = 0; lane < end - base_vec; ++lane) {
     const std::size_t vi = base_vec + lane;
     heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k,
-                         scores[lane] * vec_scales[vi], topk_map_id(id_map, vi));
+                         scores[lane] * vec_scales[vi] + score_offset, topk_map_id(id_map, vi));
   }
 }
 
@@ -52,7 +52,8 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
                            std::span<const float> vec_scales, std::size_t n_byte_groups,
                            std::size_t n_vectors, std::size_t n_blocks, std::size_t k, float* heap_s,
                            std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min,
-                           std::size_t& heap_mi, float bias_corr, const std::uint64_t* id_map) {
+                           std::size_t& heap_mi, float bias_corr, const std::uint64_t* id_map,
+                           float score_offset) {
   assert(n_byte_groups % 4 == 0);
   assert(lut.uint8_luts != nullptr);
 
@@ -109,7 +110,7 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
       const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
       const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
       flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s, heap_i, heap_sz,
-                       heap_min, heap_mi, id_map);
+                       heap_min, heap_mi, id_map, score_offset);
     }
   }
 
@@ -134,7 +135,7 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
     const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
     const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
     flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s, heap_i, heap_sz,
-                     heap_min, heap_mi, id_map);
+                     heap_min, heap_mi, id_map, score_offset);
   }
 }
 
@@ -189,7 +190,7 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
       const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][0]), vs), vb);
       const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][1]), vs), vb);
       flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s[qi], heap_i[qi],
-                       heap_sz[qi], heap_min[qi], heap_mi[qi], id_map);
+                       heap_sz[qi], heap_min[qi], heap_mi[qi], id_map, 0.f);
     }
   }
 }
@@ -203,7 +204,7 @@ void score_query_permute_dot_blk2(const QueryPermuteDot& pd,
                                   std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                                   float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                                   float& heap_min, std::size_t& heap_mi,
-                                  const std::uint64_t* id_map) {
+                                  const std::uint64_t* id_map, float score_offset) {
   assert(n_byte_groups % 4 == 0);
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const std::size_t quads = n_byte_groups / 4;
@@ -264,7 +265,7 @@ void score_query_permute_dot_blk2(const QueryPermuteDot& pd,
       const __m512 f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(a[0]), vs, vb);
       const __m512 f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(a[1]), vs, vb);
       flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s, heap_i, heap_sz,
-                       heap_min, heap_mi, id_map);
+                       heap_min, heap_mi, id_map, score_offset);
     }
   }
 
@@ -294,7 +295,7 @@ void score_query_permute_dot_blk2(const QueryPermuteDot& pd,
     const __m512 f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(a[0]), vs, vb);
     const __m512 f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(a[1]), vs, vb);
     flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s, heap_i, heap_sz,
-                     heap_min, heap_mi, id_map);
+                     heap_min, heap_mi, id_map, score_offset);
   }
 }
 
@@ -361,7 +362,7 @@ void score_queries_permute_dot_multi(const QueryPermuteDot* const* pds, std::siz
       const __m512 f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[qi][0]), vs, vb);
       const __m512 f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[qi][1]), vs, vb);
       flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s[qi], heap_i[qi],
-                       heap_sz[qi], heap_min[qi], heap_mi[qi], id_map);
+                       heap_sz[qi], heap_min[qi], heap_mi[qi], id_map, 0.f);
     }
   }
 }
@@ -436,10 +437,12 @@ void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_co
                       std::span<const float> vec_scales, std::size_t n_byte_groups,
                       std::size_t n_vectors, std::size_t n_blocks, std::size_t k, float* heap_s,
                       std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min,
-                      std::size_t& heap_mi, float bias_corr, const std::uint64_t* id_map) {
+                      std::size_t& heap_mi, float bias_corr, const std::uint64_t* id_map,
+                      float score_offset) {
 #if defined(__x86_64__) || defined(_M_X64)
   score_query_vnni_impl(lut, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k,
-                        heap_s, heap_i, heap_sz, heap_min, heap_mi, bias_corr, id_map);
+                        heap_s, heap_i, heap_sz, heap_min, heap_mi, bias_corr, id_map,
+                        score_offset);
 #else
   (void)lut;
   (void)blocked_codes;
@@ -455,6 +458,7 @@ void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_co
   (void)heap_mi;
   (void)bias_corr;
   (void)id_map;
+  (void)score_offset;
   throw std::logic_error("score_query_vnni is only available on x86_64");
 #endif
 }
@@ -470,7 +474,8 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
   if (nq == 1) {
     QueryLutView view{split_luts[0], lut_scales[0], lut_biases[0]};
     score_query_vnni_impl(view, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k,
-                          heap_s[0], heap_i[0], heap_sz[0], heap_min[0], heap_mi[0], 0.f, id_map);
+                          heap_s[0], heap_i[0], heap_sz[0], heap_min[0], heap_mi[0], 0.f, id_map,
+                          0.f);
     return;
   }
 #if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
@@ -478,7 +483,8 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
   for (std::size_t i = 0; i < nq; ++i) {
     QueryLutView view{split_luts[i], lut_scales[i], lut_biases[i]};
     score_query_vnni_impl(view, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k,
-                          heap_s[i], heap_i[i], heap_sz[i], heap_min[i], heap_mi[i], 0.f, id_map);
+                          heap_s[i], heap_i[i], heap_sz[i], heap_min[i], heap_mi[i], 0.f, id_map,
+                          0.f);
   }
 #else
   score_queries_vnni_multi(split_luts, lut_scales, lut_biases, nq, blocked_codes, vec_scales,
@@ -510,7 +516,8 @@ void score_query_permute_dot(const QueryPermuteDot& pd, std::span<const std::uin
                              std::span<const float> vec_scales, std::size_t n_byte_groups,
                              std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                              float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
-                             float& heap_min, std::size_t& heap_mi, const std::uint64_t* id_map) {
+                             float& heap_min, std::size_t& heap_mi, const std::uint64_t* id_map,
+                             float score_offset) {
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
   (void)pd;
@@ -526,10 +533,11 @@ void score_query_permute_dot(const QueryPermuteDot& pd, std::span<const std::uin
   (void)heap_min;
   (void)heap_mi;
   (void)id_map;
+  (void)score_offset;
   throw std::logic_error("score_query_permute_dot unavailable on MinGW Win64");
 #else
   score_query_permute_dot_blk2(pd, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k,
-                               heap_s, heap_i, heap_sz, heap_min, heap_mi, id_map);
+                               heap_s, heap_i, heap_sz, heap_min, heap_mi, id_map, score_offset);
 #endif
 #else
   (void)pd;
@@ -545,6 +553,7 @@ void score_query_permute_dot(const QueryPermuteDot& pd, std::span<const std::uin
   (void)heap_min;
   (void)heap_mi;
   (void)id_map;
+  (void)score_offset;
   throw std::logic_error("score_query_permute_dot is only available on x86_64");
 #endif
 }
@@ -578,7 +587,7 @@ void score_queries_permute_dot(const QueryPermuteDot* const* pds, std::size_t nq
   if (nq == 1) {
     score_query_permute_dot_blk2(*pds[0], blocked_codes, vec_scales, n_byte_groups, n_vectors,
                                  n_blocks, k, heap_s[0], heap_i[0], heap_sz[0], heap_min[0],
-                                 heap_mi[0], id_map);
+                                 heap_mi[0], id_map, 0.f);
     return;
   }
   score_queries_permute_dot_multi(pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors,

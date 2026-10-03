@@ -36,24 +36,26 @@ Clustering is in **input L2-normalized space** (not TurboQuant rotated space). N
 
 **Ingest**
 
-1. L2-normalize the vector
+1. L2-normalize the vector → `x̂`
 2. Score against all existing cluster centroids by cosine (dot of unit vectors)
 3. If `best_cos ≥ cos_threshold`: append into that bucket (centroid unchanged)
 4. Else: create a new cluster with the current unit vector as the **frozen** centroid, then append
-5. TurboQuant-encode the row into the chosen bucket
+5. Form residual `r = x̂ − c`; TurboQuant-encode `r` into the chosen bucket (`α` recovers `‖r‖` via the usual RaBitQ scale)
 
 **Query**
 
-1. Prepare TurboQuant query state once (rotate + LUT/PD)
-2. Score query against all cluster centroids; sort buckets descending
+1. Prepare TurboQuant query state **once** on unit `q̂` (rotate + LUT/PD) — same LUTs for every bucket
+2. Score `q̂` against all cluster centroids; sort buckets descending
 3. Open buckets in order until cumulative size ≥ `scan_fraction * N` (at least one non-empty)
-4. FastScan each opened bucket; remap local ids via stored global ids; merge heaps to top-k
+4. FastScan each opened bucket with the shared LUTs; push `⟨q̂, c⟩ + α · ⟨q̂, r̂⟩`; remap local ids; merge heaps to top-k
 
 Defaults: `scan_fraction=0.1`, `cos_threshold=0.7`, start with zero clusters.
 
 ## Ranking
 
-`score = α · Σ_i q_i · centroid[code_i]` (asymmetric IP in rotated / calibrated space).
+Flat: `score = α · Σ_i q_i · centroid[code_i]` (asymmetric IP in rotated / calibrated space).
+
+Bucketed (IVF residual): `score = ⟨q̂, c⟩ + α · Σ_i q_i · centroid[code_i]` where codes quantize residual direction `r̂`.
 
 ## Layout
 

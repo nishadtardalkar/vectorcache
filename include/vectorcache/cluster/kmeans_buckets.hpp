@@ -20,6 +20,8 @@ struct BucketParams {
 
 /// Online cosine-threshold IVF in front of per-bucket TurboQuant FastScan.
 /// Centroids are frozen at cluster creation (founding unit vector).
+/// Bucket codes store residuals `x̂ − c`; search reuses one query LUT and adds
+/// `⟨q̂, c⟩` per opened bucket (`⟨q̂, x̂⟩ ≈ ⟨q̂, c⟩ + α · ⟨q̂, r̂⟩`).
 class BucketedTurboQuantIndex {
  public:
   BucketedTurboQuantIndex(std::size_t dim, std::size_t bit_width, BucketParams params = {});
@@ -44,7 +46,7 @@ class BucketedTurboQuantIndex {
 
  private:
   struct Bucket {
-    std::vector<float> floats;  // unit rows, n * dim
+    std::vector<float> floats;  // residual rows (x̂ − c), n * dim — ingest scratch
     std::vector<std::uint8_t> packed;
     std::vector<float> scales;
     std::vector<std::uint64_t> ids;

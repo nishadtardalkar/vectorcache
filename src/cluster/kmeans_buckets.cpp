@@ -101,14 +101,21 @@ void BucketedTurboQuantIndex::append_to_bucket(std::size_t bi, std::span<const f
                                               std::uint64_t id) {
   Bucket& b = buckets_[bi];
   const std::size_t old_n = b.count;
+
+  // IVF residual: encode r = x̂ − c (TurboQuant re-normalizes r → r̂ + α ≈ ‖r‖).
+  std::vector<float> residual(dim_);
+  for (std::size_t d = 0; d < dim_; ++d) {
+    residual[d] = unit_row[d] - b.centroid[d];
+  }
+
   b.floats.resize((old_n + 1) * dim_);
-  std::copy(unit_row.begin(), unit_row.end(), b.floats.begin() + static_cast<std::ptrdiff_t>(old_n * dim_));
+  std::copy(residual.begin(), residual.end(),
+            b.floats.begin() + static_cast<std::ptrdiff_t>(old_n * dim_));
   b.ids.push_back(id);
   ++b.count;
 
-  // Encode single row into this bucket's packed/scales. Centroid stays frozen.
   const Calibration* cal = calibration_ ? &*calibration_ : nullptr;
-  encode(unit_row, 1, dim_, rotation_, boundaries_, codebook_centroids_, bits_, cal,
+  encode(residual, 1, dim_, rotation_, boundaries_, codebook_centroids_, bits_, cal,
          rotated_scratch_, b.packed, b.scales);
   b.blocked_ready = false;
 }
@@ -199,7 +206,8 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
   auto prep =
       prepare_queries(queries, nq, dim_, rotation_, codebook_centroids_, bits_, shift, scale);
 
-  // Unit-normalize queries for centroid scoring (input space).
+  // Unit-normalize queries for centroid scoring (input space). Same q̂ feeds FastScan LUTs
+  // once; per opened bucket we only add ⟨q̂, c⟩ (IVF residual estimator).
   std::vector<float> q_unit(nq * dim_);
   std::copy(queries.begin(), queries.end(), q_unit.begin());
   normalize_rows_inplace(q_unit, nq, dim_);
@@ -246,14 +254,20 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
   std::vector<std::size_t> heap_sz(nq, 0);
   std::vector<float> heap_min(nq, 0.f);
   std::vector<std::size_t> heap_mi(nq, 0);
+  // Per-query ⟨q̂, c⟩ for the bucket currently being scored (reused buffer).
+  std::vector<float> centroid_offsets(nq, 0.f);
 
   for (std::size_t bi = 0; bi < nc; ++bi) {
     const auto& qis = queries_for_bucket[bi];
     if (qis.empty()) continue;
     const Bucket& b = buckets_[bi];
     if (b.count == 0) continue;
+    for (std::size_t qi : qis) {
+      centroid_offsets[qi] = bucket_scores[qi * nc + bi];
+    }
     score_prepared_into(prep, kk, b.blocked, b.n_blocks, b.scales, b.ids, qis, heap_s.data(),
-                        heap_i.data(), heap_sz.data(), heap_min.data(), heap_mi.data());
+                        heap_i.data(), heap_sz.data(), heap_min.data(), heap_mi.data(),
+                        centroid_offsets.data());
   }
 
   heaps_to_search_results(merged, nq, kk, heap_s.data(), heap_i.data(), heap_sz.data());

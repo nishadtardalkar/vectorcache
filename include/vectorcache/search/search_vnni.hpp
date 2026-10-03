@@ -36,7 +36,7 @@ void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_co
                       std::size_t n_vectors, std::size_t n_blocks, std::size_t k, float* heap_s,
                       std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min,
                       std::size_t& heap_mi, float bias_corr,
-                      const std::uint64_t* id_map = nullptr);
+                      const std::uint64_t* id_map = nullptr, float score_offset = 0.f);
 
 /// Score up to 8 queries sharing one codes stream (classic VNNI / split LUT).
 /// `nq` must be in [1, 8]. For `nq==1` prefers the dual-block kernel.
@@ -56,7 +56,7 @@ void score_query_permute_dot(const QueryPermuteDot& pd, std::span<const std::uin
                              std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                              float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                              float& heap_min, std::size_t& heap_mi,
-                             const std::uint64_t* id_map = nullptr);
+                             const std::uint64_t* id_map = nullptr, float score_offset = 0.f);
 
 /// Score up to 8 queries with 4-bit permute-dot, one codes stream.
 void score_queries_permute_dot(const QueryPermuteDot* const* pds, std::size_t nq,

@@ -48,7 +48,7 @@ void score_query_avx2_perm0_impl(QueryLutView lut, std::span<const std::uint8_t>
                                  std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                                  float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                                  float& heap_min, std::size_t& heap_mi, float bias_corr,
-                                 const std::uint64_t* id_map) {
+                                 const std::uint64_t* id_map, float score_offset) {
   const __m256i nibble_mask = _mm256_set1_epi8(static_cast<char>(0x0F));
   const __m256 v_scale = _mm256_set1_ps(lut.scale);
   const float bias = lut.bias + bias_corr;
@@ -116,8 +116,8 @@ void score_query_avx2_perm0_impl(QueryLutView lut, std::span<const std::uint8_t>
     }
 
     for (std::size_t lane = 0; lane < end - base_vec; ++lane) {
-      heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, block_out[lane],
-                           topk_map_id(id_map, base_vec + lane));
+      heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k,
+                           block_out[lane] + score_offset, topk_map_id(id_map, base_vec + lane));
     }
   }
 }
@@ -131,10 +131,11 @@ void score_query_avx2_perm0(QueryLutView lut, std::span<const std::uint8_t> bloc
                             std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                             float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                             float& heap_min, std::size_t& heap_mi, float bias_corr,
-                            const std::uint64_t* id_map) {
+                            const std::uint64_t* id_map, float score_offset) {
 #if defined(__x86_64__) || defined(_M_X64)
   score_query_avx2_perm0_impl(lut, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k,
-                              heap_s, heap_i, heap_sz, heap_min, heap_mi, bias_corr, id_map);
+                              heap_s, heap_i, heap_sz, heap_min, heap_mi, bias_corr, id_map,
+                              score_offset);
 #else
   (void)lut;
   (void)blocked_codes;
@@ -150,6 +151,7 @@ void score_query_avx2_perm0(QueryLutView lut, std::span<const std::uint8_t> bloc
   (void)heap_mi;
   (void)bias_corr;
   (void)id_map;
+  (void)score_offset;
 #endif
 }
 
