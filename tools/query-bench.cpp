@@ -323,6 +323,7 @@ int main(int argc, char** argv) {
   bool bucketed = false;
   float scan_fraction = 0.1f;
   float cos_threshold = 0.7f;
+  std::size_t target_bucket_size = 20000;
   std::size_t timing_runs = 5;
 
   app.add_option("--dataset", dataset, "Named dataset (glove, sift1m, openai-1536, openai-3072)");
@@ -343,6 +344,8 @@ int main(int argc, char** argv) {
       ->check(CLI::Range(0.0f, 1.0f));
   app.add_option("--cos-threshold", cos_threshold,
                  "Min cosine to join existing cluster; else spawn new (bucketed, default 0.7)");
+  app.add_option("--target-bucket-size", target_bucket_size,
+                 "FSCL target list size in (target/n)*cos - log(n) (bucketed, default 20000)");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
   CLI11_PARSE(app, argc, argv);
@@ -441,6 +444,7 @@ int main(int argc, char** argv) {
       vectorcache::BucketParams params;
       params.scan_fraction = scan_fraction;
       params.cos_threshold = cos_threshold;
+      params.target_bucket_size = target_bucket_size;
       vectorcache::BucketedTurboQuantIndex index(db.cols, bits, params);
       if (calibrate) {
         const std::size_t n_cal =
@@ -470,7 +474,8 @@ int main(int argc, char** argv) {
                 << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
       std::cout << "buckets=" << index.num_buckets() << " max_bucket=" << max_b
                 << " mean_bucket=" << mean_b << " scan_fraction=" << scan_fraction
-                << " cos_threshold=" << cos_threshold << "\n";
+                << " cos_threshold=" << cos_threshold
+                << " target_bucket_size=" << target_bucket_size << "\n";
       std::cout << "top_bucket_sizes:";
       const std::size_t top_n = std::min<std::size_t>(10, bucket_sizes.size());
       for (std::size_t i = 0; i < top_n; ++i) {

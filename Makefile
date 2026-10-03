@@ -10,19 +10,20 @@ BUILD_TYPE    ?= Release
 JOBS          ?= $(shell nproc 2>/dev/null || echo 4)
 DATA_DIR      ?= data
 DATASETS      ?= all
-DATASET       ?= glove
+DATASET       ?= sift1m
 NPY           ?=
 SPLIT         ?=
-LIMIT         ?= 100000
+LIMIT         ?= 1000000
 BITS          ?= 4
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
-K             ?= 10
+K             ?= 64
 CALIBRATE     ?=
-RECALL        ?=
-BUCKETED      ?=
-SCAN_FRACTION ?=
-COS_THRESHOLD ?=
+RECALL        ?= 1
+BUCKETED      ?= 1
+SCAN_FRACTION ?= 0.02
+COS_THRESHOLD ?= 0.7
+TARGET_BUCKET_SIZE ?= 20000
 FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
@@ -69,7 +70,8 @@ QUERY_BENCH_ARGS = \
 	$(call flag_arg,RECALL,recall) \
 	$(call flag_arg,BUCKETED,bucketed) \
 	$(call opt_arg,SCAN_FRACTION,scan-fraction) \
-	$(call opt_arg,COS_THRESHOLD,cos-threshold)
+	$(call opt_arg,COS_THRESHOLD,cos-threshold) \
+	$(call opt_arg,TARGET_BUCKET_SIZE,target-bucket-size)
 
 .PHONY: help login compute clean
 
@@ -97,8 +99,9 @@ help:
 	@echo "  CALIBRATE=1     --calibrate (TQ+)"
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
 	@echo "  BUCKETED=1      --bucketed (online cosine-threshold IVF)"
-	@echo "  SCAN_FRACTION   --scan-fraction (bucketed; default 0.1)"
+	@echo "  SCAN_FRACTION   --scan-fraction (bucketed; default 0.02)"
 	@echo "  COS_THRESHOLD   --cos-threshold (bucketed; default 0.7)"
+	@echo "  TARGET_BUCKET_SIZE  --target-bucket-size (FSCL; default 20000)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"

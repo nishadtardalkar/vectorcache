@@ -37,9 +37,10 @@ Clustering is in **input L2-normalized space** (not TurboQuant rotated space). N
 **Ingest**
 
 1. L2-normalize the vector → `x̂`
-2. Score against all existing cluster centroids by cosine (dot of unit vectors)
-3. If `best_cos ≥ cos_threshold`: append into that bucket (centroid unchanged)
-4. Else: create a new cluster with the current unit vector as the **frozen** centroid, then append
+2. Among existing buckets with `⟨x̂, c⟩ ≥ cos_threshold`, pick the spherical-FSCL winner  
+   `argmax_j (target_bucket_size / n_j) · ⟨x̂, c_j⟩ − log(n_j)` (natural log; Banerjee & Ghosh with `N/k` → `target_bucket_size`)
+3. If no joinable bucket: create a new cluster with the current unit vector as the **frozen** centroid, then append
+4. Else append into the FSCL winner (centroid unchanged)
 5. Form residual `r = x̂ − c`; TurboQuant-encode `r` into the chosen bucket (`α` recovers `‖r‖` via the usual RaBitQ scale)
 
 **Query**
@@ -49,7 +50,7 @@ Clustering is in **input L2-normalized space** (not TurboQuant rotated space). N
 3. Open buckets in order until cumulative size ≥ `scan_fraction * N` (at least one non-empty)
 4. FastScan each opened bucket with the shared LUTs; push `⟨q̂, c⟩ + α · ⟨q̂, r̂⟩`; remap local ids; merge heaps to top-k
 
-Defaults: `scan_fraction=0.1`, `cos_threshold=0.7`, start with zero clusters.
+Defaults: `scan_fraction=0.1`, `cos_threshold=0.7`, `target_bucket_size=20000`, start with zero clusters.
 
 ## Ranking
 

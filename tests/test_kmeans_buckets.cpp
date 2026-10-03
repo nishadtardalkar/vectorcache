@@ -119,6 +119,46 @@ TEST(KMeansBuckets, OrthogonalSpawnsNewClusters) {
   }
 }
 
+TEST(KMeansBuckets, FsclPrefersSmallerJoinableBucket) {
+  constexpr std::size_t dim = 32;
+
+  // Fat bucket along e0; thin bucket at cos=0.6 to e0 (below threshold → separate).
+  // Probe closer to fat centroid on raw cosine, but FSCL should send it to the thin one.
+  std::vector<float> fat_seed(dim, 0.f);
+  fat_seed[0] = 1.f;
+
+  std::vector<float> fat_fill(40 * dim, 0.f);
+  for (std::size_t i = 0; i < 40; ++i) {
+    fat_fill[i * dim + 0] = 1.f;
+    fat_fill[i * dim + 1] = 0.01f * static_cast<float>(static_cast<int>(i % 5) - 2);
+  }
+
+  std::vector<float> thin_seed(dim, 0.f);
+  thin_seed[0] = 0.6f;
+  thin_seed[1] = 0.8f;
+
+  std::vector<float> probe(dim, 0.f);
+  probe[0] = 0.95f;
+  probe[1] = 0.3122499f;  // ≈ sqrt(1 - 0.95^2); cos(fat)≈0.95, cos(thin)≈0.82
+
+  vectorcache::BucketParams params;
+  params.scan_fraction = 1.f;
+  params.cos_threshold = 0.7f;
+  params.target_bucket_size = 20000;
+
+  vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
+  index.add(fat_seed);
+  index.add(fat_fill);
+  index.add(thin_seed);
+  ASSERT_EQ(index.num_buckets(), 2u);
+  EXPECT_GE(index.bucket_size(0), 40u);
+  EXPECT_EQ(index.bucket_size(1), 1u);
+
+  index.add(probe);
+  EXPECT_EQ(index.num_buckets(), 2u);
+  EXPECT_EQ(index.bucket_size(1), 2u) << "FSCL should join the smaller joinable bucket";
+}
+
 TEST(KMeansBuckets, CentroidFrozenAfterJoins) {
   constexpr std::size_t dim = 16;
 

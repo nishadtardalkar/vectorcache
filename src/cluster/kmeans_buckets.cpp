@@ -52,6 +52,9 @@ BucketedTurboQuantIndex::BucketedTurboQuantIndex(std::size_t dim, std::size_t bi
   if (!(params_.cos_threshold > -1.f && params_.cos_threshold <= 1.f)) {
     throw std::invalid_argument("cos_threshold must be in (-1, 1]");
   }
+  if (params_.target_bucket_size == 0) {
+    throw std::invalid_argument("target_bucket_size must be > 0");
+  }
   auto cb = codebook(bits_, dim_);
   boundaries_ = std::move(cb.first);
   codebook_centroids_ = std::move(cb.second);
@@ -131,22 +134,32 @@ void BucketedTurboQuantIndex::add(std::span<const float> vectors) {
   if (n == 0) return;
 
   std::vector<float> row(dim_);
+  const double target = static_cast<double>(params_.target_bucket_size);
 
   for (std::size_t i = 0; i < n; ++i) {
     copy_normalize_row(vectors.subspan(i * dim_, dim_), row.data(), dim_);
 
+    // Among buckets with cos >= threshold, pick FSCL winner:
+    //   score = (target_bucket_size / n_j) * cos - log(n_j)
     std::size_t best_j = 0;
-    float best = -std::numeric_limits<float>::infinity();
+    double best_fscl = -std::numeric_limits<double>::infinity();
+    bool found = false;
     const std::size_t nc = buckets_.size();
     for (std::size_t j = 0; j < nc; ++j) {
-      const float s = dot_row(row.data(), centroid_matrix_.data() + j * dim_, dim_);
-      if (s > best) {
-        best = s;
+      const std::size_t nj = buckets_[j].count;
+      if (nj == 0) continue;
+      const float cos = dot_row(row.data(), centroid_matrix_.data() + j * dim_, dim_);
+      if (cos < params_.cos_threshold) continue;
+      const double njd = static_cast<double>(nj);
+      const double fscl = (target / njd) * static_cast<double>(cos) - std::log(njd);
+      if (!found || fscl > best_fscl) {
+        best_fscl = fscl;
         best_j = j;
+        found = true;
       }
     }
 
-    if (nc == 0 || best < params_.cos_threshold) {
+    if (!found) {
       best_j = spawn_bucket(std::span<const float>(row.data(), dim_));
     }
 

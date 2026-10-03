@@ -16,10 +16,14 @@ struct BucketParams {
   float scan_fraction = 0.1f;
   /// Join existing cluster if cosine(unit vec, centroid) >= this; else spawn new.
   float cos_threshold = 0.7f;
+  /// FSCL target list size (replaces N/k in Banerjee & Ghosh): among joinable
+  /// buckets, maximize (target_bucket_size / n_j) * cos - log(n_j).
+  std::size_t target_bucket_size = 20000;
 };
 
 /// Online cosine-threshold IVF in front of per-bucket TurboQuant FastScan.
-/// Centroids are frozen at cluster creation (founding unit vector).
+/// Eligible buckets (cos >= threshold) are ranked with spherical FSCL; centroids
+/// stay frozen at cluster creation (founding unit vector).
 /// Bucket codes store residuals `x̂ − c`; search reuses one query LUT and adds
 /// `⟨q̂, c⟩` per opened bucket (`⟨q̂, x̂⟩ ≈ ⟨q̂, c⟩ + α · ⟨q̂, r̂⟩`).
 class BucketedTurboQuantIndex {
