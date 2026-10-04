@@ -1,6 +1,6 @@
 # VectorCache
 
-TurboQuant ANN engine (C++20) matching [turbovec](https://github.com/RyanCodrai/turbovec)'s core path: ChaCha8 block-Hadamard rotation, Lloyd-Max Beta codebook, bit-plane encode, FastScan blocked layout, and SIMD search — plus an optional streaming cosine k-means bucketing layer and dataset fetch helpers for TurboVec/TurboQuant benchmarks.
+TurboQuant ANN engine (C++20) matching [turbovec](https://github.com/RyanCodrai/turbovec)'s core path: ChaCha8 block-Hadamard rotation, Lloyd-Max Beta codebook, bit-plane encode, FastScan blocked layout, and SIMD search — plus an optional online moving-mean / cosine-variance bucketing layer and dataset fetch helpers for TurboVec/TurboQuant benchmarks.
 
 ## Requirements
 
@@ -43,7 +43,7 @@ make compute DATASET=sift1m LIMIT=0 QUERY_LIMIT=10000
 5. Store RaBitQ-style scale `α = ‖v‖ / ⟨u, x̂⟩`
 6. Flat SIMD search over BLOCK=32 FastScan layout (x86: FAISS `PERM0` or vector-major when AVX-512 VNNI is available)
 
-Optional `BucketedTurboQuantIndex`: L2-normalize; among buckets with cosine ≥ `cos_threshold`, assign by spherical FSCL `(target_bucket_size / n)·cos − log(n)` (default target 20k); else spawn a new cluster with the vector as frozen centroid; **encode residual `x̂ − c`** per bucket. Query builds FastScan LUTs once on `q̂`, opens buckets by centroid score until `scan_fraction` of the index is covered, and ranks with `⟨q̂, c⟩ + α · ⟨q̂, r̂⟩`.
+Optional `BucketedTurboQuantIndex`: L2-normalize; assign to nearest **routing** centroid (exact normalized running mean); maintain Welford variance of assignment cosines; split when `cos_var ≥ cos_var_threshold` with size ≥ `min_bucket_size`, or when size hits `max_bucket_size`. **Encode** centroids stay frozen at bucket birth; residuals are `x̂ − encode_c`. Query builds FastScan LUTs once on `q̂`, opens buckets by routing score until `scan_fraction` of the index is covered, and ranks with `⟨q̂, encode_c⟩ + α · ⟨q̂, r̂⟩`.
 
 `dim` must be a positive multiple of 8, ≤ 16384.
 
@@ -78,14 +78,14 @@ ctest --output-on-failure
 ./query-bench --dataset sift1m --bits 4 --k 10 --limit 0 --query-limit 10000
 ./query-bench --dataset openai-1536 --bits 2 --k 64
 ./query-bench --npy data/glove-train-100k.npy --limit 100000 --query-limit 1000
-./query-bench --dataset glove --bucketed --scan-fraction 0.1 --cos-threshold 0.7
+./query-bench --dataset glove --bucketed --scan-fraction 0.1 --cos-var-threshold 0.02 --min-bucket-size 1024 --max-bucket-size 2048
 ```
 
 OpenAI NPY corpora have no HDF5-style `test` split; `--query-split` defaults to `holdout` (last `--query-limit` rows) for them. GloVe and SIFT1M default to `test`.
 
 Reports median batch search latency (`ms_per_query`) and optional **Recall@1@k** / **Recall@k**. Exact top-k IDs are cached under `.cache/exact_topk/` (keyed by dataset/npy, split, index size, query split/limit, and k) and reused on later runs with the same ground-truth parameters.
 
-Bucketed mode flags: `--bucketed`, `--scan-fraction`, `--cos-threshold`.
+Bucketed mode flags: `--bucketed`, `--scan-fraction`, `--cos-var-threshold`, `--min-bucket-size`, `--max-bucket-size`.
 
 ## Library sketch
 
@@ -100,8 +100,8 @@ index.add(database);       // flat float[n * dim]
 index.prepare();
 auto res = index.search(queries, /*k=*/10);
 
-// Bucketed (online cosine-threshold IVF + per-bucket FastScan)
-vectorcache::BucketParams p;  // scan_fraction, cos_threshold, target_bucket_size, ...
+// Bucketed (online moving-mean IVF + per-bucket FastScan)
+vectorcache::BucketParams p;  // scan_fraction, cos_var_threshold, min/max_bucket_size, ...
 vectorcache::BucketedTurboQuantIndex bindex(/*dim=*/1536, /*bits=*/4, p);
 bindex.calibrate(sample);
 bindex.add(database);

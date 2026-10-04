@@ -1,6 +1,6 @@
 # VectorCache Algorithm
 
-Approximate nearest-neighbor search matching turbovec's TurboQuant core, with an optional online cosine-threshold bucketing layer in front of flat FastScan.
+Approximate nearest-neighbor search matching turbovec's TurboQuant core, with an optional online moving-mean / cosine-variance bucketing layer in front of flat FastScan.
 
 ## Per-bucket TurboQuant (unchanged core)
 
@@ -30,33 +30,41 @@ Approximate nearest-neighbor search matching turbovec's TurboQuant core, with an
  + store α
 ```
 
-## Online cosine-threshold bucketing (`BucketedTurboQuantIndex`)
+## Online moving-mean bucketing (`BucketedTurboQuantIndex`)
 
 Clustering is in **input L2-normalized space** (not TurboQuant rotated space). No SRHT on the clustering path. Shared rotation/codebook/TQ+ across buckets for encode/search only.
+
+Each bucket keeps two centroids:
+
+- **Routing centroid** — exact normalized running mean of members (`sum/count`, then L2-normalize). Used for assignment and query opening.
+- **Encode centroid** — frozen at bucket birth (founding unit vector, or normalized mean of a split partition). Residuals `r = x̂ − encode_c` are TurboQuant-encoded against this only.
 
 **Ingest**
 
 1. L2-normalize the vector → `x̂`
-2. Among existing buckets with `⟨x̂, c⟩ ≥ cos_threshold`, pick the spherical-FSCL winner  
-   `argmax_j (target_bucket_size / n_j) · ⟨x̂, c_j⟩ − log(n_j)` (natural log; Banerjee & Ghosh with `N/k` → `target_bucket_size`)
-3. If no joinable bucket: create a new cluster with the current unit vector as the **frozen** centroid, then append
-4. Else append into the FSCL winner (centroid unchanged)
-5. Form residual `r = x̂ − c`; TurboQuant-encode `r` into the chosen bucket (`α` recovers `‖r‖` via the usual RaBitQ scale)
+2. If no buckets exist: spawn one with encode/routing = `x̂`
+3. Else assign to `argmax_j ⟨x̂, routing_c_j⟩`
+4. Update Welford stats on `cos = ⟨x̂, routing_c⟩` (before mean update), then `sum += x̂`, `routing = normalize(sum)`
+5. Append `x̂`; TurboQuant-encode residual vs frozen encode centroid
+6. Split the bucket when `(count ≥ min_bucket_size ∧ cos_var ≥ cos_var_threshold)` or `count ≥ max_bucket_size`:
+   - Seed A = routing mean; seed B = furthest member
+   - Bipartition by nearer seed (median split by cos-to-A if one side empty)
+   - Each child: freeze encode = normalize(mean), recompute routing/Welford, re-encode residuals
 
 **Query**
 
 1. Prepare TurboQuant query state **once** on unit `q̂` (rotate + LUT/PD) — same LUTs for every bucket
-2. Score `q̂` against all cluster centroids; sort buckets descending
+2. Score `q̂` against all **routing** centroids; sort buckets descending
 3. Open buckets in order until cumulative size ≥ `scan_fraction * N` (at least one non-empty)
-4. FastScan each opened bucket with the shared LUTs; push `⟨q̂, c⟩ + α · ⟨q̂, r̂⟩`; remap local ids; merge heaps to top-k
+4. FastScan each opened bucket with the shared LUTs; push `⟨q̂, encode_c⟩ + α · ⟨q̂, r̂⟩`; remap local ids; merge heaps to top-k
 
-Defaults: `scan_fraction=0.1`, `cos_threshold=0.7`, `target_bucket_size=20000`, start with zero clusters.
+Defaults: `scan_fraction=0.1`, `cos_var_threshold=0.02`, `min_bucket_size=1024`, `max_bucket_size=2048`, start with zero clusters.
 
 ## Ranking
 
 Flat: `score = α · Σ_i q_i · centroid[code_i]` (asymmetric IP in rotated / calibrated space).
 
-Bucketed (IVF residual): `score = ⟨q̂, c⟩ + α · Σ_i q_i · centroid[code_i]` where codes quantize residual direction `r̂`.
+Bucketed (IVF residual): `score = ⟨q̂, encode_c⟩ + α · Σ_i q_i · centroid[code_i]` where codes quantize residual direction `r̂`.
 
 ## Layout
 

@@ -14,18 +14,21 @@ namespace vectorcache {
 
 struct BucketParams {
   float scan_fraction = 0.1f;
-  /// Join existing cluster if cosine(unit vec, centroid) >= this; else spawn new.
-  float cos_threshold = 0.7f;
-  /// FSCL target list size (replaces N/k in Banerjee & Ghosh): among joinable
-  /// buckets, maximize (target_bucket_size / n_j) * cos - log(n_j).
-  std::size_t target_bucket_size = 20000;
+  /// Split when sample variance of assignment cosines reaches this (and size >= min).
+  float cos_var_threshold = 0.02f;
+  /// Minimum members before a variance-triggered split is allowed.
+  std::size_t min_bucket_size = 1024;
+  /// Hard cap: always split when count reaches this.
+  std::size_t max_bucket_size = 2048;
 };
 
-/// Online cosine-threshold IVF in front of per-bucket TurboQuant FastScan.
-/// Eligible buckets (cos >= threshold) are ranked with spherical FSCL; centroids
-/// stay frozen at cluster creation (founding unit vector).
-/// Bucket codes store residuals `x̂ − c`; search reuses one query LUT and adds
-/// `⟨q̂, c⟩` per opened bucket (`⟨q̂, x̂⟩ ≈ ⟨q̂, c⟩ + α · ⟨q̂, r̂⟩`).
+/// Online nearest-centroid IVF in front of per-bucket TurboQuant FastScan.
+/// Routing centroids track the exact normalized running mean; encode centroids
+/// stay frozen at bucket birth for residual codes `x̂ − encode_c`. Buckets split
+/// when cosine-score variance exceeds `cos_var_threshold` (with size ≥ min) or
+/// when size hits `max_bucket_size`.
+/// Search opens buckets by routing centroid score until `scan_fraction` of N,
+/// then ranks with `⟨q̂, encode_c⟩ + α · ⟨q̂, r̂⟩`.
 class BucketedTurboQuantIndex {
  public:
   BucketedTurboQuantIndex(std::size_t dim, std::size_t bit_width, BucketParams params = {});
@@ -45,12 +48,16 @@ class BucketedTurboQuantIndex {
 
   bool has_calibration() const { return calibration_.has_value(); }
   std::size_t bucket_size(std::size_t bucket) const;
-  /// Unit centroid of bucket (frozen at creation). Length = dim().
+  /// Unit routing centroid (normalized running mean). Length = dim().
   std::span<const float> bucket_centroid(std::size_t bucket) const;
+  /// Unit encode centroid (frozen at birth). Length = dim().
+  std::span<const float> bucket_encode_centroid(std::size_t bucket) const;
+  /// Sample variance of assignment cosines for bucket (`0` if count < 2).
+  double bucket_cos_variance(std::size_t bucket) const;
 
  private:
   struct Bucket {
-    std::vector<float> floats;  // residual rows (x̂ − c), n * dim — ingest scratch
+    std::vector<float> floats;  // unit rows (x̂), n * dim — ingest scratch for split
     std::vector<std::uint8_t> packed;
     std::vector<float> scales;
     std::vector<std::uint64_t> ids;
@@ -58,14 +65,24 @@ class BucketedTurboQuantIndex {
     mutable std::size_t n_blocks = 0;
     mutable bool blocked_ready = false;
 
-    std::vector<float> centroid;  // unit, dim — frozen at create
+    std::vector<float> encode_centroid;   // unit, dim — frozen at create / split
+    std::vector<float> routing_centroid;  // unit, dim — normalized running mean
+    std::vector<double> sum;              // running vector sum, dim
     std::size_t count = 0;
+    double cos_mean = 0.0;
+    double cos_m2 = 0.0;
   };
 
   void ensure_bucket_blocked(std::size_t bi) const;
-  void sync_centroid_matrix();
-  void append_to_bucket(std::size_t bi, std::span<const float> unit_row, std::uint64_t id);
+  void sync_centroid_matrices();
+  void sync_routing_row(std::size_t bi);
+  void sync_encode_row(std::size_t bi);
   std::size_t spawn_bucket(std::span<const float> unit_row);
+  void append_to_bucket(std::size_t bi, std::span<const float> unit_row, std::uint64_t id);
+  bool needs_split(const Bucket& b) const;
+  void split_bucket(std::size_t bi);
+  void finalize_partition(Bucket& b, std::vector<float> units, std::vector<std::uint64_t> ids);
+  void encode_units_into(Bucket& b);
 
   std::size_t dim_;
   std::size_t bits_;
@@ -77,7 +94,8 @@ class BucketedTurboQuantIndex {
   mutable std::vector<float> rotated_scratch_;
 
   std::vector<Bucket> buckets_;
-  std::vector<float> centroid_matrix_;  // n_buckets * dim
+  std::vector<float> routing_centroid_matrix_;  // n_buckets * dim
+  std::vector<float> encode_centroid_matrix_;   // n_buckets * dim
   std::uint64_t next_id_ = 0;
   bool prepared_ = false;
 };

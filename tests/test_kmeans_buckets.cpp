@@ -24,6 +24,16 @@ std::vector<float> random_matrix(std::size_t n, std::size_t dim, std::uint32_t s
   return out;
 }
 
+vectorcache::BucketParams test_params(float scan_fraction = 1.f, std::size_t min_sz = 1024,
+                                      std::size_t max_sz = 2048, float cos_var = 0.02f) {
+  vectorcache::BucketParams params;
+  params.scan_fraction = scan_fraction;
+  params.min_bucket_size = min_sz;
+  params.max_bucket_size = max_sz;
+  params.cos_var_threshold = cos_var;
+  return params;
+}
+
 }  // namespace
 
 TEST(ScoreCentroids, AssignNearest) {
@@ -53,15 +63,17 @@ TEST(KMeansBuckets, AddSearchAndIds) {
   auto db = random_matrix(n, dim, 7);
   auto queries = random_matrix(nq, dim, 11);
 
-  vectorcache::BucketParams params;
-  params.scan_fraction = 1.f;  // open all buckets → match flat coverage
-  params.cos_threshold = 0.7f;
+  // Small max so random data splits; full scan for coverage.
+  auto params = test_params(1.f, /*min*/ 8, /*max*/ 64, /*var*/ 0.02f);
 
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
   index.prepare();
   EXPECT_EQ(index.size(), n);
   EXPECT_GE(index.num_buckets(), 1u);
+  for (std::size_t b = 0; b < index.num_buckets(); ++b) {
+    EXPECT_LE(index.bucket_size(b), params.max_bucket_size);
+  }
 
   auto res = index.search(queries, k);
   ASSERT_EQ(res.nq, nq);
@@ -76,93 +88,27 @@ TEST(KMeansBuckets, AddSearchAndIds) {
   }
 }
 
-TEST(KMeansBuckets, SameDirectionJoinsOneCluster) {
+TEST(KMeansBuckets, SameDirectionStaysOneClusterBelowMax) {
   constexpr std::size_t dim = 32;
   constexpr std::size_t n = 50;
 
-  // All nearly parallel (tiny noise) → one cluster at threshold 0.7.
+  // Nearly parallel → low cosine variance; under max → single cluster.
   std::vector<float> db(n * dim, 0.f);
   for (std::size_t i = 0; i < n; ++i) {
     db[i * dim + 0] = 1.f;
     db[i * dim + 1] = 0.01f * static_cast<float>(static_cast<int>(i % 5) - 2);
   }
 
-  vectorcache::BucketParams params;
-  params.scan_fraction = 1.f;
-  params.cos_threshold = 0.7f;
-
+  auto params = test_params(1.f, /*min*/ 8, /*max*/ 2048, /*var*/ 0.02f);
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
   EXPECT_EQ(index.num_buckets(), 1u);
   EXPECT_EQ(index.bucket_size(0), n);
 }
 
-TEST(KMeansBuckets, OrthogonalSpawnsNewClusters) {
-  constexpr std::size_t dim = 32;
-  constexpr std::size_t n = 4;
-
-  // Pairwise orthogonal unit axes → each vector forms its own cluster.
-  std::vector<float> db(n * dim, 0.f);
-  for (std::size_t i = 0; i < n; ++i) {
-    db[i * dim + i] = 1.f;
-  }
-
-  vectorcache::BucketParams params;
-  params.scan_fraction = 1.f;
-  params.cos_threshold = 0.7f;
-
-  vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
-  index.add(db);
-  EXPECT_EQ(index.num_buckets(), n);
-  for (std::size_t b = 0; b < n; ++b) {
-    EXPECT_EQ(index.bucket_size(b), 1u);
-  }
-}
-
-TEST(KMeansBuckets, FsclPrefersSmallerJoinableBucket) {
-  constexpr std::size_t dim = 32;
-
-  // Fat bucket along e0; thin bucket at cos=0.6 to e0 (below threshold → separate).
-  // Probe closer to fat centroid on raw cosine, but FSCL should send it to the thin one.
-  std::vector<float> fat_seed(dim, 0.f);
-  fat_seed[0] = 1.f;
-
-  std::vector<float> fat_fill(40 * dim, 0.f);
-  for (std::size_t i = 0; i < 40; ++i) {
-    fat_fill[i * dim + 0] = 1.f;
-    fat_fill[i * dim + 1] = 0.01f * static_cast<float>(static_cast<int>(i % 5) - 2);
-  }
-
-  std::vector<float> thin_seed(dim, 0.f);
-  thin_seed[0] = 0.6f;
-  thin_seed[1] = 0.8f;
-
-  std::vector<float> probe(dim, 0.f);
-  probe[0] = 0.95f;
-  probe[1] = 0.3122499f;  // ≈ sqrt(1 - 0.95^2); cos(fat)≈0.95, cos(thin)≈0.82
-
-  vectorcache::BucketParams params;
-  params.scan_fraction = 1.f;
-  params.cos_threshold = 0.7f;
-  params.target_bucket_size = 20000;
-
-  vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
-  index.add(fat_seed);
-  index.add(fat_fill);
-  index.add(thin_seed);
-  ASSERT_EQ(index.num_buckets(), 2u);
-  EXPECT_GE(index.bucket_size(0), 40u);
-  EXPECT_EQ(index.bucket_size(1), 1u);
-
-  index.add(probe);
-  EXPECT_EQ(index.num_buckets(), 2u);
-  EXPECT_EQ(index.bucket_size(1), 2u) << "FSCL should join the smaller joinable bucket";
-}
-
-TEST(KMeansBuckets, CentroidFrozenAfterJoins) {
+TEST(KMeansBuckets, RoutingMeanMovesAfterJoins) {
   constexpr std::size_t dim = 16;
 
-  // Founding vector along e0; joiners are close enough to pass threshold.
   std::vector<float> first(dim, 0.f);
   first[0] = 1.f;
 
@@ -172,23 +118,103 @@ TEST(KMeansBuckets, CentroidFrozenAfterJoins) {
     joiners[i * dim + 1] = 0.1f * static_cast<float>(i + 1);
   }
 
-  vectorcache::BucketParams params;
-  params.scan_fraction = 1.f;
-  params.cos_threshold = 0.7f;
-
+  auto params = test_params(1.f, /*min*/ 8, /*max*/ 2048, /*var*/ 0.02f);
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(first);
   ASSERT_EQ(index.num_buckets(), 1u);
   auto c0 = index.bucket_centroid(0);
-  std::vector<float> frozen(c0.begin(), c0.end());
+  std::vector<float> founding_routing(c0.begin(), c0.end());
 
   index.add(joiners);
   EXPECT_EQ(index.num_buckets(), 1u);
   EXPECT_EQ(index.bucket_size(0), 4u);
   auto c1 = index.bucket_centroid(0);
-  ASSERT_EQ(c1.size(), frozen.size());
+  ASSERT_EQ(c1.size(), founding_routing.size());
+
+  double diff = 0.0;
   for (std::size_t d = 0; d < dim; ++d) {
-    EXPECT_FLOAT_EQ(c1[d], frozen[d]);
+    diff += std::abs(static_cast<double>(c1[d]) - static_cast<double>(founding_routing[d]));
+  }
+  EXPECT_GT(diff, 1e-4) << "routing centroid should move toward running mean";
+}
+
+TEST(KMeansBuckets, EncodeCentroidFrozenWhileRoutingMoves) {
+  constexpr std::size_t dim = 16;
+
+  std::vector<float> first(dim, 0.f);
+  first[0] = 1.f;
+
+  std::vector<float> joiners(3 * dim, 0.f);
+  for (std::size_t i = 0; i < 3; ++i) {
+    joiners[i * dim + 0] = 1.f;
+    joiners[i * dim + 1] = 0.1f * static_cast<float>(i + 1);
+  }
+
+  auto params = test_params(1.f, /*min*/ 8, /*max*/ 2048, /*var*/ 0.02f);
+  vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
+  index.add(first);
+  ASSERT_EQ(index.num_buckets(), 1u);
+  auto enc0 = index.bucket_encode_centroid(0);
+  std::vector<float> frozen(enc0.begin(), enc0.end());
+
+  index.add(joiners);
+  EXPECT_EQ(index.num_buckets(), 1u);
+  auto enc1 = index.bucket_encode_centroid(0);
+  ASSERT_EQ(enc1.size(), frozen.size());
+  for (std::size_t d = 0; d < dim; ++d) {
+    EXPECT_FLOAT_EQ(enc1[d], frozen[d]);
+  }
+
+  // Routing moved, encode did not.
+  auto route = index.bucket_centroid(0);
+  double route_diff = 0.0;
+  for (std::size_t d = 0; d < dim; ++d) {
+    route_diff += std::abs(static_cast<double>(route[d]) - static_cast<double>(frozen[d]));
+  }
+  EXPECT_GT(route_diff, 1e-4);
+}
+
+TEST(KMeansBuckets, MaxBucketSizeForcesSplit) {
+  constexpr std::size_t dim = 32;
+  constexpr std::size_t n = 20;
+  constexpr std::size_t max_sz = 4;
+
+  // Near-duplicates → tiny cosine variance; max size still forces splits.
+  std::vector<float> db(n * dim, 0.f);
+  for (std::size_t i = 0; i < n; ++i) {
+    db[i * dim + 0] = 1.f;
+    db[i * dim + 1] = 1e-4f * static_cast<float>(i);
+  }
+
+  auto params = test_params(1.f, /*min*/ 2, /*max*/ max_sz, /*var*/ 1.0f);  // var never triggers
+  vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
+  index.add(db);
+  EXPECT_GT(index.num_buckets(), 1u);
+  for (std::size_t b = 0; b < index.num_buckets(); ++b) {
+    EXPECT_LE(index.bucket_size(b), max_sz);
+  }
+  std::size_t total = 0;
+  for (std::size_t b = 0; b < index.num_buckets(); ++b) total += index.bucket_size(b);
+  EXPECT_EQ(total, n);
+}
+
+TEST(KMeansBuckets, VarianceSplitOnDiverseVectors) {
+  constexpr std::size_t dim = 32;
+  constexpr std::size_t n = 64;
+
+  // Mix of orthogonal axes → high cosine variance → split before/at max.
+  std::vector<float> db(n * dim, 0.f);
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::size_t axis = i % 8;
+    db[i * dim + axis] = 1.f;
+  }
+
+  auto params = test_params(1.f, /*min*/ 4, /*max*/ 32, /*var*/ 0.01f);
+  vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
+  index.add(db);
+  EXPECT_GT(index.num_buckets(), 1u);
+  for (std::size_t b = 0; b < index.num_buckets(); ++b) {
+    EXPECT_LE(index.bucket_size(b), params.max_bucket_size);
   }
 }
 
@@ -196,7 +222,6 @@ TEST(KMeansBuckets, ScanFractionOpensSubset) {
   constexpr std::size_t dim = 32;
   constexpr std::size_t n = 300;
 
-  // Orthogonal-ish batches so many buckets exist and scan_fraction matters.
   std::vector<float> db(n * dim, 0.f);
   for (std::size_t i = 0; i < n; ++i) {
     const std::size_t axis = i % 8;
@@ -204,10 +229,7 @@ TEST(KMeansBuckets, ScanFractionOpensSubset) {
     db[i * dim + ((axis + 1) % dim)] = 0.02f * static_cast<float>(static_cast<int>(i % 5) - 2);
   }
 
-  vectorcache::BucketParams params;
-  params.scan_fraction = 0.2f;
-  params.cos_threshold = 0.7f;
-
+  auto params = test_params(0.2f, /*min*/ 4, /*max*/ 40, /*var*/ 0.01f);
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
   index.prepare();
@@ -220,7 +242,6 @@ TEST(KMeansBuckets, ScanFractionOpensSubset) {
 }
 
 TEST(KMeansBuckets, FullScanReturnsValidTopK) {
-  // Residual bucket codes differ from flat full-vector codes; still a valid top-k.
   constexpr std::size_t dim = 64;
   constexpr std::size_t n = 256;
   constexpr std::size_t k = 5;
@@ -228,10 +249,7 @@ TEST(KMeansBuckets, FullScanReturnsValidTopK) {
   auto db = random_matrix(n, dim, 3);
   auto q = std::span<const float>(db.data(), dim);
 
-  vectorcache::BucketParams params;
-  params.scan_fraction = 1.f;
-  params.cos_threshold = 0.7f;
-
+  auto params = test_params(1.f, /*min*/ 8, /*max*/ 64, /*var*/ 0.02f);
   vectorcache::BucketedTurboQuantIndex bucketed(dim, 4, params);
   bucketed.add(db);
   bucketed.prepare();
@@ -254,10 +272,7 @@ TEST(KMeansBuckets, SharedHeapFullScanK64Deterministic) {
   auto db = random_matrix(n, dim, 11);
   auto queries = random_matrix(nq, dim, 12);
 
-  vectorcache::BucketParams params;
-  params.scan_fraction = 1.f;
-  params.cos_threshold = 0.7f;
-
+  auto params = test_params(1.f, /*min*/ 8, /*max*/ 64, /*var*/ 0.02f);
   vectorcache::BucketedTurboQuantIndex a(dim, 4, params);
   a.add(db);
   a.prepare();

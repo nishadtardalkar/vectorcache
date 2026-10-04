@@ -22,8 +22,9 @@ CALIBRATE     ?=
 RECALL        ?= 1
 BUCKETED      ?= 1
 SCAN_FRACTION ?= 0.02
-COS_THRESHOLD ?= 0.7
-TARGET_BUCKET_SIZE ?= 20000
+COS_VAR_THRESHOLD ?= 0.02
+MIN_BUCKET_SIZE ?= 1024
+MAX_BUCKET_SIZE ?= 2048
 FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
@@ -70,8 +71,9 @@ QUERY_BENCH_ARGS = \
 	$(call flag_arg,RECALL,recall) \
 	$(call flag_arg,BUCKETED,bucketed) \
 	$(call opt_arg,SCAN_FRACTION,scan-fraction) \
-	$(call opt_arg,COS_THRESHOLD,cos-threshold) \
-	$(call opt_arg,TARGET_BUCKET_SIZE,target-bucket-size)
+	$(call opt_arg,COS_VAR_THRESHOLD,cos-var-threshold) \
+	$(call opt_arg,MIN_BUCKET_SIZE,min-bucket-size) \
+	$(call opt_arg,MAX_BUCKET_SIZE,max-bucket-size)
 
 .PHONY: help login compute clean
 
@@ -98,10 +100,11 @@ help:
 	@echo "  QUERY_SPLIT     --query-split (test for glove/sift1m; holdout for openai)"
 	@echo "  CALIBRATE=1     --calibrate (TQ+)"
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
-	@echo "  BUCKETED=1      --bucketed (online cosine-threshold IVF)"
+	@echo "  BUCKETED=1      --bucketed (online moving-mean + cosine-variance IVF)"
 	@echo "  SCAN_FRACTION   --scan-fraction (bucketed; default 0.02)"
-	@echo "  COS_THRESHOLD   --cos-threshold (bucketed; default 0.7)"
-	@echo "  TARGET_BUCKET_SIZE  --target-bucket-size (FSCL; default 20000)"
+	@echo "  COS_VAR_THRESHOLD  --cos-var-threshold (bucketed; default 0.02)"
+	@echo "  MIN_BUCKET_SIZE --min-bucket-size (bucketed; default 1024)"
+	@echo "  MAX_BUCKET_SIZE --max-bucket-size (bucketed; default 2048)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
