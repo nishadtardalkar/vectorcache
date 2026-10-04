@@ -462,13 +462,23 @@ int main(int argc, char** argv) {
       const auto t1 = std::chrono::steady_clock::now();
       std::size_t max_b = 0;
       std::size_t sum_b = 0;
+      double min_cos_var = 0.0;
+      double max_cos_var = 0.0;
       std::vector<std::size_t> bucket_sizes;
       bucket_sizes.reserve(index.num_buckets());
       for (std::size_t bi = 0; bi < index.num_buckets(); ++bi) {
         const std::size_t sz = index.bucket_size(bi);
+        const double cos_var = index.bucket_cos_variance(bi);
         bucket_sizes.push_back(sz);
         max_b = std::max(max_b, sz);
         sum_b += sz;
+        if (bi == 0) {
+          min_cos_var = cos_var;
+          max_cos_var = cos_var;
+        } else {
+          min_cos_var = std::min(min_cos_var, cos_var);
+          max_cos_var = std::max(max_cos_var, cos_var);
+        }
       }
       const double mean_b =
           index.num_buckets() == 0 ? 0.0 : static_cast<double>(sum_b) / static_cast<double>(index.num_buckets());
@@ -480,7 +490,8 @@ int main(int argc, char** argv) {
                 << " mean_bucket=" << mean_b << " scan_fraction=" << scan_fraction
                 << " cos_var_threshold=" << cos_var_threshold
                 << " min_bucket_size=" << min_bucket_size
-                << " max_bucket_size=" << max_bucket_size << "\n";
+                << " max_bucket_size=" << max_bucket_size
+                << " min_cos_var=" << min_cos_var << " max_cos_var=" << max_cos_var << "\n";
       std::cout << "top_bucket_sizes:";
       const std::size_t top_n = std::min<std::size_t>(10, bucket_sizes.size());
       for (std::size_t i = 0; i < top_n; ++i) {
