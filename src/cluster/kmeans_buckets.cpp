@@ -12,6 +12,10 @@
 #include "vectorcache/pack/pack.hpp"
 #include "vectorcache/quantize/codebook.hpp"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace vectorcache {
 namespace {
 
@@ -63,8 +67,8 @@ BucketedTurboQuantIndex::BucketedTurboQuantIndex(std::size_t dim, std::size_t bi
   if (bit_width < 2 || bit_width > 4) {
     throw std::invalid_argument("bit_width must be 2, 3, or 4");
   }
-  if (!(params_.scan_fraction > 0.f && params_.scan_fraction <= 1.f)) {
-    throw std::invalid_argument("scan_fraction must be in (0, 1]");
+  if (params_.n_probe == 0) {
+    throw std::invalid_argument("n_probe must be >= 1");
   }
   if (params_.max_bucket_size < 2) {
     throw std::invalid_argument("max_bucket_size must be >= 2");
@@ -701,7 +705,9 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
     return empty;
   }
 
-  for (std::size_t i = 0; i < buckets_.size(); ++i) ensure_bucket_blocked(i);
+  if (!prepared_) {
+    for (std::size_t i = 0; i < buckets_.size(); ++i) ensure_bucket_blocked(i);
+  }
 
   std::span<const float> shift;
   std::span<const float> scale;
@@ -721,8 +727,7 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
   score_against_centroids(q_unit, nq, dim_, routing_centroid_matrix_, nc, routing_scores);
 
   const std::size_t total_n = static_cast<std::size_t>(next_id_);
-  const std::size_t budget = std::max<std::size_t>(
-      1, static_cast<std::size_t>(std::ceil(params_.scan_fraction * static_cast<double>(total_n))));
+  const std::size_t n_probe = std::min(params_.n_probe, nc);
 
   SearchResults merged;
   merged.nq = nq;
@@ -731,22 +736,46 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
   merged.ids.assign(nq * merged.k, 0);
 
   std::vector<std::vector<std::size_t>> queries_for_bucket(nc);
-  for (std::size_t qi = 0; qi < nq; ++qi) {
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+  {
     std::vector<std::size_t> order(nc);
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-      const float sa = routing_scores[qi * nc + a];
-      const float sb = routing_scores[qi * nc + b];
-      if (sa != sb) return sa > sb;
-      return a < b;
-    });
+    std::vector<std::vector<std::size_t>> local_qfb(nc);
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+    for (int qi_i = 0; qi_i < static_cast<int>(nq); ++qi_i) {
+      const std::size_t qi = static_cast<std::size_t>(qi_i);
+      std::iota(order.begin(), order.end(), 0);
+      const float* rs = routing_scores.data() + qi * nc;
+      auto better = [&](std::size_t a, std::size_t b) {
+        if (rs[a] != rs[b]) return rs[a] > rs[b];
+        return a < b;
+      };
+      if (n_probe < nc) {
+        std::nth_element(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(n_probe),
+                         order.end(), better);
+        std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(n_probe), better);
+      } else {
+        std::sort(order.begin(), order.end(), better);
+      }
 
-    std::size_t opened = 0;
-    for (std::size_t bi : order) {
-      if (buckets_[bi].count == 0) continue;
-      queries_for_bucket[bi].push_back(qi);
-      opened += buckets_[bi].count;
-      if (opened >= budget) break;
+      for (std::size_t t = 0; t < n_probe; ++t) {
+        const std::size_t bi = order[t];
+        if (buckets_[bi].count == 0) continue;
+        local_qfb[bi].push_back(qi);
+      }
+    }
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+    {
+      for (std::size_t bi = 0; bi < nc; ++bi) {
+        if (local_qfb[bi].empty()) continue;
+        auto& dest = queries_for_bucket[bi];
+        dest.insert(dest.end(), local_qfb[bi].begin(), local_qfb[bi].end());
+      }
     }
   }
 
@@ -765,7 +794,19 @@ SearchResults BucketedTurboQuantIndex::search(std::span<const float> queries, st
     if (b.count == 0) continue;
     const float* enc = encode_centroid_matrix_.data() + bi * dim_;
     for (std::size_t qi : qis) {
-      centroid_offsets[qi] = dot_row(q_unit.data() + qi * dim_, enc, dim_);
+      // Float IP is enough for residual offset ranking (routing already used AVX dots).
+      const float* q = q_unit.data() + qi * dim_;
+      float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+      std::size_t d = 0;
+      for (; d + 4 <= dim_; d += 4) {
+        s0 += q[d] * enc[d];
+        s1 += q[d + 1] * enc[d + 1];
+        s2 += q[d + 2] * enc[d + 2];
+        s3 += q[d + 3] * enc[d + 3];
+      }
+      float s = s0 + s1 + s2 + s3;
+      for (; d < dim_; ++d) s += q[d] * enc[d];
+      centroid_offsets[qi] = s;
     }
     score_prepared_into(prep, kk, b.blocked, b.n_blocks, b.scales, b.ids, qis, heap_s.data(),
                         heap_i.data(), heap_sz.data(), heap_min.data(), heap_mi.data(),

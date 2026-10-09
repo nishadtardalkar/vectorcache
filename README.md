@@ -43,7 +43,7 @@ make compute DATASET=sift1m LIMIT=0 QUERY_LIMIT=10000
 5. Store RaBitQ-style scale `α = ‖v‖ / ⟨u, x̂⟩`
 6. Flat SIMD search over BLOCK=32 FastScan layout (x86: FAISS `PERM0` or vector-major when AVX-512 VNNI is available)
 
-Optional `BucketedTurboQuantIndex`: L2-normalize; assign to nearest **routing** centroid (margin-weighted mean + seam attract); soft energy / hard fission via 1-iter spherical 2-means Voronoi partition; mid-stream densify pulse + recover/late absorb when `expected_n` is set; prepare() applies asymmetric anti-rival push to routing centroids. **Encode** centroids stay frozen at bucket birth / partition; residuals are `x̂ − encode_c`. Query builds FastScan LUTs once on `q̂`, opens buckets by routing score until `scan_fraction` of the index is covered, and ranks with `⟨q̂, encode_c⟩ + α · ⟨q̂, r̂⟩`. Defaults match the product fat online champ (`soft309_trig1016`).
+Optional `BucketedTurboQuantIndex`: L2-normalize; assign to nearest **routing** centroid (margin-weighted mean + seam attract); soft energy / hard fission via 1-iter spherical 2-means Voronoi partition; mid-stream densify pulse + recover/late absorb when `expected_n` is set; prepare() applies asymmetric anti-rival push to routing centroids. **Encode** centroids stay frozen at bucket birth / partition; residuals are `x̂ − encode_c`. Query builds FastScan LUTs once on `q̂`, opens the top `n_probe` buckets by routing score, and ranks with `⟨q̂, encode_c⟩ + α · ⟨q̂, r̂⟩`. Defaults match the product fat online champ (`soft309_trig1016`).
 
 `dim` must be a positive multiple of 8, ≤ 16384.
 
@@ -78,14 +78,14 @@ ctest --output-on-failure
 ./query-bench --dataset sift1m --bits 4 --k 10 --limit 0 --query-limit 10000
 ./query-bench --dataset openai-1536 --bits 2 --k 64
 ./query-bench --npy data/glove-train-100k.npy --limit 100000 --query-limit 1000
-./query-bench --dataset glove --bucketed --scan-fraction 0.1 --max-bucket-size 800 --energy-soft 400
+./query-bench --dataset glove --bucketed --n-probe 64 --max-bucket-size 800 --energy-soft 400
 ```
 
 OpenAI NPY corpora have no HDF5-style `test` split; `--query-split` defaults to `holdout` (last `--query-limit` rows) for them. GloVe and SIFT1M default to `test`.
 
 Reports median batch search latency (`ms_per_query`) and optional **Recall@1@k** / **Recall@k**. Exact top-k IDs are cached under `.cache/exact_topk/` (keyed by dataset/npy, split, index size, query split/limit, and k) and reused on later runs with the same ground-truth parameters.
 
-Bucketed mode flags: `--bucketed`, `--scan-fraction`, `--max-bucket-size`, `--energy-soft` (plus deprecated `--cos-var-threshold` / `--min-bucket-size` no-ops). `expected_n` is set from the loaded corpus size so the densify pulse schedule runs.
+Bucketed mode flags: `--bucketed`, `--n-probe`, `--max-bucket-size`, `--energy-soft` (plus deprecated `--cos-var-threshold` / `--min-bucket-size` no-ops). `expected_n` is set from the loaded corpus size so the densify pulse schedule runs.
 
 ## Library sketch
 
@@ -101,7 +101,7 @@ index.prepare();
 auto res = index.search(queries, /*k=*/10);
 
 // Bucketed (online moving-mean IVF + per-bucket FastScan)
-vectorcache::BucketParams p;  // scan_fraction, max_bucket_size, energy_soft, expected_n, ...
+vectorcache::BucketParams p;  // n_probe, max_bucket_size, energy_soft, expected_n, ...
 p.expected_n = /*N*/ 0;       // set to corpus size to enable densify pulse schedule
 vectorcache::BucketedTurboQuantIndex bindex(/*dim=*/1536, /*bits=*/4, p);
 bindex.calibrate(sample);

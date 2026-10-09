@@ -13,9 +13,10 @@
 namespace vectorcache {
 
 /// Online dense soft400 / 2-means partition / absorb / pulse densify (product fat champ).
-/// Defaults match experiments soft309_trig1016 (r@1≈0.981 @ ~3105×322 on SIFT1M @ 2% scan).
+/// Defaults match experiments soft309_trig1016 (r@1≈0.981 @ ~3105×322 on SIFT1M @ n_probe≈64).
 struct BucketParams {
-  float scan_fraction = 0.1f;
+  /// Number of IVF buckets to open per query (capped at num_buckets).
+  std::size_t n_probe = 64;
   /// Hard fission when bucket count reaches this (champ fission_cap).
   std::size_t max_bucket_size = 800;
   /// Soft energy-split threshold outside the densify pulse.
@@ -61,8 +62,8 @@ struct BucketParams {
 /// lists absorb into rivals; prepare() applies asymmetric anti-rival push to
 /// routing centroids only. Encode centroids stay frozen at bucket birth /
 /// partition for residual codes `x̂ − encode_c`.
-/// Search opens buckets by routing score until `scan_fraction` of N, then ranks
-/// with `⟨q̂, encode_c⟩ + α · ⟨q̂, r̂⟩`.
+/// Search opens the top `n_probe` buckets by routing score, then ranks with
+/// `⟨q̂, encode_c⟩ + α · ⟨q̂, r̂⟩`.
 class BucketedTurboQuantIndex {
  public:
   BucketedTurboQuantIndex(std::size_t dim, std::size_t bit_width, BucketParams params = {});

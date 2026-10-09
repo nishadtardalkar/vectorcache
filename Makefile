@@ -21,7 +21,7 @@ K             ?= 64
 CALIBRATE     ?=
 RECALL        ?= 1
 BUCKETED      ?= 1
-SCAN_FRACTION ?= 0.02
+N_PROBE       ?= 64
 COS_VAR_THRESHOLD ?= 0.02
 MIN_BUCKET_SIZE ?= 256
 MAX_BUCKET_SIZE ?= 800
@@ -71,7 +71,7 @@ QUERY_BENCH_ARGS = \
 	$(call flag_arg,CALIBRATE,calibrate) \
 	$(call flag_arg,RECALL,recall) \
 	$(call flag_arg,BUCKETED,bucketed) \
-	$(call opt_arg,SCAN_FRACTION,scan-fraction) \
+	$(call opt_arg,N_PROBE,n-probe) \
 	$(call opt_arg,COS_VAR_THRESHOLD,cos-var-threshold) \
 	$(call opt_arg,MIN_BUCKET_SIZE,min-bucket-size) \
 	$(call opt_arg,MAX_BUCKET_SIZE,max-bucket-size) \
@@ -103,7 +103,7 @@ help:
 	@echo "  CALIBRATE=1     --calibrate (TQ+)"
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
 	@echo "  BUCKETED=1      --bucketed (online dense soft/2-means/absorb IVF; product fat champ)"
-	@echo "  SCAN_FRACTION   --scan-fraction (bucketed; default 0.02)"
+	@echo "  N_PROBE         --n-probe (bucketed IVF opens; default 64)"
 	@echo "  MAX_BUCKET_SIZE --max-bucket-size / hard fission_cap (bucketed; default 800)"
 	@echo "  ENERGY_SOFT     --energy-soft (bucketed; default 400)"
 	@echo "  COS_VAR_THRESHOLD / MIN_BUCKET_SIZE  deprecated no-ops (CLI compat)"
@@ -115,7 +115,7 @@ help:
 	@echo "Example: make compute DATASET=openai-1536 BITS=2 K=64"
 	@echo "Example: make compute DATASET=sift1m LIMIT=0 QUERY_LIMIT=10000"
 	@echo "Example: make compute BITS=4 RECALL=1 CALIBRATE=1"
-	@echo "Example: make compute BUCKETED=1 SCAN_FRACTION=0.1"
+	@echo "Example: make compute BUCKETED=1 N_PROBE=64"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 
 login: $(LOGIN_READY)

@@ -34,7 +34,7 @@ Approximate nearest-neighbor search matching turbovec's TurboQuant core, with an
 
 Clustering is in **input L2-normalized space** (not TurboQuant rotated space). No SRHT on the clustering path. Shared rotation/codebook/TQ+ across buckets for encode/search only.
 
-Product clustering matches the SIFT1M online fat champ (`soft309_trig1016`: r@1≈0.981 @ ~3105×322 under 2% scan).
+Product clustering matches the SIFT1M online fat champ (`soft309_trig1016`: r@1≈0.981 @ ~3105×322 under `n_probe≈64`).
 
 Each bucket keeps two centroids:
 
@@ -56,10 +56,10 @@ Each bucket keeps two centroids:
 
 1. Prepare TurboQuant query state **once** on unit `q̂` (rotate + LUT/PD) — same LUTs for every bucket
 2. Score `q̂` against all **routing** centroids; sort buckets descending
-3. Open buckets in order until cumulative size ≥ `scan_fraction * N` (at least one non-empty)
+3. Open the top `n_probe` buckets by routing score (capped at `num_buckets`)
 4. FastScan each opened bucket with the shared LUTs; push `⟨q̂, encode_c⟩ + α · ⟨q̂, r̂⟩`; remap local ids; merge heaps to top-k
 
-Defaults: `scan_fraction=0.1`, `max_bucket_size=800`, `energy_soft=400`, pulse densify when `expected_n>0` (fractions 0.65/0.78/0.90 of N).
+Defaults: `n_probe=64`, `max_bucket_size=800`, `energy_soft=400`, pulse densify when `expected_n>0` (fractions 0.65/0.78/0.90 of N).
 
 ## Ranking
 

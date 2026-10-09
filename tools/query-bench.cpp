@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -321,7 +322,7 @@ int main(int argc, char** argv) {
   bool calibrate = false;
   bool recall = false;
   bool bucketed = false;
-  float scan_fraction = 0.1f;
+  std::size_t n_probe = 64;
   float cos_var_threshold = 0.02f;  // deprecated no-op (kept for CLI compat)
   std::size_t min_bucket_size = 256;  // deprecated no-op
   std::size_t max_bucket_size = 800;  // hard fission_cap (champ)
@@ -342,9 +343,9 @@ int main(int argc, char** argv) {
   app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
   app.add_flag("--bucketed", bucketed,
                "Use online dense soft/2-means/absorb bucketed index (product fat champ)");
-  app.add_option("--scan-fraction", scan_fraction,
-                 "Fraction of index to open at query time (bucketed)")
-      ->check(CLI::Range(0.0f, 1.0f));
+  app.add_option("--n-probe", n_probe,
+                 "IVF buckets to open per query (bucketed; capped at num_buckets)")
+      ->check(CLI::Range(std::size_t{1}, std::numeric_limits<std::size_t>::max()));
   app.add_option("--cos-var-threshold", cos_var_threshold,
                  "Deprecated no-op (variance split removed)");
   app.add_option("--min-bucket-size", min_bucket_size, "Deprecated no-op");
@@ -447,7 +448,7 @@ int main(int argc, char** argv) {
 
     if (bucketed) {
       vectorcache::BucketParams params;
-      params.scan_fraction = scan_fraction;
+      params.n_probe = n_probe;
       params.cos_var_threshold = cos_var_threshold;
       params.min_bucket_size = min_bucket_size;
       params.max_bucket_size = max_bucket_size;
@@ -491,7 +492,7 @@ int main(int argc, char** argv) {
       std::cout << "ingest_ms="
                 << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
       std::cout << "buckets=" << index.num_buckets() << " max_bucket=" << max_b
-                << " mean_bucket=" << mean_b << " scan_fraction=" << scan_fraction
+                << " mean_bucket=" << mean_b << " n_probe=" << n_probe
                 << " max_bucket_size=" << max_bucket_size << " energy_soft=" << energy_soft
                 << " expected_n=" << db.rows << " min_cos_var=" << min_cos_var
                 << " max_cos_var=" << max_cos_var << "\n";

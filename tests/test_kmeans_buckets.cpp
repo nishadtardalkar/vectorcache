@@ -24,10 +24,10 @@ std::vector<float> random_matrix(std::size_t n, std::size_t dim, std::uint32_t s
   return out;
 }
 
-vectorcache::BucketParams test_params(float scan_fraction = 1.f, std::size_t min_sz = 256,
+vectorcache::BucketParams test_params(std::size_t n_probe = 1000000, std::size_t min_sz = 256,
                                       std::size_t max_sz = 800, float cos_var = 0.02f) {
   vectorcache::BucketParams params;
-  params.scan_fraction = scan_fraction;
+  params.n_probe = n_probe;
   params.min_bucket_size = min_sz;
   params.max_bucket_size = max_sz;
   params.cos_var_threshold = cos_var;
@@ -68,7 +68,7 @@ TEST(KMeansBuckets, AddSearchAndIds) {
   auto queries = random_matrix(nq, dim, 11);
 
   // Small max so random data splits; full scan for coverage.
-  auto params = test_params(1.f, /*min*/ 8, /*max*/ 64, /*var*/ 0.02f);
+  auto params = test_params(/*n_probe*/ 1000000, /*min*/ 8, /*max*/ 64, /*var*/ 0.02f);
 
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
@@ -103,7 +103,7 @@ TEST(KMeansBuckets, SameDirectionStaysOneClusterBelowMax) {
     db[i * dim + 1] = 0.01f * static_cast<float>(static_cast<int>(i % 5) - 2);
   }
 
-  auto params = test_params(1.f, /*min*/ 8, /*max*/ 2048, /*var*/ 0.02f);
+  auto params = test_params(/*n_probe*/ 1000000, /*min*/ 8, /*max*/ 2048, /*var*/ 0.02f);
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
   EXPECT_EQ(index.num_buckets(), 1u);
@@ -122,7 +122,7 @@ TEST(KMeansBuckets, RoutingMeanMovesAfterJoins) {
     joiners[i * dim + 1] = 0.1f * static_cast<float>(i + 1);
   }
 
-  auto params = test_params(1.f, /*min*/ 8, /*max*/ 2048, /*var*/ 0.02f);
+  auto params = test_params(/*n_probe*/ 1000000, /*min*/ 8, /*max*/ 2048, /*var*/ 0.02f);
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(first);
   ASSERT_EQ(index.num_buckets(), 1u);
@@ -154,7 +154,7 @@ TEST(KMeansBuckets, EncodeCentroidFrozenWhileRoutingMoves) {
     joiners[i * dim + 1] = 0.1f * static_cast<float>(i + 1);
   }
 
-  auto params = test_params(1.f, /*min*/ 8, /*max*/ 2048, /*var*/ 0.02f);
+  auto params = test_params(/*n_probe*/ 1000000, /*min*/ 8, /*max*/ 2048, /*var*/ 0.02f);
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(first);
   ASSERT_EQ(index.num_buckets(), 1u);
@@ -190,7 +190,7 @@ TEST(KMeansBuckets, MaxBucketSizeForcesSplit) {
     db[i * dim + 1] = 1e-4f * static_cast<float>(i);
   }
 
-  auto params = test_params(1.f, /*min*/ 2, /*max*/ max_sz, /*var*/ 1.0f);  // var never triggers
+  auto params = test_params(/*n_probe*/ 1000000, /*min*/ 2, /*max*/ max_sz, /*var*/ 1.0f);  // var never triggers
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
   EXPECT_GT(index.num_buckets(), 1u);
@@ -213,7 +213,7 @@ TEST(KMeansBuckets, EnergyOrHardSplitOnDiverseVectors) {
     db[i * dim + axis] = 1.f;
   }
 
-  auto params = test_params(1.f, /*min*/ 4, /*max*/ 32, /*var*/ 0.01f);
+  auto params = test_params(/*n_probe*/ 1000000, /*min*/ 4, /*max*/ 32, /*var*/ 0.01f);
   params.energy_soft = 8;
   params.energy_trig = 0.01f;
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
@@ -224,7 +224,7 @@ TEST(KMeansBuckets, EnergyOrHardSplitOnDiverseVectors) {
   }
 }
 
-TEST(KMeansBuckets, ScanFractionOpensSubset) {
+TEST(KMeansBuckets, NProbeOpensSubset) {
   constexpr std::size_t dim = 32;
   constexpr std::size_t n = 300;
 
@@ -235,7 +235,7 @@ TEST(KMeansBuckets, ScanFractionOpensSubset) {
     db[i * dim + ((axis + 1) % dim)] = 0.02f * static_cast<float>(static_cast<int>(i % 5) - 2);
   }
 
-  auto params = test_params(0.2f, /*min*/ 4, /*max*/ 40, /*var*/ 0.01f);
+  auto params = test_params(/*n_probe*/ 2, /*min*/ 4, /*max*/ 40, /*var*/ 0.01f);
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
   index.prepare();
@@ -255,7 +255,7 @@ TEST(KMeansBuckets, FullScanReturnsValidTopK) {
   auto db = random_matrix(n, dim, 3);
   auto q = std::span<const float>(db.data(), dim);
 
-  auto params = test_params(1.f, /*min*/ 8, /*max*/ 64, /*var*/ 0.02f);
+  auto params = test_params(/*n_probe*/ 1000000, /*min*/ 8, /*max*/ 64, /*var*/ 0.02f);
   vectorcache::BucketedTurboQuantIndex bucketed(dim, 4, params);
   bucketed.add(db);
   bucketed.prepare();
@@ -278,7 +278,7 @@ TEST(KMeansBuckets, SharedHeapFullScanK64Deterministic) {
   auto db = random_matrix(n, dim, 11);
   auto queries = random_matrix(nq, dim, 12);
 
-  auto params = test_params(1.f, /*min*/ 8, /*max*/ 64, /*var*/ 0.02f);
+  auto params = test_params(/*n_probe*/ 1000000, /*min*/ 8, /*max*/ 64, /*var*/ 0.02f);
   vectorcache::BucketedTurboQuantIndex a(dim, 4, params);
   a.add(db);
   a.prepare();

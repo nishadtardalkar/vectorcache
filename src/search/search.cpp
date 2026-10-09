@@ -592,11 +592,72 @@ void score_prepared_into(const PreparedQueries& prep, std::size_t k,
     throw std::invalid_argument("id_map size must equal number of vectors in range");
   }
   const std::uint64_t* id_ptr = id_map.empty() ? nullptr : id_map.data();
+  const std::size_t nqi = query_indices.size();
+
+  // Batch VNNI / permute-dot over the shared codes stream (up to kNqBatch queries).
+  if (prep.backend == SearchBackendKind::VmVnni ||
+      prep.backend == SearchBackendKind::VmPermuteDot) {
+    const std::size_t n_batches = (nqi + kNqBatch - 1) / kNqBatch;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int bi = 0; bi < static_cast<int>(n_batches); ++bi) {
+      const std::size_t start = static_cast<std::size_t>(bi) * kNqBatch;
+      const std::size_t batch_nq = std::min(kNqBatch, nqi - start);
+      float* hs_ptrs[kNqBatch];
+      std::uint64_t* hi_ptrs[kNqBatch];
+      std::size_t hsz_local[kNqBatch];
+      float hmin_local[kNqBatch];
+      std::size_t hmi_local[kNqBatch];
+      float offs_local[kNqBatch];
+
+      for (std::size_t i = 0; i < batch_nq; ++i) {
+        const std::size_t gqi = query_indices[start + i];
+        hs_ptrs[i] = heap_s + gqi * k;
+        hi_ptrs[i] = heap_i + gqi * k;
+        hsz_local[i] = heap_sz[gqi];
+        hmin_local[i] = heap_min[gqi];
+        hmi_local[i] = heap_mi[gqi];
+        offs_local[i] = score_offsets ? score_offsets[gqi] : 0.f;
+      }
+
+      if (prep.backend == SearchBackendKind::VmVnni) {
+        const std::uint8_t* lut_ptrs[kNqBatch];
+        float scales_batch[kNqBatch];
+        float biases_batch[kNqBatch];
+        for (std::size_t i = 0; i < batch_nq; ++i) {
+          const std::size_t gqi = query_indices[start + i];
+          lut_ptrs[i] = prep.split_luts[gqi].data();
+          scales_batch[i] = prep.lut_scales[gqi];
+          biases_batch[i] = prep.lut_biases[gqi];
+        }
+        score_queries_vnni(lut_ptrs, scales_batch, biases_batch, batch_nq, blocked_codes, scales,
+                           prep.n_byte_groups, n_vectors, n_blocks, k, hs_ptrs, hi_ptrs, hsz_local,
+                           hmin_local, hmi_local, id_ptr, offs_local);
+      } else {
+        const QueryPermuteDot* pd_ptrs[kNqBatch];
+        for (std::size_t i = 0; i < batch_nq; ++i) {
+          pd_ptrs[i] = &prep.pds[query_indices[start + i]];
+        }
+        score_queries_permute_dot(pd_ptrs, batch_nq, blocked_codes, scales, prep.n_byte_groups,
+                                  n_vectors, n_blocks, k, hs_ptrs, hi_ptrs, hsz_local, hmin_local,
+                                  hmi_local, id_ptr, offs_local);
+      }
+
+      for (std::size_t i = 0; i < batch_nq; ++i) {
+        const std::size_t gqi = query_indices[start + i];
+        heap_sz[gqi] = hsz_local[i];
+        heap_min[gqi] = hmin_local[i];
+        heap_mi[gqi] = hmi_local[i];
+      }
+    }
+    return;
+  }
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
-  for (int ii = 0; ii < static_cast<int>(query_indices.size()); ++ii) {
+  for (int ii = 0; ii < static_cast<int>(nqi); ++ii) {
     const std::size_t gqi = query_indices[static_cast<std::size_t>(ii)];
     float* hs = heap_s + gqi * k;
     std::uint64_t* hi = heap_i + gqi * k;
@@ -605,27 +666,18 @@ void score_prepared_into(const PreparedQueries& prep, std::size_t k,
     std::size_t& hmi = heap_mi[gqi];
     const float off = score_offsets ? score_offsets[gqi] : 0.f;
 
-    if (prep.backend == SearchBackendKind::VmPermuteDot) {
-      score_query_permute_dot(prep.pds[gqi], blocked_codes, scales, prep.n_byte_groups, n_vectors,
-                              n_blocks, k, hs, hi, hsz, hmin, hmi, id_ptr, off);
-    } else if (prep.backend == SearchBackendKind::VmVnni) {
-      QueryLutView view{prep.split_luts[gqi].data(), prep.lut_scales[gqi], prep.lut_biases[gqi]};
-      score_query_vnni(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks, k, hs,
-                       hi, hsz, hmin, hmi, 0.f, id_ptr, off);
-    } else {
 #if defined(__x86_64__) || defined(_M_X64)
-      if (prep.backend == SearchBackendKind::Avx2) {
-        const auto& lut = prep.luts[gqi];
-        QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
-        score_query_avx2_perm0(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks,
-                               k, hs, hi, hsz, hmin, hmi, prep.bias_corrs[gqi], id_ptr, off);
-      } else
+    if (prep.backend == SearchBackendKind::Avx2) {
+      const auto& lut = prep.luts[gqi];
+      QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
+      score_query_avx2_perm0(view, blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks, k,
+                             hs, hi, hsz, hmin, hmi, prep.bias_corrs[gqi], id_ptr, off);
+    } else
 #endif
-      {
-        score_query_scalar(prep.luts[gqi], blocked_codes, scales, prep.bits, prep.n_byte_groups,
-                           n_vectors, n_blocks, k, hs, hi, hsz, hmin, hmi, prep.bias_corrs[gqi],
-                           id_ptr, off);
-      }
+    {
+      score_query_scalar(prep.luts[gqi], blocked_codes, scales, prep.bits, prep.n_byte_groups,
+                         n_vectors, n_blocks, k, hs, hi, hsz, hmin, hmi, prep.bias_corrs[gqi],
+                         id_ptr, off);
     }
   }
 }
