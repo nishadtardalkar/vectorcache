@@ -322,9 +322,10 @@ int main(int argc, char** argv) {
   bool recall = false;
   bool bucketed = false;
   float scan_fraction = 0.1f;
-  float cos_var_threshold = 0.02f;
-  std::size_t min_bucket_size = 1024;
-  std::size_t max_bucket_size = 2048;
+  float cos_var_threshold = 0.02f;  // deprecated no-op (kept for CLI compat)
+  std::size_t min_bucket_size = 256;  // deprecated no-op
+  std::size_t max_bucket_size = 800;  // hard fission_cap (champ)
+  std::size_t energy_soft = 400;
   std::size_t timing_runs = 5;
 
   app.add_option("--dataset", dataset, "Named dataset (glove, sift1m, openai-1536, openai-3072)");
@@ -339,16 +340,17 @@ int main(int argc, char** argv) {
   app.add_option("--k", k, "Top-k");
   app.add_flag("--calibrate", calibrate, "Fit TQ+ on first min(1000, n) index vectors before add");
   app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
-  app.add_flag("--bucketed", bucketed, "Use online moving-mean + cosine-variance bucketed index");
+  app.add_flag("--bucketed", bucketed,
+               "Use online dense soft/2-means/absorb bucketed index (product fat champ)");
   app.add_option("--scan-fraction", scan_fraction,
                  "Fraction of index to open at query time (bucketed)")
       ->check(CLI::Range(0.0f, 1.0f));
   app.add_option("--cos-var-threshold", cos_var_threshold,
-                 "Cosine-score variance that triggers a split (bucketed, default 0.02)");
-  app.add_option("--min-bucket-size", min_bucket_size,
-                 "Min members before variance split is allowed (bucketed, default 1024)");
+                 "Deprecated no-op (variance split removed)");
+  app.add_option("--min-bucket-size", min_bucket_size, "Deprecated no-op");
   app.add_option("--max-bucket-size", max_bucket_size,
-                 "Hard max bucket size before forced split (bucketed, default 2048)");
+                 "Hard fission cap (champ default 800)");
+  app.add_option("--energy-soft", energy_soft, "Soft energy-split threshold (champ default 400)");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
   CLI11_PARSE(app, argc, argv);
@@ -449,6 +451,8 @@ int main(int argc, char** argv) {
       params.cos_var_threshold = cos_var_threshold;
       params.min_bucket_size = min_bucket_size;
       params.max_bucket_size = max_bucket_size;
+      params.energy_soft = energy_soft;
+      params.expected_n = db.rows;
       vectorcache::BucketedTurboQuantIndex index(db.cols, bits, params);
       if (calibrate) {
         const std::size_t n_cal =
@@ -488,10 +492,9 @@ int main(int argc, char** argv) {
                 << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
       std::cout << "buckets=" << index.num_buckets() << " max_bucket=" << max_b
                 << " mean_bucket=" << mean_b << " scan_fraction=" << scan_fraction
-                << " cos_var_threshold=" << cos_var_threshold
-                << " min_bucket_size=" << min_bucket_size
-                << " max_bucket_size=" << max_bucket_size
-                << " min_cos_var=" << min_cos_var << " max_cos_var=" << max_cos_var << "\n";
+                << " max_bucket_size=" << max_bucket_size << " energy_soft=" << energy_soft
+                << " expected_n=" << db.rows << " min_cos_var=" << min_cos_var
+                << " max_cos_var=" << max_cos_var << "\n";
       std::cout << "top_bucket_sizes:";
       const std::size_t top_n = std::min<std::size_t>(10, bucket_sizes.size());
       for (std::size_t i = 0; i < top_n; ++i) {

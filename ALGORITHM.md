@@ -30,26 +30,27 @@ Approximate nearest-neighbor search matching turbovec's TurboQuant core, with an
  + store α
 ```
 
-## Online moving-mean bucketing (`BucketedTurboQuantIndex`)
+## Online dense bucketing (`BucketedTurboQuantIndex`)
 
 Clustering is in **input L2-normalized space** (not TurboQuant rotated space). No SRHT on the clustering path. Shared rotation/codebook/TQ+ across buckets for encode/search only.
 
+Product clustering matches the SIFT1M online fat champ (`soft309_trig1016`: r@1≈0.981 @ ~3105×322 under 2% scan).
+
 Each bucket keeps two centroids:
 
-- **Routing centroid** — exact normalized running mean of members (`sum/count`, then L2-normalize). Used for assignment and query opening.
+- **Routing centroid** — margin-weighted normalized mean + optional soft seam attract toward near-tie vectors. Used for assignment and query opening. At `prepare()`, thinner lists get a stronger anti-rival push (`C -= β Crival`, β scaled by size asymmetry).
 - **Encode centroid** — frozen at bucket birth (founding unit vector, or normalized mean of a split partition). Residuals `r = x̂ − encode_c` are TurboQuant-encoded against this only.
 
 **Ingest**
 
 1. L2-normalize the vector → `x̂`
 2. If no buckets exist: spawn one with encode/routing = `x̂`
-3. Else assign to `argmax_j ⟨x̂, routing_c_j⟩`
-4. Update Welford stats on `cos = ⟨x̂, routing_c⟩` (before mean update), then `sum += x̂`, `routing = normalize(sum)`
-5. Append `x̂`; TurboQuant-encode residual vs frozen encode centroid
-6. Split the bucket when `(count ≥ min_bucket_size ∧ cos_var ≥ cos_var_threshold)` or `count ≥ max_bucket_size`:
-   - Seed A = routing mean; seed B = furthest member
-   - Bipartition by nearer seed (median split by cos-to-A if one side empty)
-   - Each child: freeze encode = normalize(mean), recompute routing/Welford, re-encode residuals
+3. Else assign to `argmax_j ⟨x̂, routing_c_j⟩`; if top-2 margin is thin, soft-pull both centroids
+4. Append with margin weight `w = clip(margin/(margin+τ))`; update weighted routing mean; TurboQuant-encode residual vs frozen encode centroid
+5. Fission via 1-iter spherical 2-means poles + Voronoi membership (median-axis fallback if a side has <2):
+   - **Hard** when `count ≥ max_bucket_size` (default 800)
+   - **Soft** when `count ≥ soft_t` and `energy = 1−cos_mean ≥ trig` (`energy_soft=400` / `energy_trig=0.095`, with mid-stream densify pulse when `expected_n` is set)
+6. Periodic absorb of tiny near-duplicate lists into larger rivals (stream absorb / recovery / late)
 
 **Query**
 
@@ -58,7 +59,7 @@ Each bucket keeps two centroids:
 3. Open buckets in order until cumulative size ≥ `scan_fraction * N` (at least one non-empty)
 4. FastScan each opened bucket with the shared LUTs; push `⟨q̂, encode_c⟩ + α · ⟨q̂, r̂⟩`; remap local ids; merge heaps to top-k
 
-Defaults: `scan_fraction=0.1`, `cos_var_threshold=0.02`, `min_bucket_size=1024`, `max_bucket_size=2048`, start with zero clusters.
+Defaults: `scan_fraction=0.1`, `max_bucket_size=800`, `energy_soft=400`, pulse densify when `expected_n>0` (fractions 0.65/0.78/0.90 of N).
 
 ## Ranking
 

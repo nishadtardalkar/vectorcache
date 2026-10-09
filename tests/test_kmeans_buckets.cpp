@@ -24,13 +24,17 @@ std::vector<float> random_matrix(std::size_t n, std::size_t dim, std::uint32_t s
   return out;
 }
 
-vectorcache::BucketParams test_params(float scan_fraction = 1.f, std::size_t min_sz = 1024,
-                                      std::size_t max_sz = 2048, float cos_var = 0.02f) {
+vectorcache::BucketParams test_params(float scan_fraction = 1.f, std::size_t min_sz = 256,
+                                      std::size_t max_sz = 800, float cos_var = 0.02f) {
   vectorcache::BucketParams params;
   params.scan_fraction = scan_fraction;
   params.min_bucket_size = min_sz;
   params.max_bucket_size = max_sz;
   params.cos_var_threshold = cos_var;
+  // Keep pulse schedule off-scale for unit tests unless a test opts in.
+  params.energy_soft = (std::max)(max_sz, min_sz);
+  params.pulse_soft = (std::max)(max_sz, min_sz);
+  params.expected_n = 0;
   return params;
 }
 
@@ -198,11 +202,11 @@ TEST(KMeansBuckets, MaxBucketSizeForcesSplit) {
   EXPECT_EQ(total, n);
 }
 
-TEST(KMeansBuckets, VarianceSplitOnDiverseVectors) {
+TEST(KMeansBuckets, EnergyOrHardSplitOnDiverseVectors) {
   constexpr std::size_t dim = 32;
   constexpr std::size_t n = 64;
 
-  // Mix of orthogonal axes → high cosine variance → split before/at max.
+  // Mix of orthogonal axes → energy / hard fission creates multiple lists.
   std::vector<float> db(n * dim, 0.f);
   for (std::size_t i = 0; i < n; ++i) {
     const std::size_t axis = i % 8;
@@ -210,6 +214,8 @@ TEST(KMeansBuckets, VarianceSplitOnDiverseVectors) {
   }
 
   auto params = test_params(1.f, /*min*/ 4, /*max*/ 32, /*var*/ 0.01f);
+  params.energy_soft = 8;
+  params.energy_trig = 0.01f;
   vectorcache::BucketedTurboQuantIndex index(dim, 4, params);
   index.add(db);
   EXPECT_GT(index.num_buckets(), 1u);
