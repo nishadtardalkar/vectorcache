@@ -23,7 +23,8 @@ std::vector<std::uint32_t> fisher_yates(std::size_t dim, ChaCha8Rng& rng) {
     perm[i] = static_cast<std::uint32_t>(i);
   }
   for (std::size_t i = dim; i-- > 1;) {
-    const std::size_t j = static_cast<std::size_t>(rng.next_u64() % (static_cast<std::uint64_t>(i) + 1));
+    const std::size_t j =
+        static_cast<std::size_t>(rng.next_u64() % (static_cast<std::uint64_t>(i) + 1));
     std::swap(perm[i], perm[j]);
   }
   return perm;
@@ -51,18 +52,10 @@ void wht_all(float* buf, std::size_t dim, std::size_t block, float inv_sqrt_bloc
   }
 }
 
-template <int Mode>
-void permute_gather(const float* src, const std::uint32_t* perm, const float* signs, float inv,
-                    float* dst, std::size_t dim) {
+void permute_gather_signed(const float* src, const std::uint32_t* perm, const float* signs,
+                           float inv, float* dst, std::size_t dim) {
   for (std::size_t i = 0; i < dim; ++i) {
-    const float v = src[perm[i]];
-    if constexpr (Mode == 0) {
-      dst[i] = v;
-    } else if constexpr (Mode == 1) {
-      dst[i] = v * signs[i];
-    } else {
-      dst[i] = (v * inv) * signs[i];
-    }
+    dst[i] = (src[perm[i]] * inv) * signs[i];
   }
 }
 
@@ -89,9 +82,6 @@ Rotation::Rotation(std::size_t dim) : dim_(dim) {
     perms_[r] = fisher_yates(dim, rng);
   }
   signs1_pre_.assign(dim, 1.f);
-  for (std::size_t i = 0; i < dim; ++i) {
-    signs1_pre_[perms_[1][i]] = signs_[1][i];
-  }
 }
 
 void Rotation::apply(std::span<float> row) const {
@@ -104,11 +94,10 @@ void Rotation::apply_with_scratch(std::span<float> row, std::span<float> scratch
   float* a = row.data();
   float* b = scratch.data();
   for (std::size_t round = 0; round < kRotationRounds; ++round) {
-    permute_gather<1>(a, perms_[round].data(), signs_[round].data(), 1.f, b, dim_);
+    permute_gather_signed(a, perms_[round].data(), signs_[round].data(), 1.f, b, dim_);
     wht_all(b, dim_, block_, inv_sqrt_block_);
     std::swap(a, b);
   }
-  // Even K: result is back in `row`. If a swapped away from row, copy.
   if (a != row.data()) {
     std::copy(a, a + static_cast<std::ptrdiff_t>(dim_), row.begin());
   }
@@ -117,13 +106,23 @@ void Rotation::apply_with_scratch(std::span<float> row, std::span<float> scratch
 void Rotation::apply_scaled_into(std::span<const float> src, float inv, std::span<float> dst,
                                  std::span<float> scratch) const {
   assert(src.size() == dim_ && dst.size() == dim_ && scratch.size() == dim_);
-  permute_gather<2>(src.data(), perms_[0].data(), signs_[0].data(), inv, scratch.data(), dim_);
+  // First round: scale+sign+perm into scratch, WH, then remaining rounds like apply.
+  permute_gather_signed(src.data(), perms_[0].data(), signs_[0].data(), inv, scratch.data(), dim_);
   wht_all(scratch.data(), dim_, block_, inv_sqrt_block_);
-  for (std::size_t i = 0; i < dim_; ++i) {
-    scratch[i] *= signs1_pre_[i];
+  if constexpr (kRotationRounds == 1) {
+    std::copy(scratch.begin(), scratch.end(), dst.begin());
+    return;
   }
-  permute_gather<0>(scratch.data(), perms_[1].data(), signs1_pre_.data(), 1.f, dst.data(), dim_);
-  wht_all(dst.data(), dim_, block_, inv_sqrt_block_);
+  float* a = scratch.data();
+  float* b = dst.data();
+  for (std::size_t round = 1; round < kRotationRounds; ++round) {
+    permute_gather_signed(a, perms_[round].data(), signs_[round].data(), 1.f, b, dim_);
+    wht_all(b, dim_, block_, inv_sqrt_block_);
+    std::swap(a, b);
+  }
+  if (a != dst.data()) {
+    std::copy(a, a + static_cast<std::ptrdiff_t>(dim_), dst.begin());
+  }
 }
 
 }  // namespace vectorcache

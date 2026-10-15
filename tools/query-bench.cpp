@@ -16,9 +16,7 @@
 
 #include "vectorcache/datasets/datasets.hpp"
 #include "vectorcache/datasets/npy.hpp"
-#include "vectorcache/cluster/kmeans_buckets.hpp"
 #include "vectorcache/index.hpp"
-#include "vectorcache/pack/pack.hpp"
 
 namespace fs = std::filesystem;
 
@@ -308,7 +306,7 @@ bool save_exact_topk(const fs::path& path, const ExactTopkCacheKey& key,
 }  // namespace
 
 int main(int argc, char** argv) {
-  CLI::App app{"Query engine benchmark (TurboQuant flat / bucketed index)"};
+  CLI::App app{"Query engine benchmark (FWHT→4bit→landmarks→exact re-rank)"};
 
   std::string dataset = "glove";
   std::string npy;
@@ -319,14 +317,9 @@ int main(int argc, char** argv) {
   std::size_t query_limit = 1000;
   std::size_t bits = 4;
   std::size_t k = 10;
-  bool calibrate = false;
+  std::size_t landmarks = vectorcache::kDefaultLandmarks;
+  std::size_t shortlist = vectorcache::kDefaultShortlist;
   bool recall = false;
-  bool bucketed = false;
-  std::size_t n_probe = 64;
-  float cos_var_threshold = 0.02f;  // deprecated no-op (kept for CLI compat)
-  std::size_t min_bucket_size = 256;  // deprecated no-op
-  std::size_t max_bucket_size = 800;  // hard fission_cap (champ)
-  std::size_t energy_soft = 400;
   std::size_t timing_runs = 5;
 
   app.add_option("--dataset", dataset, "Named dataset (glove, sift1m, openai-1536, openai-3072)");
@@ -337,21 +330,11 @@ int main(int argc, char** argv) {
                  "Query split: test (GloVe/SIFT1M) or holdout (OpenAI/NPY); default by dataset");
   app.add_option("--limit", limit, "Max index vectors (0 = all)");
   app.add_option("--query-limit", query_limit, "Max queries (0 = all)");
-  app.add_option("--bits", bits, "Bits per dim (2-4)")->check(CLI::Range(2, 4));
-  app.add_option("--k", k, "Top-k");
-  app.add_flag("--calibrate", calibrate, "Fit TQ+ on first min(1000, n) index vectors before add");
+  app.add_option("--bits", bits, "Bits per dim for pre-landmark quant (2-4)")->check(CLI::Range(2, 4));
+  app.add_option("--k", k, "Final top-k after exact re-rank");
+  app.add_option("--landmarks", landmarks, "Orthonormal landmark dims for shortlist scan");
+  app.add_option("--shortlist", shortlist, "Landmark-space shortlist size before exact re-rank");
   app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
-  app.add_flag("--bucketed", bucketed,
-               "Use online dense soft/2-means/absorb bucketed index (product fat champ)");
-  app.add_option("--n-probe", n_probe,
-                 "IVF buckets to open per query (bucketed; capped at num_buckets)")
-      ->check(CLI::Range(std::size_t{1}, std::numeric_limits<std::size_t>::max()));
-  app.add_option("--cos-var-threshold", cos_var_threshold,
-                 "Deprecated no-op (variance split removed)");
-  app.add_option("--min-bucket-size", min_bucket_size, "Deprecated no-op");
-  app.add_option("--max-bucket-size", max_bucket_size,
-                 "Hard fission cap (champ default 800)");
-  app.add_option("--energy-soft", energy_soft, "Soft energy-split threshold (champ default 400)");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
   CLI11_PARSE(app, argc, argv);
@@ -422,105 +405,39 @@ int main(int argc, char** argv) {
     l2_normalize_rows(db);
     l2_normalize_rows(queries);
 
+    if (landmarks == 0 || landmarks > db.cols) {
+      throw std::runtime_error("--landmarks must be in 1..dim");
+    }
+    if (shortlist == 0) {
+      throw std::runtime_error("--shortlist must be > 0");
+    }
+
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
-              << " bits=" << bits << " k=" << k
-              << " mode=" << (bucketed ? "bucketed" : "flat")
-              << " search_backend=" << vectorcache::search_backend_name(bits, db.cols) << "\n";
+              << " bits=" << bits << " landmarks=" << landmarks << " shortlist=" << shortlist
+              << " k=" << k << " search_backend=" << vectorcache::search_backend_name(bits, db.cols)
+              << "\n";
     std::cout << vectorcache::search_backend_diagnostics(bits, db.cols);
 
     vectorcache::SearchResults last;
     std::vector<double> run_ms;
 
-    auto run_search_loop = [&](auto& index) {
-      for (std::size_t r = 0; r < timing_runs; ++r) {
-        const auto a = std::chrono::steady_clock::now();
-        last = index.search(queries.data, k);
-        const auto b = std::chrono::steady_clock::now();
-        run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
-      }
-    };
+    vectorcache::LandmarkIndex index(db.cols, bits, landmarks, shortlist);
+    const auto t0 = std::chrono::steady_clock::now();
+    index.add(db.data);
+    index.prepare();
+    const auto t1 = std::chrono::steady_clock::now();
+    std::cout << "ingest_ms=" << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n"
+              << std::flush;
 
-    auto release_db_if_unused = [&]() {
-      if (!recall) {
-        db = Matrix{};
-      }
-    };
+    if (!recall) {
+      db = Matrix{};
+    }
 
-    if (bucketed) {
-      vectorcache::BucketParams params;
-      params.n_probe = n_probe;
-      params.cos_var_threshold = cos_var_threshold;
-      params.min_bucket_size = min_bucket_size;
-      params.max_bucket_size = max_bucket_size;
-      params.energy_soft = energy_soft;
-      params.expected_n = db.rows;
-      vectorcache::BucketedTurboQuantIndex index(db.cols, bits, params);
-      if (calibrate) {
-        const std::size_t n_cal =
-            std::min(db.rows, static_cast<std::size_t>(vectorcache::kRecommendedCalibrationRows));
-        index.calibrate(std::span<const float>(db.data.data(), n_cal * db.cols));
-        std::cout << "calibrated on " << n_cal << " rows\n" << std::flush;
-      }
-      const auto t0 = std::chrono::steady_clock::now();
-      index.add(db.data);
-      index.prepare();
-      const auto t1 = std::chrono::steady_clock::now();
-      std::size_t max_b = 0;
-      std::size_t sum_b = 0;
-      double min_cos_var = 0.0;
-      double max_cos_var = 0.0;
-      std::vector<std::size_t> bucket_sizes;
-      bucket_sizes.reserve(index.num_buckets());
-      for (std::size_t bi = 0; bi < index.num_buckets(); ++bi) {
-        const std::size_t sz = index.bucket_size(bi);
-        const double cos_var = index.bucket_cos_variance(bi);
-        bucket_sizes.push_back(sz);
-        max_b = std::max(max_b, sz);
-        sum_b += sz;
-        if (bi == 0) {
-          min_cos_var = cos_var;
-          max_cos_var = cos_var;
-        } else {
-          min_cos_var = std::min(min_cos_var, cos_var);
-          max_cos_var = std::max(max_cos_var, cos_var);
-        }
-      }
-      const double mean_b =
-          index.num_buckets() == 0 ? 0.0 : static_cast<double>(sum_b) / static_cast<double>(index.num_buckets());
-      std::sort(bucket_sizes.begin(), bucket_sizes.end(),
-                [](std::size_t a, std::size_t b) { return a > b; });
-      std::cout << "ingest_ms="
-                << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n";
-      std::cout << "buckets=" << index.num_buckets() << " max_bucket=" << max_b
-                << " mean_bucket=" << mean_b << " n_probe=" << n_probe
-                << " max_bucket_size=" << max_bucket_size << " energy_soft=" << energy_soft
-                << " expected_n=" << db.rows << " min_cos_var=" << min_cos_var
-                << " max_cos_var=" << max_cos_var << "\n";
-      std::cout << "top_bucket_sizes:";
-      const std::size_t top_n = std::min<std::size_t>(10, bucket_sizes.size());
-      for (std::size_t i = 0; i < top_n; ++i) {
-        std::cout << " " << bucket_sizes[i];
-      }
-      std::cout << "\n" << std::flush;
-      release_db_if_unused();
-      run_search_loop(index);
-    } else {
-      vectorcache::TurboQuantIndex index(db.cols, bits);
-      if (calibrate) {
-        const std::size_t n_cal =
-            std::min(db.rows, static_cast<std::size_t>(vectorcache::kRecommendedCalibrationRows));
-        index.calibrate(std::span<const float>(db.data.data(), n_cal * db.cols));
-        std::cout << "calibrated on " << n_cal << " rows\n" << std::flush;
-      }
-      const auto t0 = std::chrono::steady_clock::now();
-      index.add(db.data);
-      index.prepare();
-      const auto t1 = std::chrono::steady_clock::now();
-      std::cout << "ingest_ms="
-                << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n"
-                << std::flush;
-      release_db_if_unused();
-      run_search_loop(index);
+    for (std::size_t r = 0; r < timing_runs; ++r) {
+      const auto a = std::chrono::steady_clock::now();
+      last = index.search(queries.data, k);
+      const auto b = std::chrono::steady_clock::now();
+      run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
     }
 
     std::sort(run_ms.begin(), run_ms.end());

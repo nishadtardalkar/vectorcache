@@ -9,8 +9,8 @@
 
 namespace vectorcache {
 
-/// Deterministic orthogonal rotation matching turbovec `Rotation`
-/// (K=2 globally-permuted block Walsh–Hadamard rounds, ChaCha8 seed).
+/// Deterministic orthogonal FWHT rotation (K=`kRotationRounds` rounds of
+/// Fisher–Yates perm + ±1 signs + normalized block Walsh–Hadamard).
 class Rotation {
  public:
   explicit Rotation(std::size_t dim);
@@ -29,7 +29,7 @@ class Rotation {
   float inv_sqrt_block_ = 0.f;
   std::vector<std::vector<float>> signs_;
   std::vector<std::vector<std::uint32_t>> perms_;
-  std::vector<float> signs1_pre_;
+  std::vector<float> signs1_pre_;  // unused for K=1; kept for ABI stability of layout
 };
 
 }  // namespace vectorcache

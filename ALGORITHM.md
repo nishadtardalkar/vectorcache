@@ -1,15 +1,15 @@
 # VectorCache Algorithm
 
-Approximate nearest-neighbor search matching turbovec's TurboQuant core, with an optional online moving-mean / cosine-variance bucketing layer in front of flat FastScan.
+Two-stage ANN: FWHT → 4-bit → orthonormal landmarks shortlist → exact float re-rank.
 
-## Per-bucket TurboQuant (unchanged core)
+## Index / query
 
-1. L2-normalize on `dim` (8-way chain norm, no FMA)
-2. Apply `K=2` rounds of (global ChaCha8 Fisher–Yates → ±1 signs → normalized block Walsh–Hadamard). Block size `B = dim & -dim`. Frozen ChaCha8 seed from turbovec v5.
-3. Optional TQ+: per-coord `(x + shift) * scale` fitted from sample quantiles onto outermost Lloyd-Max centroids
-4. Lloyd-Max scalar quantize: each rotated coord → one of `2^n` centroids (`n ∈ {2,3,4}`) on Beta((dim−1)/2,(dim−1)/2); boundaries are f32 midpoints of f32 centroids; pack bit-planes
-5. Store per-vector scale `α = ‖v‖ / ⟨u, x̂⟩` (RaBitQ-style); degenerate inner → 0
-6. Query (inside an opened bucket): same prep; score vectors with nibble LUT / FastScan over BLOCK=32 layout; multiply by `α`; take top-k
+1. L2-normalize
+2. **1 round** FWHT (ChaCha8 Fisher–Yates + ±1 signs + normalized block Walsh–Hadamard, `B = dim & -dim`)
+3. Lloyd-Max scalar quantize (`bits` ∈ {2,3,4}) on Beta((dim−1)/2,(dim−1)/2); RaBitQ `α = ⟨y, ŷ⟩ / ‖ŷ‖²`
+4. Project `α·ŷ` onto `m` orthonormal landmarks (QR of seeded Gaussians)
+5. Pack landmark rows into BLOCK=32 SoA layout; AVX2 FMA shortlist scan + heap
+6. Exact IP re-rank of the shortlist against stored unit float vectors → top-k
 
 ```
  INGEST (per bucket)                 QUERY (per opened bucket)

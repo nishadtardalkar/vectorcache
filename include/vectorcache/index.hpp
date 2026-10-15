@@ -2,52 +2,57 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <vector>
 
 #include "vectorcache/constants.hpp"
-#include "vectorcache/encode/encode.hpp"
 #include "vectorcache/search/search.hpp"
 #include "vectorcache/transform/rotation.hpp"
 
 namespace vectorcache {
 
-class TurboQuantIndex {
+/// FWHT (1 round) → 4-bit scalar quant → orthonormal landmarks → shortlist → exact re-rank.
+class LandmarkIndex {
  public:
-  TurboQuantIndex(std::size_t dim, std::size_t bit_width);
+  LandmarkIndex(std::size_t dim, std::size_t bit_width, std::size_t n_landmarks = kDefaultLandmarks,
+                std::size_t shortlist = kDefaultShortlist, std::uint64_t landmark_seed = 0);
 
   std::size_t dim() const { return dim_; }
   std::size_t bit_width() const { return bits_; }
-  std::size_t size() const { return scales_.size(); }
+  std::size_t n_landmarks() const { return n_landmarks_; }
+  std::size_t shortlist() const { return shortlist_; }
+  std::size_t size() const { return n_vectors_; }
 
-  void add(std::span<const float> vectors);  // flat n*dim
-  void calibrate(std::span<const float> sample);  // flat n*dim, n >= 2
+  void set_shortlist(std::size_t shortlist) { shortlist_ = shortlist; }
+
+  /// Append flat n*dim vectors (L2-normalized or not; stored normalized).
+  void add(std::span<const float> vectors);
   void prepare();
 
   SearchResults search(std::span<const float> queries, std::size_t k) const;
 
-  std::span<const float> centroids() const { return centroids_; }
-  std::span<const float> boundaries() const { return boundaries_; }
-  std::span<const std::uint8_t> packed_codes() const { return packed_; }
-  std::span<const float> scales() const { return scales_; }
-  bool has_calibration() const { return calibration_.has_value(); }
-
  private:
-  void ensure_blocked() const;
+  void encode_row(const float* src, float* unit_out, float* landmark_row_out);
 
   std::size_t dim_;
   std::size_t bits_;
+  std::size_t n_landmarks_;
+  std::size_t shortlist_;
+  std::uint64_t landmark_seed_;
   Rotation rotation_;
   std::vector<float> boundaries_;
   std::vector<float> centroids_;
-  std::optional<Calibration> calibration_;
-  std::vector<std::uint8_t> packed_;
-  std::vector<float> scales_;
-  mutable std::vector<std::uint8_t> blocked_;
+  std::vector<float> landmark_basis_;  // dim * m, column-major
+  std::vector<float> db_unit_;         // n * dim (L2-normalized originals for re-rank)
+  std::vector<float> landmark_rows_;   // n * m (row-major before prepare)
+  mutable std::vector<float> blocked_landmarks_;  // n_blocks * m * kBlock
   mutable std::size_t n_blocks_ = 0;
-  mutable bool blocked_ready_ = false;
-  mutable std::vector<float> rotated_scratch_;
+  std::size_t n_vectors_ = 0;
+  mutable bool prepared_ = false;
+  mutable std::vector<float> rotate_scratch_;
 };
+
+/// Back-compat name used by older call sites / benches.
+using TurboQuantIndex = LandmarkIndex;
 
 }  // namespace vectorcache
