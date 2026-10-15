@@ -47,6 +47,11 @@ std::pair<std::vector<std::uint8_t>, std::size_t> repack_perm0(
 std::vector<std::uint8_t> repack_seq(std::span<const std::uint8_t> packed_codes,
                                      std::size_t n_vectors, std::size_t bits, std::size_t dim);
 
+/// Bit-plane packed → row-major flat codes (`n_vectors × n_byte_groups`) for sparse access.
+std::vector<std::uint8_t> codes_flat_from_packed(std::span<const std::uint8_t> packed_codes,
+                                                 std::size_t n_vectors, std::size_t bits,
+                                                 std::size_t dim);
+
 std::uint8_t read_code(std::span<const std::uint8_t> blocked, std::size_t bits,
                        std::size_t n_byte_groups, std::size_t block_idx, std::size_t g,
                        std::size_t lane);

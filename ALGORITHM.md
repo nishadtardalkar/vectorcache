@@ -2,7 +2,7 @@
 
 Two-stage ANN over a flat corpus (`LandmarkIndex`):
 
-**FWHT → 4-bit quant → orthonormal landmark shortlist → exact float re-rank.**
+**FWHT → 4-bit quant → orthonormal landmark shortlist → quantized re-rank.**
 
 Defaults: `bits=4`, `m=96` landmarks, shortlist `S=1024`, final top-`k` after re-rank. `dim` must be a positive multiple of 8, ≤ 16384.
 
@@ -10,13 +10,16 @@ Defaults: `bits=4`, `m=96` landmarks, shortlist `S=1024`, final top-`k` after re
 
 For each database vector:
 
-1. **L2-normalize** → unit `x̂` (stored for exact re-rank)
+1. **L2-normalize** → unit `x̂` (scratch until `prepare()`)
 2. **1 round FWHT** (SRHT stand-in): ChaCha8 Fisher–Yates permutation + ±1 signs + normalized block Walsh–Hadamard. Block size `B = dim & -dim`. Frozen ChaCha8 seed from turbovec v5.
 3. **Lloyd-Max scalar quantize** each rotated coord to one of `2^n` centroids (`n ∈ {2,3,4}`) on Beta((dim−1)/2, (dim−1)/2); boundaries are f32 midpoints of centroids → reconstruction `ŷ`
 4. **RaBitQ scale** `α = ⟨y, ŷ⟩ / ‖ŷ‖²` (degenerate → 0)
 5. **Landmark project** `ℓ = (α · ŷ) L` where `L` is `dim × m` with orthonormal columns (QR / modified Gram–Schmidt of seeded Gaussians)
 
-At `prepare()`: pack landmark rows into **BLOCK=32 SoA** layout (per block: for each of `m` dims, 32 lane floats).
+At `prepare()`:
+
+- Encode full-dim unit vectors with TurboQuant (`encode`) → store **flat 4-bit codes** + per-vector α; **drop float originals**
+- L2-normalize landmark rows, FastScan-pack into **BLOCK=32 SoA** (PERM0)
 
 ```
  INGEST                              QUERY
@@ -24,20 +27,22 @@ At `prepare()`: pack landmark rows into **BLOCK=32 SoA** layout (per block: for 
  float[dim]                          float[dim]
       │                                   │
       ▼                                   ▼
- L2 normalize  ──store x̂──┐         L2 normalize
-      │                   │               │
-      ▼                   │               ▼
- FWHT ×1                  │          FWHT ×1
-      │                   │               │
-      ▼                   │               ▼
- 4-bit Lloyd-Max + α      │          project q_rot → q_ℓ (float)
-      │                   │               │
-      ▼                   │               ▼
- ℓ = (α·ŷ) L              │          AVX2 blocked landmark scan
-      │                   │               │  heap top-S
-      ▼                   │               ▼
- pack BLOCK=32 SoA        │          exact IP re-rank vs x̂
-                          └──────────→ top-k
+ L2 normalize                    L2 normalize
+      │                                   │
+      ▼                                   ▼
+ FWHT ×1                             FWHT ×1
+      │                                   │
+      ▼                                   ▼
+ 4-bit Lloyd-Max + α            project q_rot → q_ℓ (float)
+      │                                   │
+      ▼                                   ▼
+ ℓ = (α·ŷ) L                     AVX2 blocked landmark scan
+      │                                   │  heap top-S
+      ▼                                   ▼
+ prepare():                      quantized re-rank vs codes
+  store full-dim codes+α              (α · LUT(q_rot))
+  pack landmark BLOCK=32 SoA  ──────→ top-k
+  drop floats
 ```
 
 ## Query
@@ -46,24 +51,24 @@ At `prepare()`: pack landmark rows into **BLOCK=32 SoA** layout (per block: for 
 2. Same **1 round FWHT** as ingest → `q_rot`
 3. Project onto landmarks: `q_ℓ = q_rot L` (query stays **float**; DB landmarks already baked from quantized `α·ŷ`)
 4. **Shortlist scan (FastScan)**: L2-normalize landmark rows, 4-bit Lloyd-Max + `α`, bit-plane pack (PERM0 or vector-major); query builds LUT on `q_ℓ` and scores with AVX2 `vpshufb` / AVX-512 VNNI (batched up to 8 queries). Keep top-`S`.
-5. **Exact re-rank**: for each shortlist id, score `⟨q̂, x̂_i⟩` in original unit space; heap / sort to final top-`k`
+5. **Quantized re-rank**: for each shortlist id, score `α_i · LUT(q_rot, code_i)` against stored full-dim codes; heap / sort to final top-`k`
 
-Asymmetric: query landmarks stay float (LUT); DB landmarks are 4-bit FastScan codes. Exact re-rank uses original unit floats.
+Asymmetric throughout: query stays float (LUT); DB is 4-bit codes (landmarks for shortlist, full-dim for re-rank).
 
 ## Ranking
 
 | Stage | Score |
 |---|---|
-| Landmark shortlist | `⟨q_ℓ, ℓ_i⟩` with `ℓ_i = (α_i · ŷ_i) L` |
-| Exact re-rank | `⟨q̂, x̂_i⟩` (unit IP ≡ cosine) |
+| Landmark shortlist | `⟨q_ℓ, ℓ_i⟩` with `ℓ_i = (α_i · ŷ_i) L` (via FastScan LUT) |
+| Quantized re-rank | `α_i · ⟨q_rot, ŷ_i⟩` via LUT on full-dim codes |
 
 ## Layout / SIMD
 
 - Landmark dim padded to a multiple of 8 for FastScan (`scan_dim`)
 - Codes: bit-plane pack → BLOCK=32 **PERM0** (paired with `avx2_perm0` LUT scan)
+- Full-dim re-rank codes: row-major flat (`n × n_byte_groups`) for sparse shortlist access
 - **Multi-query FastScan** (turbovec-style): up to 4 queries share one codes stream (`kAvx2NqBatch`); OpenMP tiles `(query-batch × block-range)`
 - Prior TurboQuant VNNI / vector-major kernels remain in-tree for full-dim paths; landmark search uses PERM0 for pack/search layout match
-- Exact re-rank: float IP on shortlist ids
 
 ## CLI (`query-bench`)
 
@@ -77,7 +82,7 @@ Asymmetric: query landmarks stay float (LUT); DB landmarks are 4-bit FastScan co
 | `--bits` | Scalar quant bits before landmarks (2–4) |
 | `--landmarks` / `m` | Orthonormal landmark dimensionality |
 | `--shortlist` / `S` | Landmark-space candidate count before re-rank |
-| `--k` | Final top-k after exact re-rank |
+| `--k` | Final top-k after quantized re-rank |
 
 ## Sources
 

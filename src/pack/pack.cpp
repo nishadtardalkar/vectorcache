@@ -371,6 +371,12 @@ void vector_major_to_seq_chunk(std::span<std::uint8_t> buf) {
   }
 }
 
+std::vector<std::uint8_t> codes_flat_from_packed(std::span<const std::uint8_t> packed_codes,
+                                                 std::size_t n_vectors, std::size_t bits,
+                                                 std::size_t dim) {
+  return extract_codes_flat(packed_codes, n_vectors, bits, dim);
+}
+
 std::vector<std::uint8_t> repack_seq(std::span<const std::uint8_t> packed_codes,
                                      std::size_t n_vectors, std::size_t bits, std::size_t dim) {
   const auto geo = blocked_geometry(n_vectors, bits, dim);

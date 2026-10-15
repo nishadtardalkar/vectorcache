@@ -11,7 +11,7 @@
 
 namespace vectorcache {
 
-/// FWHT (1 round) → 4-bit quant → orthonormal landmarks → FastScan shortlist → exact re-rank.
+/// FWHT (1 round) → 4-bit quant → orthonormal landmarks → FastScan shortlist → quantized re-rank.
 class LandmarkIndex {
  public:
   LandmarkIndex(std::size_t dim, std::size_t bit_width, std::size_t n_landmarks = kDefaultLandmarks,
@@ -26,7 +26,7 @@ class LandmarkIndex {
 
   void set_shortlist(std::size_t shortlist) { shortlist_ = shortlist; }
 
-  /// Append flat n*dim vectors (L2-normalized or not; stored normalized).
+  /// Append flat n*dim vectors (L2-normalized or not). After prepare(), only quantized codes remain.
   void add(std::span<const float> vectors);
   void prepare();
 
@@ -47,10 +47,12 @@ class LandmarkIndex {
   std::vector<float> lm_boundaries_;    // landmark-space FastScan quant
   std::vector<float> lm_centroids_;
   std::vector<float> landmark_basis_;  // dim * m, column-major
-  std::vector<float> db_unit_;         // n * dim
+  std::vector<float> db_unit_;         // n * dim (scratch until prepare)
   std::vector<float> landmark_rows_;   // n * scan_dim (row-major before prepare)
-  std::vector<std::uint8_t> blocked_codes_;
-  std::vector<float> scales_;
+  std::vector<std::uint8_t> blocked_codes_;  // landmark FastScan
+  std::vector<float> scales_;                // landmark α
+  std::vector<std::uint8_t> rerank_codes_;    // full-dim flat codes (n * n_byte_groups)
+  std::vector<float> rerank_scales_;          // full-dim TurboQuant α
   mutable std::size_t n_blocks_ = 0;
   std::size_t n_vectors_ = 0;
   mutable bool prepared_ = false;

@@ -872,26 +872,36 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const float> landmark_basis, std::size_t n_landmarks,
                                      std::size_t scan_dim, std::span<const float> lm_centroids,
                                      std::size_t bits, std::span<const std::uint8_t> blocked_codes,
-                                     std::size_t n_blocks, std::span<const float> scales,
-                                     std::span<const float> db_unit, const Rotation& rotation) {
+                                     std::size_t n_blocks, std::span<const float> lm_scales,
+                                     std::span<const std::uint8_t> rerank_codes,
+                                     std::span<const float> rerank_scales,
+                                     std::span<const float> centroids, const Rotation& rotation) {
   SearchResults out;
   out.nq = nq;
   out.k = k;
   out.scores.assign(nq * k, 0.f);
   out.ids.assign(nq * k, 0);
-  if (nq == 0 || scales.empty() || k == 0) {
+  if (nq == 0 || lm_scales.empty() || k == 0) {
     return out;
   }
   if (scan_dim < n_landmarks || scan_dim % 8 != 0) {
     throw std::invalid_argument("search_landmark_rerank: scan_dim must be >= m and multiple of 8");
   }
+  if (rerank_scales.size() != lm_scales.size()) {
+    throw std::invalid_argument("search_landmark_rerank: rerank_scales size mismatch");
+  }
+  const std::size_t codes_per_byte = 8 / bits;
+  const std::size_t n_byte_groups = dim / codes_per_byte;
+  if (rerank_codes.size() < rerank_scales.size() * n_byte_groups) {
+    throw std::invalid_argument("search_landmark_rerank: rerank_codes too short");
+  }
 
-  const std::size_t n_vectors = scales.size();
+  const std::size_t n_vectors = lm_scales.size();
   const std::size_t sl = std::min(shortlist, n_vectors);
   const std::size_t kk = std::min(k, n_vectors);
 
   std::vector<float> q_land(nq * scan_dim, 0.f);
-  std::vector<float> q_unit(nq * dim);
+  std::vector<float> q_rot(nq * dim);
 
 #ifdef _OPENMP
 #pragma omp parallel
@@ -907,10 +917,8 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       auto q = queries.subspan(qis * dim, dim);
       const float nrm = row_norm(q);
       const float inv = (nrm > kMinInputNorm) ? (1.f / nrm) : 0.f;
-      for (std::size_t d = 0; d < dim; ++d) {
-        q_unit[qis * dim + d] = q[d] * inv;
-      }
       rotation.apply_scaled_into(q, inv, row, scratch);
+      std::copy(row.begin(), row.end(), q_rot.begin() + static_cast<std::ptrdiff_t>(qis * dim));
       float* dest = q_land.data() + qis * scan_dim;
       for (std::size_t j = 0; j < n_landmarks; ++j) {
         double s = 0.0;
@@ -924,7 +932,10 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
   }
 
   auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, bits);
-  SearchResults cand = score_prepared(prep, sl, blocked_codes, n_blocks, scales);
+  SearchResults cand = score_prepared(prep, sl, blocked_codes, n_blocks, lm_scales);
+
+  // Asymmetric full-dim re-rank: float query LUT × stored quantized codes.
+  auto rerank_prep = prepare_from_rows(q_rot, nq, dim, centroids, bits);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
@@ -932,9 +943,11 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
   for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
     const std::size_t qis = static_cast<std::size_t>(qi);
     const std::size_t n_cand = std::min(sl, cand.k);
-    exact_rerank_topk(std::span<const float>(q_unit.data() + qis * dim, dim), dim, db_unit,
-                      std::span<const std::uint64_t>(cand.ids.data() + qis * cand.k, n_cand), n_cand,
-                      kk, out.scores.data() + qis * kk, out.ids.data() + qis * kk);
+    const auto& lut = rerank_prep.luts[qis];
+    quantized_rerank_topk(lut.uint8_luts, lut.scale, lut.bias, rerank_codes, n_byte_groups,
+                          rerank_scales,
+                          std::span<const std::uint64_t>(cand.ids.data() + qis * cand.k, n_cand),
+                          n_cand, kk, out.scores.data() + qis * kk, out.ids.data() + qis * kk);
   }
   out.k = kk;
   return out;

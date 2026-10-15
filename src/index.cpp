@@ -130,6 +130,18 @@ void LandmarkIndex::add(std::span<const float> vectors) {
 }
 
 void LandmarkIndex::prepare() {
+  // Full-dim TurboQuant codes for re-rank (drop unit floats after).
+  {
+    std::vector<float> rotated_scratch;
+    std::vector<std::uint8_t> packed;
+    rerank_scales_.clear();
+    encode(db_unit_, n_vectors_, dim_, rotation_, boundaries_, centroids_, bits_, nullptr,
+           rotated_scratch, packed, rerank_scales_);
+    rerank_codes_ = codes_flat_from_packed(packed, n_vectors_, bits_, dim_);
+    db_unit_.clear();
+    db_unit_.shrink_to_fit();
+  }
+
   // L2-normalize landmark rows for TurboQuant-style α, then FastScan-pack.
   std::vector<float> unit_lm(n_vectors_ * scan_dim_);
   std::vector<float> norms(n_vectors_);
@@ -163,8 +175,8 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
   const std::size_t sl = std::min(shortlist_, n_vectors_);
   const std::size_t kk = std::min(k, n_vectors_);
   return search_landmark_rerank(queries, nq, dim_, kk, sl, landmark_basis_, n_landmarks_, scan_dim_,
-                                lm_centroids_, bits_, blocked_codes_, n_blocks_, scales_, db_unit_,
-                                rotation_);
+                                lm_centroids_, bits_, blocked_codes_, n_blocks_, scales_,
+                                rerank_codes_, rerank_scales_, centroids_, rotation_);
 }
 
 }  // namespace vectorcache
