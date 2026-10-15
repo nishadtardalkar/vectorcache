@@ -12,6 +12,9 @@ inline constexpr float kMinInputNorm = 1e-10f;
 inline constexpr float kMaxInputMagnitude = 1e16f;
 inline constexpr double kDegenerateInnerEps = 1e-12;
 inline constexpr std::size_t kNormChains = 8;
+inline constexpr std::size_t kFlushEvery = 256;
+inline constexpr std::size_t kMinCalibrationRows = 2;
+inline constexpr std::size_t kRecommendedCalibrationRows = 1000;
 inline constexpr std::size_t kDefaultLandmarks = 96;
 inline constexpr std::size_t kDefaultShortlist = 1024;
 

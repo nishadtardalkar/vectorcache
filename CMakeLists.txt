@@ -28,7 +28,11 @@ set(VECTORCACHE_SOURCES
   src/transform/rotation.cpp
   src/transform/landmarks.cpp
   src/quantize/codebook.cpp
+  src/encode/encode.cpp
+  src/pack/pack.cpp
   src/search/landmark_scan.cpp
+  src/search/search_avx2.cpp
+  src/search/search_vnni.cpp
   src/search/search.cpp
   src/index.cpp
   src/datasets/npy.cpp
@@ -45,11 +49,18 @@ target_compile_features(vectorcache PUBLIC cxx_std_20)
 
 if(MSVC)
   target_compile_options(vectorcache PRIVATE /W4 /arch:AVX2)
+  set_source_files_properties(src/search/search_vnni.cpp PROPERTIES
+    COMPILE_OPTIONS "/arch:AVX512")
 else()
   target_compile_options(vectorcache PRIVATE
     -Wall -Wextra
     -mavx2 -mfma
   )
+  # Compile SIMD search TUs with broader ISA; runtime dispatch selects path.
+  set_source_files_properties(src/search/search_avx2.cpp PROPERTIES
+    COMPILE_OPTIONS "-mavx2;-mfma")
+  set_source_files_properties(src/search/search_vnni.cpp PROPERTIES
+    COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vbmi;-mavx512vnni;-mfma")
 endif()
 
 if(VECTORCACHE_OPENMP)

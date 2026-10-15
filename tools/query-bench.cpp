@@ -17,6 +17,7 @@
 #include "vectorcache/datasets/datasets.hpp"
 #include "vectorcache/datasets/npy.hpp"
 #include "vectorcache/index.hpp"
+#include "vectorcache/pack/pack.hpp"
 
 namespace fs = std::filesystem;
 
@@ -414,9 +415,8 @@ int main(int argc, char** argv) {
 
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
               << " bits=" << bits << " landmarks=" << landmarks << " shortlist=" << shortlist
-              << " k=" << k << " search_backend=" << vectorcache::search_backend_name(bits, db.cols)
-              << "\n";
-    std::cout << vectorcache::search_backend_diagnostics(bits, db.cols);
+              << " k=" << k << " search_backend=avx2_perm0+rerank (landmark FastScan)\n";
+    std::cout << vectorcache::search_backend_diagnostics(bits, landmarks);
 
     vectorcache::SearchResults last;
     std::vector<double> run_ms;

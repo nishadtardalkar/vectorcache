@@ -3,8 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <string>
+#include <utility>
 #include <vector>
+
+#include "vectorcache/search/search_vnni.hpp"
+#include "vectorcache/transform/rotation.hpp"
 
 namespace vectorcache {
 
@@ -15,17 +18,88 @@ struct SearchResults {
   std::size_t nq = 0;
 };
 
-/// Blocked float landmark shortlist scan + exact float re-rank.
+struct PreparedQueryLut {
+  std::vector<std::uint8_t> uint8_luts;
+  float scale = 1.f;
+  float bias = 0.f;
+};
+
+enum class SearchBackendKind { VmPermuteDot, VmVnni, Avx2, Scalar };
+
+/// Query-side state shared across one or more blocked code ranges (buckets).
+struct PreparedQueries {
+  std::size_t nq = 0;
+  std::size_t dim = 0;
+  std::size_t bits = 0;
+  std::size_t n_byte_groups = 0;
+  SearchBackendKind backend = SearchBackendKind::Scalar;
+
+  std::vector<float> q_rot;
+  std::vector<float> bias_corrs;
+
+  std::vector<QueryPermuteDot> pds;
+  std::vector<std::vector<std::uint8_t>> split_luts;
+  std::vector<float> lut_scales;
+  std::vector<float> lut_biases;
+  std::vector<PreparedQueryLut> luts;
+};
+
+PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, std::size_t dim,
+                                const Rotation& rotation, std::span<const float> centroids,
+                                std::size_t bits, std::span<const float> tqplus_shift,
+                                std::span<const float> tqplus_scale);
+
+/// Build LUTs from already-transformed query rows (no rotation). Used for landmark FastScan.
+PreparedQueries prepare_from_rows(std::span<const float> rows, std::size_t nq, std::size_t dim,
+                                  std::span<const float> centroids, std::size_t bits);
+
+/// FWHT → landmark project → FastScan shortlist → exact float re-rank.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
                                      std::size_t k, std::size_t shortlist,
-                                     std::span<const float> landmark_basis,  // dim * m, col-major
-                                     std::size_t n_landmarks,
-                                     std::span<const float> blocked_landmarks,  // n_blocks*m*kBlock
-                                     std::size_t n_vectors, std::size_t n_blocks,
-                                     std::span<const float> db_unit,  // n_vectors * dim
-                                     const class Rotation& rotation);
+                                     std::span<const float> landmark_basis, std::size_t n_landmarks,
+                                     std::size_t scan_dim, std::span<const float> lm_centroids,
+                                     std::size_t bits, std::span<const std::uint8_t> blocked_codes,
+                                     std::size_t n_blocks, std::span<const float> scales,
+                                     std::span<const float> db_unit, const Rotation& rotation);
 
-std::string search_backend_name(std::size_t /*bits*/, std::size_t /*dim*/);
-std::string search_backend_diagnostics(std::size_t /*bits*/, std::size_t /*dim*/);
+/// Copy prepared state for a single query index (for per-query IVF probing).
+PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
+
+/// Score a contiguous blocked range using prepared query state.
+/// If `id_map` is non-empty it must have `scales.size()` entries; local ids are remapped.
+/// If `query_indices` is non-empty, only those prepared queries are scored (output nq =
+/// query_indices.size()); otherwise all `prep.nq` queries are scored.
+SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
+                             std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                             std::span<const float> scales,
+                             std::span<const std::uint64_t> id_map = {},
+                             std::span<const std::size_t> query_indices = {});
+
+/// Continue scoring into existing per-query top-k heaps (length `prep.nq`, indexed by global qi).
+/// Only `query_indices` are updated. Heaps may already be partially filled.
+/// When `id_map` is non-empty, pushes `id_map[local]` (required for multi-bucket IVF).
+/// If `score_offsets` is non-null (length `prep.nq`), adds `score_offsets[qi]` after α·LUT
+/// (IVF residual: ⟨q̂, c⟩ + α · ⟨q̂, r̂⟩) without rebuilding query LUTs.
+void score_prepared_into(const PreparedQueries& prep, std::size_t k,
+                         std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                         std::span<const float> scales, std::span<const std::uint64_t> id_map,
+                         std::span<const std::size_t> query_indices, float* heap_s,
+                         std::uint64_t* heap_i, std::size_t* heap_sz, float* heap_min,
+                         std::size_t* heap_mi, const float* score_offsets = nullptr);
+
+/// Sort unordered top-k heaps (min-heap layout) into descending SearchResults.
+void heaps_to_search_results(SearchResults& out, std::size_t nq, std::size_t k,
+                             const float* heap_s, const std::uint64_t* heap_i,
+                             const std::size_t* heap_sz);
+
+SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::size_t dim,
+                          std::size_t k, const Rotation& rotation,
+                          std::span<const float> centroids, std::size_t bits,
+                          std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                          std::span<const float> scales, std::span<const float> tqplus_shift,
+                          std::span<const float> tqplus_scale);
+
+/// Merge `src` into `dst` keeping top-k per query (higher score wins; tie → lower id).
+void merge_search_results(SearchResults& dst, const SearchResults& src);
 
 }  // namespace vectorcache

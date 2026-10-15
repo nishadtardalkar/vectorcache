@@ -11,7 +11,7 @@
 
 namespace vectorcache {
 
-/// FWHT (1 round) → 4-bit scalar quant → orthonormal landmarks → shortlist → exact re-rank.
+/// FWHT (1 round) → 4-bit quant → orthonormal landmarks → FastScan shortlist → exact re-rank.
 class LandmarkIndex {
  public:
   LandmarkIndex(std::size_t dim, std::size_t bit_width, std::size_t n_landmarks = kDefaultLandmarks,
@@ -20,6 +20,7 @@ class LandmarkIndex {
   std::size_t dim() const { return dim_; }
   std::size_t bit_width() const { return bits_; }
   std::size_t n_landmarks() const { return n_landmarks_; }
+  std::size_t scan_dim() const { return scan_dim_; }
   std::size_t shortlist() const { return shortlist_; }
   std::size_t size() const { return n_vectors_; }
 
@@ -37,22 +38,25 @@ class LandmarkIndex {
   std::size_t dim_;
   std::size_t bits_;
   std::size_t n_landmarks_;
+  std::size_t scan_dim_;  // n_landmarks padded to multiple of 8 for FastScan
   std::size_t shortlist_;
   std::uint64_t landmark_seed_;
   Rotation rotation_;
-  std::vector<float> boundaries_;
-  std::vector<float> centroids_;
+  std::vector<float> boundaries_;       // full-dim FWHT quant
+  std::vector<float> centroids_;        // full-dim FWHT quant
+  std::vector<float> lm_boundaries_;    // landmark-space FastScan quant
+  std::vector<float> lm_centroids_;
   std::vector<float> landmark_basis_;  // dim * m, column-major
-  std::vector<float> db_unit_;         // n * dim (L2-normalized originals for re-rank)
-  std::vector<float> landmark_rows_;   // n * m (row-major before prepare)
-  mutable std::vector<float> blocked_landmarks_;  // n_blocks * m * kBlock
+  std::vector<float> db_unit_;         // n * dim
+  std::vector<float> landmark_rows_;   // n * scan_dim (row-major before prepare)
+  std::vector<std::uint8_t> blocked_codes_;
+  std::vector<float> scales_;
   mutable std::size_t n_blocks_ = 0;
   std::size_t n_vectors_ = 0;
   mutable bool prepared_ = false;
   mutable std::vector<float> rotate_scratch_;
 };
 
-/// Back-compat name used by older call sites / benches.
 using TurboQuantIndex = LandmarkIndex;
 
 }  // namespace vectorcache

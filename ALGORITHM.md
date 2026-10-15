@@ -45,10 +45,10 @@ At `prepare()`: pack landmark rows into **BLOCK=32 SoA** layout (per block: for 
 1. L2-normalize query → `q̂`
 2. Same **1 round FWHT** as ingest → `q_rot`
 3. Project onto landmarks: `q_ℓ = q_rot L` (query stays **float**; DB landmarks already baked from quantized `α·ŷ`)
-4. **Shortlist scan**: score `⟨q_ℓ, ℓ_i⟩` over all DB landmark rows (AVX2 FMA over BLOCK=32 SoA); keep top-`S` with a min-heap
+4. **Shortlist scan (FastScan)**: L2-normalize landmark rows, 4-bit Lloyd-Max + `α`, bit-plane pack (PERM0 or vector-major); query builds LUT on `q_ℓ` and scores with AVX2 `vpshufb` / AVX-512 VNNI (batched up to 8 queries). Keep top-`S`.
 5. **Exact re-rank**: for each shortlist id, score `⟨q̂, x̂_i⟩` in original unit space; heap / sort to final top-`k`
 
-Asymmetric: only the DB path is 4-bit quantized; the query is never quantized. Landmark scan is float·float against the dequantized-then-projected DB features (not Hamming).
+Asymmetric: query landmarks stay float (LUT); DB landmarks are 4-bit FastScan codes. Exact re-rank uses original unit floats.
 
 ## Ranking
 
@@ -59,10 +59,11 @@ Asymmetric: only the DB path is 4-bit quantized; the query is never quantized. L
 
 ## Layout / SIMD
 
-- Landmark DB: blocked SoA, `n_blocks × m × 32` floats
-- Shortlist kernel: broadcast each `q_ℓ[d]`, `_mm256_fmadd_ps` across 32 lanes (4× YMM), heap push
-- OpenMP over queries
-- Backend name: `landmark-avx2+rerank`
+- Landmark dim padded to a multiple of 8 for FastScan (`scan_dim`)
+- Codes: bit-plane pack → BLOCK=32 **PERM0** (paired with `avx2_perm0` LUT scan)
+- **Multi-query FastScan** (turbovec-style): up to 4 queries share one codes stream (`kAvx2NqBatch`); OpenMP tiles `(query-batch × block-range)`
+- Prior TurboQuant VNNI / vector-major kernels remain in-tree for full-dim paths; landmark search uses PERM0 for pack/search layout match
+- Exact re-rank: float IP on shortlist ids
 
 ## CLI (`query-bench`)
 
@@ -87,5 +88,7 @@ Asymmetric: only the DB path is 4-bit quantized; the query is never quantized. L
 | Landmarks (QR) | `include/vectorcache/transform/landmarks.hpp`, `src/transform/landmarks.cpp` |
 | Codebook | `include/vectorcache/quantize/codebook.hpp`, `src/quantize/codebook.cpp` |
 | Landmark scan + re-rank | `include/vectorcache/search/landmark_scan.hpp`, `src/search/landmark_scan.cpp`, `src/search/search.cpp` |
+| FastScan pack / AVX2 / VNNI | `include/vectorcache/pack/pack.hpp`, `src/pack/pack.cpp`, `src/search/search_avx2.cpp`, `src/search/search_vnni.cpp` |
+| Encode (landmark FastScan quant) | `include/vectorcache/encode/encode.hpp`, `src/encode/encode.cpp` |
 | Top-k heap | `include/vectorcache/search/topk_heap.hpp` |
 | Bench | `tools/query-bench.cpp` |
