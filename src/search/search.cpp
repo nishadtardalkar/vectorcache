@@ -871,11 +871,12 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::size_t k, std::size_t shortlist,
                                      std::span<const float> landmark_basis, std::size_t n_landmarks,
                                      std::size_t scan_dim, std::span<const float> lm_centroids,
-                                     std::size_t bits, std::span<const std::uint8_t> blocked_codes,
+                                     std::size_t scan_bits, std::span<const std::uint8_t> blocked_codes,
                                      std::size_t n_blocks, std::span<const float> lm_scales,
                                      std::span<const std::uint8_t> rerank_codes,
                                      std::span<const float> rerank_scales,
-                                     std::span<const float> centroids, const Rotation& rotation) {
+                                     std::span<const float> centroids, std::size_t rerank_bits,
+                                     const Rotation& rotation) {
   SearchResults out;
   out.nq = nq;
   out.k = k;
@@ -890,7 +891,10 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
   if (rerank_scales.size() != lm_scales.size()) {
     throw std::invalid_argument("search_landmark_rerank: rerank_scales size mismatch");
   }
-  const std::size_t codes_per_byte = 8 / bits;
+  if (scan_bits < 2 || scan_bits > 4 || rerank_bits < 2 || rerank_bits > 4) {
+    throw std::invalid_argument("search_landmark_rerank: scan/rerank bits must be 2, 3, or 4");
+  }
+  const std::size_t codes_per_byte = 8 / rerank_bits;
   const std::size_t n_byte_groups = dim / codes_per_byte;
   if (rerank_codes.size() < rerank_scales.size() * n_byte_groups) {
     throw std::invalid_argument("search_landmark_rerank: rerank_codes too short");
@@ -931,11 +935,11 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     }
   }
 
-  auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, bits);
+  auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
   SearchResults cand = score_prepared(prep, sl, blocked_codes, n_blocks, lm_scales);
 
   // Asymmetric full-dim re-rank: float query LUT × stored quantized codes.
-  auto rerank_prep = prepare_from_rows(q_rot, nq, dim, centroids, bits);
+  auto rerank_prep = prepare_from_rows(q_rot, nq, dim, centroids, rerank_bits);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)

@@ -51,3 +51,33 @@ TEST(Index, SelfQueryHighScore) {
   EXPECT_EQ(res.ids[0], 0u);
   EXPECT_GT(res.scores[0], 0.9f);
 }
+
+TEST(Index, SeparateScanAndRerankBits) {
+  constexpr std::size_t dim = 64;
+  constexpr std::size_t n = 128;
+  constexpr std::size_t nq = 2;
+  constexpr std::size_t k = 3;
+
+  std::mt19937 rng(99);
+  std::normal_distribution<float> dist(0.f, 1.f);
+  std::vector<float> db(n * dim);
+  for (float& x : db) x = dist(rng);
+  std::vector<float> queries(nq * dim);
+  for (float& x : queries) x = dist(rng);
+
+  vectorcache::LandmarkIndex index(dim, /*scan_bits=*/2, /*n_landmarks=*/32, /*shortlist=*/48,
+                                   /*landmark_seed=*/0, /*rerank_bits=*/4);
+  EXPECT_EQ(index.scan_bits(), 2u);
+  EXPECT_EQ(index.rerank_bits(), 4u);
+  EXPECT_EQ(index.bit_width(), 2u);
+  index.add(db);
+  index.prepare();
+  auto res = index.search(queries, k);
+  ASSERT_EQ(res.nq, nq);
+  ASSERT_EQ(res.k, k);
+  for (std::size_t qi = 0; qi < nq; ++qi) {
+    for (std::size_t j = 0; j < k; ++j) {
+      EXPECT_LT(res.ids[qi * k + j], n);
+    }
+  }
+}

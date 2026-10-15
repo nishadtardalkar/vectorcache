@@ -11,14 +11,19 @@
 
 namespace vectorcache {
 
-/// FWHT (1 round) → 4-bit quant → orthonormal landmarks → FastScan shortlist → quantized re-rank.
+/// FWHT → quant → orthonormal landmarks → FastScan shortlist → quantized re-rank.
+/// `scan_bits` = landmark FastScan; `rerank_bits` = full-dim re-rank (0 → same as scan).
 class LandmarkIndex {
  public:
-  LandmarkIndex(std::size_t dim, std::size_t bit_width, std::size_t n_landmarks = kDefaultLandmarks,
-                std::size_t shortlist = kDefaultShortlist, std::uint64_t landmark_seed = 0);
+  LandmarkIndex(std::size_t dim, std::size_t scan_bits, std::size_t n_landmarks = kDefaultLandmarks,
+                std::size_t shortlist = kDefaultShortlist, std::uint64_t landmark_seed = 0,
+                std::size_t rerank_bits = 0);
 
   std::size_t dim() const { return dim_; }
-  std::size_t bit_width() const { return bits_; }
+  /// Landmark FastScan bit width (alias of scan_bits).
+  std::size_t bit_width() const { return scan_bits_; }
+  std::size_t scan_bits() const { return scan_bits_; }
+  std::size_t rerank_bits() const { return rerank_bits_; }
   std::size_t n_landmarks() const { return n_landmarks_; }
   std::size_t scan_dim() const { return scan_dim_; }
   std::size_t shortlist() const { return shortlist_; }
@@ -36,15 +41,16 @@ class LandmarkIndex {
   void encode_row(const float* src, float* unit_out, float* landmark_row_out);
 
   std::size_t dim_;
-  std::size_t bits_;
+  std::size_t scan_bits_;    // landmark FastScan quant
+  std::size_t rerank_bits_;  // full-dim re-rank quant (+ ŷ for landmark project)
   std::size_t n_landmarks_;
   std::size_t scan_dim_;  // n_landmarks padded to multiple of 8 for FastScan
   std::size_t shortlist_;
   std::uint64_t landmark_seed_;
   Rotation rotation_;
-  std::vector<float> boundaries_;       // full-dim FWHT quant
-  std::vector<float> centroids_;        // full-dim FWHT quant
-  std::vector<float> lm_boundaries_;    // landmark-space FastScan quant
+  std::vector<float> boundaries_;       // full-dim FWHT quant (rerank_bits)
+  std::vector<float> centroids_;        // full-dim FWHT quant (rerank_bits)
+  std::vector<float> lm_boundaries_;    // landmark-space FastScan quant (scan_bits)
   std::vector<float> lm_centroids_;
   std::vector<float> landmark_basis_;  // dim * m, column-major
   std::vector<float> db_unit_;         // n * dim (scratch until prepare)

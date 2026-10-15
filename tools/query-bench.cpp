@@ -317,6 +317,7 @@ int main(int argc, char** argv) {
   std::size_t limit = 100000;
   std::size_t query_limit = 1000;
   std::size_t bits = 4;
+  std::size_t rerank_bits = 0;  // 0 → same as --bits
   std::size_t k = 10;
   std::size_t landmarks = vectorcache::kDefaultLandmarks;
   std::size_t shortlist = vectorcache::kDefaultShortlist;
@@ -331,10 +332,14 @@ int main(int argc, char** argv) {
                  "Query split: test (GloVe/SIFT1M) or holdout (OpenAI/NPY); default by dataset");
   app.add_option("--limit", limit, "Max index vectors (0 = all)");
   app.add_option("--query-limit", query_limit, "Max queries (0 = all)");
-  app.add_option("--bits", bits, "Bits per dim for pre-landmark quant (2-4)")->check(CLI::Range(2, 4));
-  app.add_option("--k", k, "Final top-k after exact re-rank");
+  app.add_option("--bits,--scan-bits", bits, "Bits for landmark FastScan (2-4)")
+      ->check(CLI::Range(2, 4));
+  app.add_option("--rerank-bits", rerank_bits,
+                 "Bits for full-dim quantized re-rank (2-4; default = --bits)")
+      ->check(CLI::Range(0, 4));
+  app.add_option("--k", k, "Final top-k after quantized re-rank");
   app.add_option("--landmarks", landmarks, "Orthonormal landmark dims for shortlist scan");
-  app.add_option("--shortlist", shortlist, "Landmark-space shortlist size before exact re-rank");
+  app.add_option("--shortlist", shortlist, "Landmark-space shortlist size before quantized re-rank");
   app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
@@ -412,16 +417,22 @@ int main(int argc, char** argv) {
     if (shortlist == 0) {
       throw std::runtime_error("--shortlist must be > 0");
     }
+    if (rerank_bits != 0 && (rerank_bits < 2 || rerank_bits > 4)) {
+      throw std::runtime_error("--rerank-bits must be 0 (default) or 2-4");
+    }
+    const std::size_t effective_rerank_bits = rerank_bits == 0 ? bits : rerank_bits;
 
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
-              << " bits=" << bits << " landmarks=" << landmarks << " shortlist=" << shortlist
-              << " k=" << k << " search_backend=avx2_perm0+rerank (landmark FastScan)\n";
+              << " scan_bits=" << bits << " rerank_bits=" << effective_rerank_bits
+              << " landmarks=" << landmarks << " shortlist=" << shortlist << " k=" << k
+              << " search_backend=avx2_perm0+rerank (landmark FastScan)\n";
     std::cout << vectorcache::search_backend_diagnostics(bits, landmarks);
 
     vectorcache::SearchResults last;
     std::vector<double> run_ms;
 
-    vectorcache::LandmarkIndex index(db.cols, bits, landmarks, shortlist);
+    vectorcache::LandmarkIndex index(db.cols, bits, landmarks, shortlist, /*landmark_seed=*/0,
+                                    effective_rerank_bits);
     const auto t0 = std::chrono::steady_clock::now();
     index.add(db.data);
     index.prepare();

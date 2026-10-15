@@ -15,6 +15,7 @@ NPY           ?=
 SPLIT         ?=
 LIMIT         ?= 1000000
 BITS          ?= 4
+RERANK_BITS   ?=
 LANDMARKS     ?= 96
 SHORTLIST     ?= 1024
 QUERY_SPLIT   ?=
@@ -56,6 +57,7 @@ BENCH_COMMON_ARGS = \
 	$(call opt_arg,SPLIT,split) \
 	$(call opt_arg,LIMIT,limit) \
 	$(call opt_arg,BITS,bits) \
+	$(call opt_arg,RERANK_BITS,rerank-bits) \
 	$(call opt_arg,LANDMARKS,landmarks) \
 	$(call opt_arg,SHORTLIST,shortlist) \
 	$(BENCH_EXTRA_ARGS)
@@ -86,10 +88,11 @@ help:
 	@echo "Bench variables (map to query-bench CLI):"
 	@echo "  DATASET / NPY   --dataset or --npy (default DATASET=$(DATASET))"
 	@echo "  LIMIT           --limit (default $(LIMIT))"
-	@echo "  BITS            --bits (default $(BITS); 2-4)"
+	@echo "  BITS            --bits / --scan-bits landmark FastScan (default $(BITS); 2-4)"
+	@echo "  RERANK_BITS     --rerank-bits full-dim re-rank (default = BITS; 2-4)"
 	@echo "  LANDMARKS       --landmarks (default $(LANDMARKS))"
 	@echo "  SHORTLIST       --shortlist (default $(SHORTLIST))"
-	@echo "  K               --k final top-k after exact re-rank (default $(K))"
+	@echo "  K               --k final top-k after quantized re-rank (default $(K))"
 	@echo "  QUERY_LIMIT     --query-limit"
 	@echo "  QUERY_SPLIT     --query-split (test for glove/sift1m; holdout for openai)"
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
@@ -101,6 +104,7 @@ help:
 	@echo "Example: make compute DATASET=openai-1536 BITS=2 K=64"
 	@echo "Example: make compute DATASET=sift1m LIMIT=0 QUERY_LIMIT=10000"
 	@echo "Example: make compute LANDMARKS=64 SHORTLIST=8192 K=64 RECALL=1"
+	@echo "Example: make compute BITS=2 RERANK_BITS=4 LANDMARKS=96 SHORTLIST=1024"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 
 login: $(LOGIN_READY)

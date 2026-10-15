@@ -49,10 +49,12 @@ std::size_t pad_scan_dim(std::size_t m) { return (m + 7u) & ~std::size_t{7u}; }
 
 }  // namespace
 
-LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t bit_width, std::size_t n_landmarks,
-                             std::size_t shortlist, std::uint64_t landmark_seed)
+LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t scan_bits, std::size_t n_landmarks,
+                             std::size_t shortlist, std::uint64_t landmark_seed,
+                             std::size_t rerank_bits)
     : dim_(dim),
-      bits_(bit_width),
+      scan_bits_(scan_bits),
+      rerank_bits_(rerank_bits == 0 ? scan_bits : rerank_bits),
       n_landmarks_(n_landmarks),
       scan_dim_(pad_scan_dim(n_landmarks)),
       shortlist_(shortlist),
@@ -61,8 +63,11 @@ LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t bit_width, std::size_t
   if (dim == 0 || dim % 8 != 0 || dim > kMaxDim) {
     throw std::invalid_argument("dim must be a multiple of 8 in [8, MAX_DIM]");
   }
-  if (bit_width < 2 || bit_width > 4) {
-    throw std::invalid_argument("bit_width must be 2, 3, or 4");
+  if (scan_bits_ < 2 || scan_bits_ > 4) {
+    throw std::invalid_argument("scan_bits must be 2, 3, or 4");
+  }
+  if (rerank_bits_ < 2 || rerank_bits_ > 4) {
+    throw std::invalid_argument("rerank_bits must be 2, 3, or 4");
   }
   if (n_landmarks == 0 || n_landmarks > dim) {
     throw std::invalid_argument("n_landmarks must be in 1..dim");
@@ -70,10 +75,10 @@ LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t bit_width, std::size_t
   if (shortlist == 0) {
     throw std::invalid_argument("shortlist must be > 0");
   }
-  auto cb = codebook(bits_, dim_);
+  auto cb = codebook(rerank_bits_, dim_);
   boundaries_ = std::move(cb.first);
   centroids_ = std::move(cb.second);
-  auto lm_cb = codebook(bits_, scan_dim_);
+  auto lm_cb = codebook(scan_bits_, scan_dim_);
   lm_boundaries_ = std::move(lm_cb.first);
   lm_centroids_ = std::move(lm_cb.second);
   landmark_basis_ = make_ortho_landmarks(dim_, n_landmarks_, landmark_seed_);
@@ -135,9 +140,9 @@ void LandmarkIndex::prepare() {
     std::vector<float> rotated_scratch;
     std::vector<std::uint8_t> packed;
     rerank_scales_.clear();
-    encode(db_unit_, n_vectors_, dim_, rotation_, boundaries_, centroids_, bits_, nullptr,
+    encode(db_unit_, n_vectors_, dim_, rotation_, boundaries_, centroids_, rerank_bits_, nullptr,
            rotated_scratch, packed, rerank_scales_);
-    rerank_codes_ = codes_flat_from_packed(packed, n_vectors_, bits_, dim_);
+    rerank_codes_ = codes_flat_from_packed(packed, n_vectors_, rerank_bits_, dim_);
     db_unit_.clear();
     db_unit_.shrink_to_fit();
   }
@@ -153,10 +158,10 @@ void LandmarkIndex::prepare() {
 
   std::vector<std::uint8_t> packed;
   scales_.clear();
-  encode_prerotated(unit_lm, norms, n_vectors_, scan_dim_, lm_boundaries_, lm_centroids_, bits_,
-                    nullptr, packed, scales_);
+  encode_prerotated(unit_lm, norms, n_vectors_, scan_dim_, lm_boundaries_, lm_centroids_,
+                    scan_bits_, nullptr, packed, scales_);
   // Landmark search uses avx2_perm0 LUTs; keep pack layout matched.
-  auto repacked = repack_perm0(packed, n_vectors_, bits_, scan_dim_);
+  auto repacked = repack_perm0(packed, n_vectors_, scan_bits_, scan_dim_);
   blocked_codes_ = std::move(repacked.first);
   n_blocks_ = (n_vectors_ + kBlock - 1) / kBlock;
   landmark_rows_.clear();
@@ -175,8 +180,8 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
   const std::size_t sl = std::min(shortlist_, n_vectors_);
   const std::size_t kk = std::min(k, n_vectors_);
   return search_landmark_rerank(queries, nq, dim_, kk, sl, landmark_basis_, n_landmarks_, scan_dim_,
-                                lm_centroids_, bits_, blocked_codes_, n_blocks_, scales_,
-                                rerank_codes_, rerank_scales_, centroids_, rotation_);
+                                lm_centroids_, scan_bits_, blocked_codes_, n_blocks_, scales_,
+                                rerank_codes_, rerank_scales_, centroids_, rerank_bits_, rotation_);
 }
 
 }  // namespace vectorcache

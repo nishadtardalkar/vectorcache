@@ -54,15 +54,17 @@ PreparedQueries prepare_from_rows(std::span<const float> rows, std::size_t nq, s
                                   std::span<const float> centroids, std::size_t bits);
 
 /// FWHT → landmark project → FastScan shortlist → quantized full-dim re-rank.
+/// `scan_bits` for landmark FastScan; `rerank_bits` for full-dim code LUTs.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
                                      std::size_t k, std::size_t shortlist,
                                      std::span<const float> landmark_basis, std::size_t n_landmarks,
                                      std::size_t scan_dim, std::span<const float> lm_centroids,
-                                     std::size_t bits, std::span<const std::uint8_t> blocked_codes,
+                                     std::size_t scan_bits, std::span<const std::uint8_t> blocked_codes,
                                      std::size_t n_blocks, std::span<const float> lm_scales,
                                      std::span<const std::uint8_t> rerank_codes,
                                      std::span<const float> rerank_scales,
-                                     std::span<const float> centroids, const Rotation& rotation);
+                                     std::span<const float> centroids, std::size_t rerank_bits,
+                                     const Rotation& rotation);
 
 /// Copy prepared state for a single query index (for per-query IVF probing).
 PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
