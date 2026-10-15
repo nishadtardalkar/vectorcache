@@ -15,17 +15,12 @@ NPY           ?=
 SPLIT         ?=
 LIMIT         ?= 1000000
 BITS          ?= 4
+LANDMARKS     ?= 96
+SHORTLIST     ?= 1024
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
 K             ?= 64
-CALIBRATE     ?=
 RECALL        ?= 1
-BUCKETED      ?= 1
-N_PROBE       ?= 64
-COS_VAR_THRESHOLD ?= 0.02
-MIN_BUCKET_SIZE ?= 256
-MAX_BUCKET_SIZE ?= 800
-ENERGY_SOFT   ?= 400
 FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
@@ -61,6 +56,8 @@ BENCH_COMMON_ARGS = \
 	$(call opt_arg,SPLIT,split) \
 	$(call opt_arg,LIMIT,limit) \
 	$(call opt_arg,BITS,bits) \
+	$(call opt_arg,LANDMARKS,landmarks) \
+	$(call opt_arg,SHORTLIST,shortlist) \
 	$(BENCH_EXTRA_ARGS)
 
 QUERY_BENCH_ARGS = \
@@ -68,14 +65,7 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_SPLIT,query-split) \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
-	$(call flag_arg,CALIBRATE,calibrate) \
-	$(call flag_arg,RECALL,recall) \
-	$(call flag_arg,BUCKETED,bucketed) \
-	$(call opt_arg,N_PROBE,n-probe) \
-	$(call opt_arg,COS_VAR_THRESHOLD,cos-var-threshold) \
-	$(call opt_arg,MIN_BUCKET_SIZE,min-bucket-size) \
-	$(call opt_arg,MAX_BUCKET_SIZE,max-bucket-size) \
-	$(call opt_arg,ENERGY_SOFT,energy-soft)
+	$(call flag_arg,RECALL,recall)
 
 .PHONY: help login compute clean
 
@@ -97,16 +87,12 @@ help:
 	@echo "  DATASET / NPY   --dataset or --npy (default DATASET=$(DATASET))"
 	@echo "  LIMIT           --limit (default $(LIMIT))"
 	@echo "  BITS            --bits (default $(BITS); 2-4)"
-	@echo "  K               --k (default $(K))"
+	@echo "  LANDMARKS       --landmarks (default $(LANDMARKS))"
+	@echo "  SHORTLIST       --shortlist (default $(SHORTLIST))"
+	@echo "  K               --k final top-k after exact re-rank (default $(K))"
 	@echo "  QUERY_LIMIT     --query-limit"
 	@echo "  QUERY_SPLIT     --query-split (test for glove/sift1m; holdout for openai)"
-	@echo "  CALIBRATE=1     --calibrate (TQ+)"
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
-	@echo "  BUCKETED=1      --bucketed (online dense soft/2-means/absorb IVF; product fat champ)"
-	@echo "  N_PROBE         --n-probe (bucketed IVF opens; default 64)"
-	@echo "  MAX_BUCKET_SIZE --max-bucket-size / hard fission_cap (bucketed; default 800)"
-	@echo "  ENERGY_SOFT     --energy-soft (bucketed; default 400)"
-	@echo "  COS_VAR_THRESHOLD / MIN_BUCKET_SIZE  deprecated no-ops (CLI compat)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
@@ -114,8 +100,7 @@ help:
 	@echo "Example: make compute"
 	@echo "Example: make compute DATASET=openai-1536 BITS=2 K=64"
 	@echo "Example: make compute DATASET=sift1m LIMIT=0 QUERY_LIMIT=10000"
-	@echo "Example: make compute BITS=4 RECALL=1 CALIBRATE=1"
-	@echo "Example: make compute BUCKETED=1 N_PROBE=64"
+	@echo "Example: make compute LANDMARKS=64 SHORTLIST=8192 K=64 RECALL=1"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 
 login: $(LOGIN_READY)
