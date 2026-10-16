@@ -314,13 +314,15 @@ int main(int argc, char** argv) {
   std::string data_dir = "data";
   std::string split = "train";
   std::string query_split;  // default: test for glove/sift1m, holdout for OpenAI / --npy
-  std::size_t limit = 100000;
+  std::size_t limit = 0;  // 0 = all
   std::size_t query_limit = 1000;
   std::size_t bits = 4;
   std::size_t rerank_bits = 0;  // 0 → same as --bits
   std::size_t k = 10;
   std::size_t landmarks = vectorcache::kDefaultLandmarks;
   std::size_t shortlist = vectorcache::kDefaultShortlist;
+  float score_threshold = std::numeric_limits<float>::quiet_NaN();
+  std::size_t tune_mean_shortlist = 0;  // 0 = off; else binary-search threshold for this mean |S|
   bool recall = false;
   std::size_t timing_runs = 5;
 
@@ -339,7 +341,12 @@ int main(int argc, char** argv) {
       ->check(CLI::Range(0, 4));
   app.add_option("--k", k, "Final top-k after quantized re-rank");
   app.add_option("--landmarks", landmarks, "Orthonormal landmark dims for shortlist scan");
-  app.add_option("--shortlist", shortlist, "Landmark-space shortlist size before quantized re-rank");
+  app.add_option("--shortlist", shortlist,
+                 "Mean shortlist target (fixed buffer = 2×shortlist); requires --score-threshold");
+  app.add_option("--score-threshold", score_threshold,
+                 "Keep landmark scores >= T into a fixed 2×shortlist buffer; stop when full");
+  app.add_option("--tune-mean-shortlist", tune_mean_shortlist,
+                 "Binary-search --score-threshold for this mean shortlist size (ingest once)");
   app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
@@ -414,8 +421,14 @@ int main(int argc, char** argv) {
     if (landmarks == 0 || landmarks > db.cols) {
       throw std::runtime_error("--landmarks must be in 1..dim");
     }
-    if (shortlist == 0) {
-      throw std::runtime_error("--shortlist must be > 0");
+    if (tune_mean_shortlist > 0) {
+      score_threshold = std::numeric_limits<float>::quiet_NaN();  // set after tune
+    }
+    if (tune_mean_shortlist == 0 && !std::isfinite(score_threshold)) {
+      throw std::runtime_error("require --score-threshold or --tune-mean-shortlist (no heap shortlist)");
+    }
+    if (std::isfinite(score_threshold) && shortlist == 0 && tune_mean_shortlist == 0) {
+      throw std::runtime_error("--shortlist must be > 0 (mean target; cap=2×)");
     }
     if (rerank_bits != 0 && (rerank_bits < 2 || rerank_bits > 4)) {
       throw std::runtime_error("--rerank-bits must be 0 (default) or 2-4");
@@ -425,14 +438,21 @@ int main(int argc, char** argv) {
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
               << " scan_bits=" << bits << " rerank_bits=" << effective_rerank_bits
               << " landmarks=" << landmarks << " shortlist=" << shortlist << " k=" << k
-              << " search_backend=avx2_perm0+rerank (landmark FastScan)\n";
+              << " search_backend=" << vectorcache::search_backend_name(bits, landmarks)
+              << "+rerank\n";
     std::cout << vectorcache::search_backend_diagnostics(bits, landmarks);
 
     vectorcache::SearchResults last;
     std::vector<double> run_ms;
+    std::vector<vectorcache::LandmarkStageTimings> run_stages;
 
-    vectorcache::LandmarkIndex index(db.cols, bits, landmarks, shortlist, /*landmark_seed=*/0,
+    // During threshold tune, keep shortlist uncapped (0).
+    const std::size_t index_shortlist = tune_mean_shortlist > 0 ? 0 : shortlist;
+    vectorcache::LandmarkIndex index(db.cols, bits, landmarks, index_shortlist, /*landmark_seed=*/0,
                                     effective_rerank_bits);
+    if (std::isfinite(score_threshold)) {
+      index.set_score_threshold(score_threshold);
+    }
     const auto t0 = std::chrono::steady_clock::now();
     index.add(db.data);
     index.prepare();
@@ -440,21 +460,146 @@ int main(int argc, char** argv) {
     std::cout << "ingest_ms=" << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n"
               << std::flush;
 
+    if (tune_mean_shortlist > 0) {
+      auto mean_sl_at = [&](float thr) {
+        index.set_score_threshold(thr);
+        index.set_shortlist(0);
+        vectorcache::LandmarkStageTimings stages;
+        (void)index.search(queries.data, k, &stages, /*shortlist_only=*/true);
+        return stages.mean_shortlist;
+      };
+
+      // Bracket: higher threshold ⇒ fewer survivors. Start near typical landmark IP scale.
+      float lo = 0.f;
+      float hi = 0.2f;
+      double mean_lo = mean_sl_at(lo);
+      double mean_hi = mean_sl_at(hi);
+      std::cout << "tune bracket: T=" << lo << " mean_shortlist=" << mean_lo << " | T=" << hi
+                << " mean_shortlist=" << mean_hi << " target=" << tune_mean_shortlist << "\n"
+                << std::flush;
+      if (mean_lo < static_cast<double>(tune_mean_shortlist)) {
+        // Expand downward (more survivors).
+        for (int expand = 0; expand < 20 && mean_lo < static_cast<double>(tune_mean_shortlist);
+             ++expand) {
+          hi = lo;
+          mean_hi = mean_lo;
+          lo = (lo == 0.f) ? -0.05f : (lo < 0.f ? lo * 2.f : -0.05f);
+          mean_lo = mean_sl_at(lo);
+          std::cout << "tune expand-lo: T=" << lo << " mean_shortlist=" << mean_lo << "\n"
+                    << std::flush;
+        }
+        if (mean_lo < static_cast<double>(tune_mean_shortlist)) {
+          throw std::runtime_error("tune-mean-shortlist: could not find lower bracket");
+        }
+      }
+      if (mean_hi > static_cast<double>(tune_mean_shortlist)) {
+        // Expand upward until below target.
+        for (int expand = 0; expand < 20 && mean_hi > static_cast<double>(tune_mean_shortlist);
+             ++expand) {
+          lo = hi;
+          mean_lo = mean_hi;
+          hi = hi <= 0.f ? 0.1f : hi * 2.f;
+          mean_hi = mean_sl_at(hi);
+          std::cout << "tune expand-hi: T=" << hi << " mean_shortlist=" << mean_hi << "\n"
+                    << std::flush;
+        }
+        if (mean_hi > static_cast<double>(tune_mean_shortlist)) {
+          throw std::runtime_error("tune-mean-shortlist: could not find upper bracket");
+        }
+      }
+
+      const double target = static_cast<double>(tune_mean_shortlist);
+      float best_t = lo;
+      double best_mean = mean_lo;
+      double best_err = std::abs(best_mean - target);
+      for (int iter = 0; iter < 24; ++iter) {
+        const float mid = 0.5f * (lo + hi);
+        const double mean_mid = mean_sl_at(mid);
+        const double err = std::abs(mean_mid - target);
+        std::cout << "tune iter " << iter << ": T=" << mid << " mean_shortlist=" << mean_mid
+                  << "\n"
+                  << std::flush;
+        if (err < best_err) {
+          best_err = err;
+          best_t = mid;
+          best_mean = mean_mid;
+        }
+        // Too many survivors → raise threshold.
+        if (mean_mid > target) {
+          lo = mid;
+          mean_lo = mean_mid;
+        } else {
+          hi = mid;
+          mean_hi = mean_mid;
+        }
+        if (err / target < 0.01 || (hi - lo) < 1e-5f) {
+          break;
+        }
+      }
+      score_threshold = best_t;
+      shortlist = tune_mean_shortlist;  // mean target; search uses fixed buffer = 2×shortlist
+      index.set_score_threshold(score_threshold);
+      index.set_shortlist(shortlist);
+      std::cout << "tuned score_threshold=" << score_threshold << " mean_shortlist=" << best_mean
+                << " (target=" << tune_mean_shortlist << ", buffer_cap=" << (2 * shortlist)
+                << ")\n"
+                << std::flush;
+    }
+
     if (!recall) {
       db = Matrix{};
     }
 
     for (std::size_t r = 0; r < timing_runs; ++r) {
+      vectorcache::LandmarkStageTimings stages;
       const auto a = std::chrono::steady_clock::now();
-      last = index.search(queries.data, k);
+      last = index.search(queries.data, k, &stages);
       const auto b = std::chrono::steady_clock::now();
       run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
+      run_stages.push_back(stages);
     }
 
     std::sort(run_ms.begin(), run_ms.end());
     const double median_ms = run_ms[run_ms.size() / 2];
-    const double ms_per_query = median_ms / static_cast<double>(queries.rows);
+    const double nq = static_cast<double>(queries.rows);
+    const double ms_per_query = median_ms / nq;
     std::cout << "search_median_ms=" << median_ms << " ms_per_query=" << ms_per_query << "\n";
+
+    auto median_of = [&](auto getter) {
+      std::vector<double> vals;
+      vals.reserve(run_stages.size());
+      for (const auto& s : run_stages) vals.push_back(getter(s));
+      std::sort(vals.begin(), vals.end());
+      return vals[vals.size() / 2] / nq;
+    };
+    const double project_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.project_ms; });
+    const double sl_prep_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_prep_ms; });
+    const double sl_scan_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_scan_ms; });
+    const double rr_prep_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_prep_ms; });
+    const double rr_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_ms; });
+    auto median_raw = [&](auto getter) {
+      std::vector<double> vals;
+      vals.reserve(run_stages.size());
+      for (const auto& s : run_stages) vals.push_back(getter(s));
+      std::sort(vals.begin(), vals.end());
+      return vals[vals.size() / 2];
+    };
+    const double mean_sl =
+        median_raw([](const vectorcache::LandmarkStageTimings& s) { return s.mean_shortlist; });
+    const double max_sl =
+        median_raw([](const vectorcache::LandmarkStageTimings& s) { return s.max_shortlist; });
+    std::cout << "stage_ms_per_query:"
+              << " project=" << project_q << " shortlist_prep=" << sl_prep_q
+              << " shortlist_scan=" << sl_scan_q << " rerank_prep=" << rr_prep_q
+              << " rerank=" << rr_q
+              << " (shortlist_total=" << (sl_prep_q + sl_scan_q)
+              << " stage1=" << (project_q + sl_prep_q + sl_scan_q) << ")"
+              << " mean_shortlist=" << mean_sl << " max_shortlist=" << max_sl << "\n";
 
     if (recall) {
       ExactTopkCacheKey cache_key;

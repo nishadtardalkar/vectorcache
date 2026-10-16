@@ -236,4 +236,280 @@ void score_queries_avx2_perm0(const QueryLutView* luts, std::size_t nq,
 #endif
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+void score_query_avx2_perm0_threshold_fill_impl(QueryLutView lut,
+                                                std::span<const std::uint8_t> blocked_codes,
+                                                std::span<const float> vec_scales,
+                                                std::size_t n_byte_groups, std::size_t n_vectors,
+                                                std::size_t n_blocks, float threshold,
+                                                std::size_t capacity, float* out_scores,
+                                                std::uint64_t* out_ids, std::size_t* out_count,
+                                                float bias_corr, const std::uint64_t* id_map,
+                                                float score_offset) {
+  const bool count_only = out_scores == nullptr;
+  if (!count_only && (capacity == 0 || *out_count >= capacity)) {
+    return;
+  }
+  const __m256i nibble_mask = _mm256_set1_epi8(static_cast<char>(0x0F));
+  const std::uint8_t* codes_base = blocked_codes.data();
+  const __m256 v_scale = _mm256_set1_ps(lut.scale);
+  const float bias = lut.bias + bias_corr;
+
+  for (std::size_t b = 0; b < n_blocks; ++b) {
+    if (!count_only && *out_count >= capacity) {
+      break;
+    }
+    const std::size_t base_vec = b * kBlock;
+    const std::size_t end = std::min(base_vec + kBlock, n_vectors);
+
+    __m256 fa[4] = {_mm256_set1_ps(bias), _mm256_set1_ps(bias), _mm256_set1_ps(bias),
+                    _mm256_set1_ps(bias)};
+
+    const std::size_t n_batches = (n_byte_groups + kFlushEvery - 1) / kFlushEvery;
+    for (std::size_t batch = 0; batch < n_batches; ++batch) {
+      const std::size_t g_start = batch * kFlushEvery;
+      const std::size_t g_end = std::min(g_start + kFlushEvery, n_byte_groups);
+      __m256i accus[4] = {_mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256(),
+                          _mm256_setzero_si256()};
+
+      for (std::size_t g = g_start; g < g_end; ++g) {
+        const std::uint8_t* cp = codes_base + (b * n_byte_groups + g) * kBlock;
+        const __m256i codes_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cp));
+        const __m256i clo = _mm256_and_si256(codes_v, nibble_mask);
+        const __m256i chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), nibble_mask);
+        const __m256i lut_v =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(lut.uint8_luts + g * 32));
+        const __m256i res0 = _mm256_shuffle_epi8(lut_v, clo);
+        const __m256i res1 = _mm256_shuffle_epi8(lut_v, chi);
+        accus[0] = _mm256_add_epi16(accus[0], res0);
+        accus[1] = _mm256_add_epi16(accus[1], _mm256_srli_epi16(res0, 8));
+        accus[2] = _mm256_add_epi16(accus[2], res1);
+        accus[3] = _mm256_add_epi16(accus[3], _mm256_srli_epi16(res1, 8));
+      }
+      flush_batch_to_fa(accus, v_scale, fa);
+    }
+
+    alignas(32) float block_out[kBlock];
+    if (end - base_vec == kBlock) {
+      _mm256_storeu_ps(block_out,
+                       _mm256_mul_ps(fa[0], _mm256_loadu_ps(vec_scales.data() + base_vec)));
+      _mm256_storeu_ps(block_out + 8,
+                       _mm256_mul_ps(fa[1], _mm256_loadu_ps(vec_scales.data() + base_vec + 8)));
+      _mm256_storeu_ps(block_out + 16,
+                       _mm256_mul_ps(fa[2], _mm256_loadu_ps(vec_scales.data() + base_vec + 16)));
+      _mm256_storeu_ps(block_out + 24,
+                       _mm256_mul_ps(fa[3], _mm256_loadu_ps(vec_scales.data() + base_vec + 24)));
+    } else {
+      _mm256_storeu_ps(block_out, fa[0]);
+      _mm256_storeu_ps(block_out + 8, fa[1]);
+      _mm256_storeu_ps(block_out + 16, fa[2]);
+      _mm256_storeu_ps(block_out + 24, fa[3]);
+      for (std::size_t lane = 0; lane < end - base_vec; ++lane) {
+        block_out[lane] *= vec_scales[base_vec + lane];
+      }
+    }
+
+    for (std::size_t lane = 0; lane < end - base_vec; ++lane) {
+      if (!count_only && *out_count >= capacity) {
+        break;
+      }
+      const float score = block_out[lane] + score_offset;
+      if (score >= threshold) {
+        if (!count_only) {
+          out_scores[*out_count] = score;
+          out_ids[*out_count] = topk_map_id(id_map, base_vec + lane);
+        }
+        ++(*out_count);
+      }
+    }
+  }
+}
+#endif
+
+void score_query_avx2_perm0_threshold_fill(QueryLutView lut,
+                                           std::span<const std::uint8_t> blocked_codes,
+                                           std::span<const float> vec_scales,
+                                           std::size_t n_byte_groups, std::size_t n_vectors,
+                                           std::size_t n_blocks, float threshold,
+                                           std::size_t capacity, float* out_scores,
+                                           std::uint64_t* out_ids, std::size_t* out_count,
+                                           float bias_corr, const std::uint64_t* id_map,
+                                           float score_offset) {
+#if defined(__x86_64__) || defined(_M_X64)
+  score_query_avx2_perm0_threshold_fill_impl(lut, blocked_codes, vec_scales, n_byte_groups,
+                                             n_vectors, n_blocks, threshold, capacity, out_scores,
+                                             out_ids, out_count, bias_corr, id_map, score_offset);
+#else
+  (void)lut;
+  (void)blocked_codes;
+  (void)vec_scales;
+  (void)n_byte_groups;
+  (void)n_vectors;
+  (void)n_blocks;
+  (void)threshold;
+  (void)capacity;
+  (void)out_scores;
+  (void)out_ids;
+  (void)out_count;
+  (void)bias_corr;
+  (void)id_map;
+  (void)score_offset;
+  throw std::logic_error("score_query_avx2_perm0_threshold_fill requires x86_64");
+#endif
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+void score_queries_avx2_perm0_threshold_fill_impl(
+    const QueryLutView* luts, std::size_t nq, std::span<const std::uint8_t> blocked_codes,
+    std::span<const float> vec_scales, std::size_t n_byte_groups, std::size_t n_vectors,
+    std::size_t n_blocks, float threshold, std::size_t capacity, float* const* out_scores,
+    std::uint64_t* const* out_ids, std::size_t* out_counts, const float* bias_corrs,
+    const std::uint64_t* id_map, const float* score_offsets) {
+  const __m256i nibble_mask = _mm256_set1_epi8(static_cast<char>(0x0F));
+  const std::uint8_t* codes_base = blocked_codes.data();
+
+  __m256 v_scale[kAvx2NqBatch];
+  float bias[kAvx2NqBatch];
+  float score_off[kAvx2NqBatch];
+  for (std::size_t qi = 0; qi < nq; ++qi) {
+    v_scale[qi] = _mm256_set1_ps(luts[qi].scale);
+    const float bc = bias_corrs ? bias_corrs[qi] : 0.f;
+    bias[qi] = luts[qi].bias + bc;
+    score_off[qi] = score_offsets ? score_offsets[qi] : 0.f;
+  }
+
+  auto all_full = [&]() {
+    for (std::size_t qi = 0; qi < nq; ++qi) {
+      if (out_counts[qi] < capacity) return false;
+    }
+    return true;
+  };
+
+  for (std::size_t b = 0; b < n_blocks; ++b) {
+    if (all_full()) break;
+    const std::size_t base_vec = b * kBlock;
+    const std::size_t end = std::min(base_vec + kBlock, n_vectors);
+
+    __m256 fa[kAvx2NqBatch][4];
+    for (std::size_t qi = 0; qi < nq; ++qi) {
+      fa[qi][0] = _mm256_set1_ps(bias[qi]);
+      fa[qi][1] = _mm256_set1_ps(bias[qi]);
+      fa[qi][2] = _mm256_set1_ps(bias[qi]);
+      fa[qi][3] = _mm256_set1_ps(bias[qi]);
+    }
+
+    const std::size_t n_batches = (n_byte_groups + kFlushEvery - 1) / kFlushEvery;
+    for (std::size_t batch = 0; batch < n_batches; ++batch) {
+      const std::size_t g_start = batch * kFlushEvery;
+      const std::size_t g_end = std::min(g_start + kFlushEvery, n_byte_groups);
+      __m256i accus[kAvx2NqBatch][4];
+      for (std::size_t qi = 0; qi < nq; ++qi) {
+        accus[qi][0] = _mm256_setzero_si256();
+        accus[qi][1] = _mm256_setzero_si256();
+        accus[qi][2] = _mm256_setzero_si256();
+        accus[qi][3] = _mm256_setzero_si256();
+      }
+
+      for (std::size_t g = g_start; g < g_end; ++g) {
+        // Codes loaded once; shared across the query batch (turbovec-style).
+        const std::uint8_t* cp = codes_base + (b * n_byte_groups + g) * kBlock;
+        const __m256i codes_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cp));
+        const __m256i clo = _mm256_and_si256(codes_v, nibble_mask);
+        const __m256i chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), nibble_mask);
+
+        for (std::size_t qi = 0; qi < nq; ++qi) {
+          if (out_counts[qi] >= capacity) continue;
+          const __m256i lut_v =
+              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(luts[qi].uint8_luts + g * 32));
+          const __m256i res0 = _mm256_shuffle_epi8(lut_v, clo);
+          const __m256i res1 = _mm256_shuffle_epi8(lut_v, chi);
+          accus[qi][0] = _mm256_add_epi16(accus[qi][0], res0);
+          accus[qi][1] = _mm256_add_epi16(accus[qi][1], _mm256_srli_epi16(res0, 8));
+          accus[qi][2] = _mm256_add_epi16(accus[qi][2], res1);
+          accus[qi][3] = _mm256_add_epi16(accus[qi][3], _mm256_srli_epi16(res1, 8));
+        }
+      }
+      for (std::size_t qi = 0; qi < nq; ++qi) {
+        if (out_counts[qi] >= capacity) continue;
+        flush_batch_to_fa(accus[qi], v_scale[qi], fa[qi]);
+      }
+    }
+
+    for (std::size_t qi = 0; qi < nq; ++qi) {
+      if (out_counts[qi] >= capacity) continue;
+      alignas(32) float block_out[kBlock];
+      if (end - base_vec == kBlock) {
+        _mm256_storeu_ps(block_out,
+                         _mm256_mul_ps(fa[qi][0], _mm256_loadu_ps(vec_scales.data() + base_vec)));
+        _mm256_storeu_ps(
+            block_out + 8,
+            _mm256_mul_ps(fa[qi][1], _mm256_loadu_ps(vec_scales.data() + base_vec + 8)));
+        _mm256_storeu_ps(
+            block_out + 16,
+            _mm256_mul_ps(fa[qi][2], _mm256_loadu_ps(vec_scales.data() + base_vec + 16)));
+        _mm256_storeu_ps(
+            block_out + 24,
+            _mm256_mul_ps(fa[qi][3], _mm256_loadu_ps(vec_scales.data() + base_vec + 24)));
+      } else {
+        _mm256_storeu_ps(block_out, fa[qi][0]);
+        _mm256_storeu_ps(block_out + 8, fa[qi][1]);
+        _mm256_storeu_ps(block_out + 16, fa[qi][2]);
+        _mm256_storeu_ps(block_out + 24, fa[qi][3]);
+        for (std::size_t lane = 0; lane < end - base_vec; ++lane) {
+          block_out[lane] *= vec_scales[base_vec + lane];
+        }
+      }
+
+      for (std::size_t lane = 0; lane < end - base_vec; ++lane) {
+        if (out_counts[qi] >= capacity) break;
+        const float score = block_out[lane] + score_off[qi];
+        if (score >= threshold) {
+          const std::size_t c = out_counts[qi];
+          out_scores[qi][c] = score;
+          out_ids[qi][c] = topk_map_id(id_map, base_vec + lane);
+          ++out_counts[qi];
+        }
+      }
+    }
+  }
+}
+#endif
+
+void score_queries_avx2_perm0_threshold_fill(const QueryLutView* luts, std::size_t nq,
+                                             std::span<const std::uint8_t> blocked_codes,
+                                             std::span<const float> vec_scales,
+                                             std::size_t n_byte_groups, std::size_t n_vectors,
+                                             std::size_t n_blocks, float threshold,
+                                             std::size_t capacity, float* const* out_scores,
+                                             std::uint64_t* const* out_ids, std::size_t* out_counts,
+                                             const float* bias_corrs, const std::uint64_t* id_map,
+                                             const float* score_offsets) {
+  if (nq == 0) return;
+  if (nq > kAvx2NqBatch) {
+    throw std::invalid_argument("score_queries_avx2_perm0_threshold_fill: nq > kAvx2NqBatch");
+  }
+#if defined(__x86_64__) || defined(_M_X64)
+  score_queries_avx2_perm0_threshold_fill_impl(luts, nq, blocked_codes, vec_scales, n_byte_groups,
+                                               n_vectors, n_blocks, threshold, capacity, out_scores,
+                                               out_ids, out_counts, bias_corrs, id_map,
+                                               score_offsets);
+#else
+  (void)luts;
+  (void)blocked_codes;
+  (void)vec_scales;
+  (void)n_byte_groups;
+  (void)n_vectors;
+  (void)n_blocks;
+  (void)threshold;
+  (void)capacity;
+  (void)out_scores;
+  (void)out_ids;
+  (void)out_counts;
+  (void)bias_corrs;
+  (void)id_map;
+  (void)score_offsets;
+  throw std::logic_error("score_queries_avx2_perm0_threshold_fill requires x86_64");
+#endif
+}
+
 }  // namespace vectorcache

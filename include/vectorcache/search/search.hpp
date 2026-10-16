@@ -2,20 +2,33 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <utility>
 #include <vector>
 
-#include "vectorcache/search/search_vnni.hpp"
 #include "vectorcache/transform/rotation.hpp"
 
 namespace vectorcache {
 
 struct SearchResults {
-  std::vector<float> scores;       // nq * k
+  std::vector<float> scores;       // nq * k (row-major; may be padded)
   std::vector<std::uint64_t> ids;  // nq * k
-  std::size_t k = 0;
+  std::size_t k = 0;               // stride / max candidates per query
   std::size_t nq = 0;
+  /// If non-empty, per-query candidate counts (≤ k). Empty ⇒ every query has exactly k hits.
+  std::vector<std::size_t> counts;
+};
+
+/// Wall-clock stage times for one `search_landmark_rerank` call (total batch, not per-query).
+struct LandmarkStageTimings {
+  double project_ms = 0;        // L2 + FWHT + landmark project
+  double shortlist_prep_ms = 0; // landmark LUT build
+  double shortlist_scan_ms = 0; // landmark FastScan shortlist
+  double rerank_prep_ms = 0;    // full-dim LUT build
+  double rerank_ms = 0;         // quantized re-rank of shortlist
+  double mean_shortlist = 0;    // mean candidates / query after shortlist stage
+  double max_shortlist = 0;     // max candidates on any query
 };
 
 struct PreparedQueryLut {
@@ -24,7 +37,7 @@ struct PreparedQueryLut {
   float bias = 0.f;
 };
 
-enum class SearchBackendKind { VmPermuteDot, VmVnni, Avx2, Scalar };
+enum class SearchBackendKind { Avx512bw, Avx2, Scalar };
 
 /// Query-side state shared across one or more blocked code ranges (buckets).
 struct PreparedQueries {
@@ -36,11 +49,6 @@ struct PreparedQueries {
 
   std::vector<float> q_rot;
   std::vector<float> bias_corrs;
-
-  std::vector<QueryPermuteDot> pds;
-  std::vector<std::vector<std::uint8_t>> split_luts;
-  std::vector<float> lut_scales;
-  std::vector<float> lut_biases;
   std::vector<PreparedQueryLut> luts;
 };
 
@@ -53,8 +61,10 @@ PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, 
 PreparedQueries prepare_from_rows(std::span<const float> rows, std::size_t nq, std::size_t dim,
                                   std::span<const float> centroids, std::size_t bits);
 
-/// FWHT → landmark project → FastScan shortlist → quantized full-dim re-rank.
-/// `scan_bits` for landmark FastScan; `rerank_bits` for full-dim code LUTs.
+/// FWHT → landmark project → FastScan threshold shortlist → quantized full-dim re-rank.
+/// Requires finite `score_threshold`. Keeps landmark scores ≥ threshold into a fixed buffer of
+/// size `2×shortlist` (stop when full; `shortlist` is the mean target; 0 = uncapped → n_vectors).
+/// If `timings` is non-null, fills per-stage wall times for this call.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
                                      std::size_t k, std::size_t shortlist,
                                      std::span<const float> landmark_basis, std::size_t n_landmarks,
@@ -64,7 +74,9 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const std::uint8_t> rerank_codes,
                                      std::span<const float> rerank_scales,
                                      std::span<const float> centroids, std::size_t rerank_bits,
-                                     const Rotation& rotation);
+                                     const Rotation& rotation, float score_threshold,
+                                     LandmarkStageTimings* timings = nullptr,
+                                     bool shortlist_only = false);
 
 /// Copy prepared state for a single query index (for per-query IVF probing).
 PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
@@ -73,11 +85,13 @@ PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
 /// If `id_map` is non-empty it must have `scales.size()` entries; local ids are remapped.
 /// If `query_indices` is non-empty, only those prepared queries are scored (output nq =
 /// query_indices.size()); otherwise all `prep.nq` queries are scored.
+/// Finite `score_threshold` ⇒ fixed-buffer collect (no top-k heap).
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                              std::span<const float> scales,
                              std::span<const std::uint64_t> id_map = {},
-                             std::span<const std::size_t> query_indices = {});
+                             std::span<const std::size_t> query_indices = {},
+                             float score_threshold = std::numeric_limits<float>::quiet_NaN());
 
 /// Continue scoring into existing per-query top-k heaps (length `prep.nq`, indexed by global qi).
 /// Only `query_indices` are updated. Heaps may already be partially filled.

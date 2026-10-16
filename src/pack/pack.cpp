@@ -20,7 +20,7 @@ namespace vectorcache {
 namespace {
 
 #if defined(__x86_64__) || defined(_M_X64)
-bool cpu_has_avx512_vnni_vbmi() {
+bool cpu_has_avx512bw() {
 #if defined(_MSC_VER)
   int info[4] = {};
   __cpuid(info, 0);
@@ -32,23 +32,20 @@ bool cpu_has_avx512_vnni_vbmi() {
     return false;  // OSXSAVE
   }
   const unsigned long long xcr0 = _xgetbv(0);
-  // XCR0 bits 1,2,5,6,7: XMM, YMM, opmask, ZMM_hi256, ZMM_hi16
   if ((xcr0 & 0xE6ull) != 0xE6ull) {
     return false;
   }
   __cpuidex(info, 7, 0);
   const bool avx512f = (info[1] & (1 << 16)) != 0;
   const bool avx512bw = (info[1] & (1 << 30)) != 0;
-  const bool avx512vbmi = (info[2] & (1 << 1)) != 0;
-  const bool avx512vnni = (info[2] & (1 << 11)) != 0;
-  return avx512f && avx512bw && avx512vbmi && avx512vnni;
+  return avx512f && avx512bw;
 #else
   unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
   if (__get_cpuid(1, &eax, &ebx, &ecx, &edx) == 0) {
     return false;
   }
   if ((ecx & (1u << 27)) == 0) {
-    return false;  // OSXSAVE
+    return false;
   }
   const unsigned long long xcr0 = _xgetbv(0);
   if ((xcr0 & 0xE6ull) != 0xE6ull) {
@@ -59,9 +56,23 @@ bool cpu_has_avx512_vnni_vbmi() {
   }
   const bool avx512f = (ebx & (1u << 16)) != 0;
   const bool avx512bw = (ebx & (1u << 30)) != 0;
-  const bool avx512vbmi = (ecx & (1u << 1)) != 0;
-  const bool avx512vnni = (ecx & (1u << 11)) != 0;
-  return avx512f && avx512bw && avx512vbmi && avx512vnni;
+  return avx512f && avx512bw;
+#endif
+}
+
+bool cpu_has_avx2() {
+#if defined(__GNUC__) || defined(__clang__)
+  return __builtin_cpu_supports("avx2");
+#elif defined(_MSC_VER)
+  int info[4] = {};
+  __cpuid(info, 0);
+  if (info[0] >= 7) {
+    __cpuidex(info, 7, 0);
+    return (info[1] & (1 << 5)) != 0;
+  }
+  return false;
+#else
+  return false;
 #endif
 }
 #endif
@@ -112,7 +123,6 @@ std::vector<std::uint8_t> extract_codes_flat(std::span<const std::uint8_t> packe
       for (std::size_t p = 0; p < bits; ++p) {
         acc |= lut[p][packed_codes[base + p * bytes_per_plane + c]];
       }
-      // Little-endian bytes (matches turbovec `to_le_bytes`).
       std::uint8_t le[4] = {
           static_cast<std::uint8_t>(acc & 0xff),
           static_cast<std::uint8_t>((acc >> 8) & 0xff),
@@ -166,7 +176,6 @@ std::vector<std::uint8_t> pack_blocked_perm0(std::size_t n, std::size_t n_blocks
   }
   return blocked;
 }
-#endif
 
 std::uint8_t deinterleave_x86_code_byte(std::span<const std::uint8_t> blocked, std::size_t group_off,
                                         std::size_t lane) {
@@ -183,6 +192,7 @@ std::uint8_t deinterleave_x86_code_byte(std::span<const std::uint8_t> blocked, s
   }
   return static_cast<std::uint8_t>((hi << 4) | lo);
 }
+#endif
 
 }  // namespace
 
@@ -193,11 +203,8 @@ BlockedGeometry blocked_geometry(std::size_t n_vectors, std::size_t bits, std::s
   return {n_blocks, n_byte_groups, n_blocks * n_byte_groups * kBlock};
 }
 
-bool use_vector_major() {
-  if (const char* v = std::getenv("TURBOVEC_NO_VECTOR_MAJOR"); v && v[0] != '0') {
-    return false;
-  }
-  if (const char* v = std::getenv("TURBOVEC_NO_VNNI"); v && v[0] != '0') {
+bool use_avx512bw() {
+  if (const char* v = std::getenv("TURBOVEC_NO_AVX512BW"); v && v[0] != '0') {
     return false;
   }
   static int cpu_ok = -1;
@@ -205,49 +212,21 @@ bool use_vector_major() {
     return cpu_ok != 0;
   }
 #if defined(__x86_64__) || defined(_M_X64)
-  // Prefer CPUID over __builtin_cpu_supports: GCC often reports false for
-  // AVX-512 VNNI/VBMI when the TU is compiled with only -mavx2.
-  cpu_ok = cpu_has_avx512_vnni_vbmi() ? 1 : 0;
+  cpu_ok = cpu_has_avx512bw() ? 1 : 0;
 #else
   cpu_ok = 0;
 #endif
   return cpu_ok != 0;
 }
 
-bool vector_major_for([[maybe_unused]] std::size_t bits, std::size_t n_byte_groups) {
-#if defined(__x86_64__) || defined(_M_X64)
-  const bool kernel_exists = true;
-#else
-  const bool kernel_exists = (bits == 4);
-#endif
-  return kernel_exists && use_vector_major() && (n_byte_groups % 4 == 0);
-}
-
-std::string search_backend_name(std::size_t bits, std::size_t dim) {
-  const std::size_t codes_per_byte = 8 / bits;
-  const std::size_t n_byte_groups = dim / codes_per_byte;
-  if (vector_major_for(bits, n_byte_groups)) {
-#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
-    return "avx512_vnni";
-#else
-    return (bits == 4) ? "avx512_permute_dot" : "avx512_vnni";
-#endif
+std::string search_backend_name(std::size_t /*bits*/, std::size_t /*dim*/) {
+  if (use_avx512bw()) {
+    return "avx512bw_perm0";
   }
 #if defined(__x86_64__) || defined(_M_X64)
-#if defined(__GNUC__) || defined(__clang__)
-  if (__builtin_cpu_supports("avx2")) {
+  if (cpu_has_avx2()) {
     return "avx2_perm0";
   }
-#elif defined(_MSC_VER)
-  int info[4] = {};
-  __cpuid(info, 0);
-  if (info[0] >= 7) {
-    __cpuidex(info, 7, 0);
-    if ((info[1] & (1 << 5)) != 0) {
-      return "avx2_perm0";
-    }
-  }
-#endif
 #endif
   return "scalar";
 }
@@ -256,20 +235,17 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
   std::ostringstream out;
   const std::size_t codes_per_byte = (bits == 0) ? 0 : (8 / bits);
   const std::size_t n_byte_groups = (codes_per_byte == 0) ? 0 : (dim / codes_per_byte);
-  const char* env_no_vm = std::getenv("TURBOVEC_NO_VECTOR_MAJOR");
-  const char* env_no_vnni = std::getenv("TURBOVEC_NO_VNNI");
+  const char* env_no = std::getenv("TURBOVEC_NO_AVX512BW");
 
   out << "=== search_backend_diagnostics ===\n";
   out << "bits=" << bits << " dim=" << dim << " codes_per_byte=" << codes_per_byte
-      << " n_byte_groups=" << n_byte_groups << " n_byte_groups%4=" << (n_byte_groups % 4) << "\n";
-  out << "TURBOVEC_NO_VECTOR_MAJOR=" << (env_no_vm ? env_no_vm : "(unset)") << "\n";
-  out << "TURBOVEC_NO_VNNI=" << (env_no_vnni ? env_no_vnni : "(unset)") << "\n";
-  out << "use_vector_major()=" << (use_vector_major() ? 1 : 0) << "\n";
-  out << "vector_major_for()=" << (vector_major_for(bits, n_byte_groups) ? 1 : 0) << "\n";
+      << " n_byte_groups=" << n_byte_groups << "\n";
+  out << "TURBOVEC_NO_AVX512BW=" << (env_no ? env_no : "(unset)") << "\n";
+  out << "use_avx512bw()=" << (use_avx512bw() ? 1 : 0) << "\n";
   out << "search_backend=" << search_backend_name(bits, dim) << "\n";
 
 #if defined(__x86_64__) || defined(_M_X64)
-  unsigned leaf7_ebx = 0, leaf7_ecx = 0;
+  unsigned leaf7_ebx = 0;
   unsigned long long xcr0 = 0;
   bool osxsave = false;
   bool leaf7_ok = false;
@@ -289,7 +265,6 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
   if (max_leaf >= 7) {
     __cpuidex(info, 7, 0);
     leaf7_ebx = static_cast<unsigned>(info[1]);
-    leaf7_ecx = static_cast<unsigned>(info[2]);
     leaf7_ok = true;
   }
 #else
@@ -306,69 +281,23 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
   }
   if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
     leaf7_ebx = ebx;
-    leaf7_ecx = ecx;
     leaf7_ok = true;
   }
 #endif
   out << "osxsave=" << (osxsave ? 1 : 0) << " xcr0=0x" << std::hex << xcr0 << std::dec << "\n";
-  out << "xcr0_xmm_ymm=" << (((xcr0 & 0x6ull) == 0x6ull) ? 1 : 0)
-      << " xcr0_opmask_zmm=" << (((xcr0 & 0xe0ull) == 0xe0ull) ? 1 : 0)
-      << " xcr0_avx512_ok=" << (((xcr0 & 0xe6ull) == 0xe6ull) ? 1 : 0) << "\n";
+  out << "xcr0_avx512_ok=" << (((xcr0 & 0xe6ull) == 0xe6ull) ? 1 : 0) << "\n";
   if (leaf7_ok) {
     const int avx512f = (leaf7_ebx & (1u << 16)) != 0;
     const int avx512bw = (leaf7_ebx & (1u << 30)) != 0;
-    const int avx512vbmi = (leaf7_ecx & (1u << 1)) != 0;
-    const int avx512vnni = (leaf7_ecx & (1u << 11)) != 0;
     const int avx2 = (leaf7_ebx & (1u << 5)) != 0;
-    out << "leaf7_ebx=0x" << std::hex << leaf7_ebx << " leaf7_ecx=0x" << leaf7_ecx << std::dec
-        << "\n";
     out << "cpuid_avx2=" << avx2 << " cpuid_avx512f=" << avx512f << " cpuid_avx512bw=" << avx512bw
-        << " cpuid_avx512vbmi=" << avx512vbmi << " cpuid_avx512vnni=" << avx512vnni << "\n";
-    if (avx512vnni && !avx512vbmi) {
-      out << "vnni_note=AVX512VNNI present but AVX512VBMI missing; "
-             "vector-major VNNI path requires VBMI (vpermb). Using AVX2 PERM0 SIMD.\n";
-    }
-  } else {
-    out << "leaf7_ok=0 (CPUID leaf 7 unavailable)\n";
+        << "\n";
   }
-#if defined(__GNUC__) || defined(__clang__)
-  out << "builtin_avx2=" << (__builtin_cpu_supports("avx2") ? 1 : 0)
-      << " builtin_avx512f=" << (__builtin_cpu_supports("avx512f") ? 1 : 0)
-      << " builtin_avx512bw=" << (__builtin_cpu_supports("avx512bw") ? 1 : 0)
-      << " builtin_avx512vbmi=" << (__builtin_cpu_supports("avx512vbmi") ? 1 : 0)
-      << " builtin_avx512vnni=" << (__builtin_cpu_supports("avx512vnni") ? 1 : 0) << "\n";
-#endif
 #else
   out << "arch=non-x86_64\n";
 #endif
   out << "=== end diagnostics ===\n";
   return out.str();
-}
-
-void vector_major_chunk(std::span<std::uint8_t> buf) {
-  std::array<std::uint8_t, kVmUnit> tmp{};
-  for (std::size_t off = 0; off + kVmUnit <= buf.size(); off += kVmUnit) {
-    std::memcpy(tmp.data(), buf.data() + off, kVmUnit);
-    auto* unit = buf.data() + off;
-    for (std::size_t j = 0; j < 4; ++j) {
-      for (std::size_t v = 0; v < kBlock; ++v) {
-        unit[(v / 16) * 64 + (v % 16) * 4 + j] = tmp[j * kBlock + v];
-      }
-    }
-  }
-}
-
-void vector_major_to_seq_chunk(std::span<std::uint8_t> buf) {
-  std::array<std::uint8_t, kVmUnit> tmp{};
-  for (std::size_t off = 0; off + kVmUnit <= buf.size(); off += kVmUnit) {
-    std::memcpy(tmp.data(), buf.data() + off, kVmUnit);
-    auto* unit = buf.data() + off;
-    for (std::size_t j = 0; j < 4; ++j) {
-      for (std::size_t v = 0; v < kBlock; ++v) {
-        unit[j * kBlock + v] = tmp[(v / 16) * 64 + (v % 16) * 4 + j];
-      }
-    }
-  }
 }
 
 std::vector<std::uint8_t> codes_flat_from_packed(std::span<const std::uint8_t> packed_codes,
@@ -388,23 +317,7 @@ std::vector<std::uint8_t> repack_seq(std::span<const std::uint8_t> packed_codes,
 std::pair<std::vector<std::uint8_t>, std::size_t> repack(std::span<const std::uint8_t> packed_codes,
                                                          std::size_t n_vectors, std::size_t bits,
                                                          std::size_t dim) {
-  const auto geo = blocked_geometry(n_vectors, bits, dim);
-  auto codes_flat = extract_codes_flat(packed_codes, n_vectors, bits, dim);
-  std::vector<std::uint8_t> blocked;
-  if (vector_major_for(bits, geo.n_byte_groups)) {
-    blocked = pack_blocked_sequential(n_vectors, geo.n_blocks, geo.n_byte_groups, geo.blocked_len,
-                                      codes_flat);
-    vector_major_chunk(blocked);
-  } else {
-#if defined(__x86_64__) || defined(_M_X64)
-    blocked = pack_blocked_perm0(n_vectors, geo.n_blocks, geo.n_byte_groups, geo.blocked_len,
-                                 codes_flat);
-#else
-    blocked = pack_blocked_sequential(n_vectors, geo.n_blocks, geo.n_byte_groups, geo.blocked_len,
-                                      codes_flat);
-#endif
-  }
-  return {std::move(blocked), geo.n_blocks};
+  return repack_perm0(packed_codes, n_vectors, bits, dim);
 }
 
 std::pair<std::vector<std::uint8_t>, std::size_t> repack_perm0(
@@ -422,15 +335,10 @@ std::pair<std::vector<std::uint8_t>, std::size_t> repack_perm0(
   return {std::move(blocked), geo.n_blocks};
 }
 
-std::uint8_t read_code(std::span<const std::uint8_t> blocked, std::size_t bits,
+std::uint8_t read_code(std::span<const std::uint8_t> blocked, std::size_t /*bits*/,
                        std::size_t n_byte_groups, std::size_t block_idx, std::size_t g,
                        std::size_t lane) {
   const std::size_t block_base = block_idx * n_byte_groups * kBlock;
-  if (vector_major_for(bits, n_byte_groups)) {
-    const std::size_t idx =
-        block_base + (g / 4) * 128 + (lane / 16) * 64 + (lane % 16) * 4 + (g % 4);
-    return blocked[idx];
-  }
 #if defined(__x86_64__) || defined(_M_X64)
   return deinterleave_x86_code_byte(blocked, block_base + g * kBlock, lane);
 #else

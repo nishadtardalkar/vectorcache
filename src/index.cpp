@@ -72,9 +72,7 @@ LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t scan_bits, std::size_t
   if (n_landmarks == 0 || n_landmarks > dim) {
     throw std::invalid_argument("n_landmarks must be in 1..dim");
   }
-  if (shortlist == 0) {
-    throw std::invalid_argument("shortlist must be > 0");
-  }
+  // shortlist == 0 allowed only with a finite score_threshold (uncapped); checked at search().
   auto cb = codebook(rerank_bits_, dim_);
   boundaries_ = std::move(cb.first);
   centroids_ = std::move(cb.second);
@@ -160,16 +158,17 @@ void LandmarkIndex::prepare() {
   scales_.clear();
   encode_prerotated(unit_lm, norms, n_vectors_, scan_dim_, lm_boundaries_, lm_centroids_,
                     scan_bits_, nullptr, packed, scales_);
-  // Landmark search uses avx2_perm0 LUTs; keep pack layout matched.
-  auto repacked = repack_perm0(packed, n_vectors_, scan_bits_, scan_dim_);
+  // Same pack dispatch as flat TurboQuant (VNNI/vector-major when available, else PERM0).
+  auto repacked = repack(packed, n_vectors_, scan_bits_, scan_dim_);
   blocked_codes_ = std::move(repacked.first);
-  n_blocks_ = (n_vectors_ + kBlock - 1) / kBlock;
+  n_blocks_ = repacked.second;
   landmark_rows_.clear();
   landmark_rows_.shrink_to_fit();
   prepared_ = true;
 }
 
-SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t k) const {
+SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t k,
+                                    LandmarkStageTimings* timings, bool shortlist_only) const {
   if (queries.size() % dim_ != 0) {
     throw std::invalid_argument("queries length must be multiple of dim");
   }
@@ -177,11 +176,12 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
     throw std::runtime_error("call prepare() before search");
   }
   const std::size_t nq = queries.size() / dim_;
-  const std::size_t sl = std::min(shortlist_, n_vectors_);
+  const std::size_t sl = shortlist_ == 0 ? 0 : std::min(shortlist_, n_vectors_);
   const std::size_t kk = std::min(k, n_vectors_);
   return search_landmark_rerank(queries, nq, dim_, kk, sl, landmark_basis_, n_landmarks_, scan_dim_,
                                 lm_centroids_, scan_bits_, blocked_codes_, n_blocks_, scales_,
-                                rerank_codes_, rerank_scales_, centroids_, rerank_bits_, rotation_);
+                                rerank_codes_, rerank_scales_, centroids_, rerank_bits_, rotation_,
+                                score_threshold_, timings, shortlist_only);
 }
 
 }  // namespace vectorcache

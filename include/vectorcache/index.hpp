@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -27,15 +28,21 @@ class LandmarkIndex {
   std::size_t n_landmarks() const { return n_landmarks_; }
   std::size_t scan_dim() const { return scan_dim_; }
   std::size_t shortlist() const { return shortlist_; }
+  float score_threshold() const { return score_threshold_; }
   std::size_t size() const { return n_vectors_; }
 
+  /// Mean shortlist target; buffer capacity = 2×shortlist (0 = uncapped, tune-only).
   void set_shortlist(std::size_t shortlist) { shortlist_ = shortlist; }
+  /// Keep landmark scores >= threshold (required for search; no top-S heap).
+  void set_score_threshold(float threshold) { score_threshold_ = threshold; }
 
   /// Append flat n*dim vectors (L2-normalized or not). After prepare(), only quantized codes remain.
   void add(std::span<const float> vectors);
   void prepare();
 
-  SearchResults search(std::span<const float> queries, std::size_t k) const;
+  SearchResults search(std::span<const float> queries, std::size_t k,
+                       LandmarkStageTimings* timings = nullptr,
+                       bool shortlist_only = false) const;
 
  private:
   void encode_row(const float* src, float* unit_out, float* landmark_row_out);
@@ -46,6 +53,7 @@ class LandmarkIndex {
   std::size_t n_landmarks_;
   std::size_t scan_dim_;  // n_landmarks padded to multiple of 8 for FastScan
   std::size_t shortlist_;
+  float score_threshold_ = std::numeric_limits<float>::quiet_NaN();
   std::uint64_t landmark_seed_;
   Rotation rotation_;
   std::vector<float> boundaries_;       // full-dim FWHT quant (rerank_bits)

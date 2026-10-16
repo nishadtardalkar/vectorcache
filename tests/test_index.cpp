@@ -20,6 +20,7 @@ TEST(Index, AddAndSearchReturnsIds) {
   for (float& x : queries) x = dist(rng);
 
   vectorcache::LandmarkIndex index(dim, 4, /*n_landmarks=*/48, /*shortlist=*/64);
+  index.set_score_threshold(-1e9f);  // threshold shortlist (no top-S heap)
   index.add(db);
   index.prepare();
   auto res = index.search(queries, k);
@@ -44,6 +45,7 @@ TEST(Index, SelfQueryHighScore) {
   for (float& x : db) x = dist(rng);
 
   vectorcache::LandmarkIndex index(dim, 4, 96, 32);
+  index.set_score_threshold(-1e9f);
   index.add(db);
   index.prepare();
   auto res = index.search(std::span<const float>(db.data(), dim), 1);
@@ -70,6 +72,7 @@ TEST(Index, SeparateScanAndRerankBits) {
   EXPECT_EQ(index.scan_bits(), 2u);
   EXPECT_EQ(index.rerank_bits(), 4u);
   EXPECT_EQ(index.bit_width(), 2u);
+  index.set_score_threshold(-1e9f);
   index.add(db);
   index.prepare();
   auto res = index.search(queries, k);

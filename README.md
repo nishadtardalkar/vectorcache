@@ -28,7 +28,7 @@ make login DATASETS=sift1m
 make compute
 make compute BITS=4 RECALL=1 CALIBRATE=1
 make compute DATASET=openai-1536 BITS=2 K=64
-make compute DATASET=sift1m LIMIT=0 QUERY_LIMIT=10000
+make compute DATASET=sift1m QUERY_LIMIT=10000
 ```
 
 `make login` configures CMake and downloads datasets into `data/`.  
@@ -75,7 +75,7 @@ ctest --output-on-failure
 ```bash
 ./query-bench --dataset glove --bits 4 --k 10
 ./query-bench --dataset glove --bits 4 --calibrate --recall
-./query-bench --dataset sift1m --bits 4 --k 10 --limit 0 --query-limit 10000
+./query-bench --dataset sift1m --bits 4 --k 10 --query-limit 10000
 ./query-bench --dataset openai-1536 --bits 2 --k 64
 ./query-bench --npy data/glove-train-100k.npy --limit 100000 --query-limit 1000
 ./query-bench --dataset glove --bucketed --n-probe 64 --max-bucket-size 800 --energy-soft 400
