@@ -54,6 +54,36 @@ TEST(Index, SelfQueryHighScore) {
   EXPECT_GT(res.scores[0], 0.9f);
 }
 
+TEST(Index, MultiQueryThresholdMatchesSingle) {
+  constexpr std::size_t dim = 64;
+  constexpr std::size_t n = 512;
+  constexpr std::size_t nq = 8;
+  constexpr std::size_t k = 8;
+
+  std::mt19937 rng(123);
+  std::normal_distribution<float> dist(0.f, 1.f);
+  std::vector<float> db(n * dim);
+  for (float& x : db) x = dist(rng);
+  std::vector<float> queries(nq * dim);
+  for (float& x : queries) x = dist(rng);
+
+  vectorcache::LandmarkIndex index(dim, 4, /*n_landmarks=*/48, /*shortlist=*/128);
+  index.set_score_threshold(-1e9f);
+  index.add(db);
+  index.prepare();
+
+  auto batch = index.search(queries, k);
+  ASSERT_EQ(batch.nq, nq);
+  for (std::size_t qi = 0; qi < nq; ++qi) {
+    auto one = index.search(std::span<const float>(queries.data() + qi * dim, dim), k);
+    ASSERT_EQ(one.nq, 1u);
+    for (std::size_t j = 0; j < k; ++j) {
+      EXPECT_EQ(batch.ids[qi * k + j], one.ids[j]) << "qi=" << qi << " j=" << j;
+      EXPECT_NEAR(batch.scores[qi * k + j], one.scores[j], 1e-4f) << "qi=" << qi << " j=" << j;
+    }
+  }
+}
+
 TEST(Index, SeparateScanAndRerankBits) {
   constexpr std::size_t dim = 64;
   constexpr std::size_t n = 128;

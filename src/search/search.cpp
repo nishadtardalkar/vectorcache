@@ -736,6 +736,7 @@ SearchResults score_prepared_vm_threshold(const PreparedQueries& prep, std::size
   };
   const std::size_t n_vectors = scales.size();
   const bool use_pd = prep.backend == SearchBackendKind::VmPermuteDot;
+  const std::size_t n_byte_groups = prep.n_byte_groups;
 
   SearchResults out;
   out.nq = nq;
@@ -746,25 +747,63 @@ SearchResults score_prepared_vm_threshold(const PreparedQueries& prep, std::size
   if (nq == 0 || capacity == 0) return out;
 
 #if defined(__x86_64__) || defined(_M_X64)
-#ifdef _OPENMP
+  // turbovec-style: amortize one codes stream across up to kNqBatch queries.
+  // Keep n_ranges=1 (VM addressing); parallelize across query batches only.
+  const std::size_t n_quads = (nq + kNqBatch - 1) / kNqBatch;
+  struct Tile {
+    std::size_t qi_start;
+  };
+  std::vector<Tile> tiles;
+  tiles.reserve(n_quads);
+  for (std::size_t qi_start = 0; qi_start < nq; qi_start += kNqBatch) {
+    tiles.push_back(Tile{qi_start});
+  }
+
+#if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
 #pragma omp parallel for schedule(dynamic)
 #endif
-  for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-    const std::size_t gqi = global_qi(static_cast<std::size_t>(qi));
-    std::size_t count = 0;
-    float* score_ptr = out.scores.data() + static_cast<std::size_t>(qi) * capacity;
-    std::uint64_t* id_ptr = out.ids.data() + static_cast<std::size_t>(qi) * capacity;
-    if (use_pd) {
-      score_query_permute_dot_threshold_fill(
-          prep.pds[gqi], blocked_codes, scales, prep.n_byte_groups, n_vectors, n_blocks,
-          score_threshold, capacity, score_ptr, id_ptr, &count, nullptr, 0.f);
-    } else {
-      QueryLutView view{prep.split_luts[gqi].data(), prep.lut_scales[gqi], prep.lut_biases[gqi]};
-      score_query_vnni_threshold_fill(view, blocked_codes, scales, prep.n_byte_groups, n_vectors,
-                                      n_blocks, score_threshold, capacity, score_ptr, id_ptr, &count,
-                                      0.f, nullptr, 0.f);
+  for (int ti = 0; ti < static_cast<int>(tiles.size()); ++ti) {
+    const std::size_t qi_start = tiles[static_cast<std::size_t>(ti)].qi_start;
+    const std::size_t qi_end = std::min(qi_start + kNqBatch, nq);
+    const std::size_t batch_nq = qi_end - qi_start;
+    if (batch_nq == 0) continue;
+
+    float* score_ptrs[kNqBatch];
+    std::uint64_t* id_ptrs[kNqBatch];
+    std::size_t hit_counts[kNqBatch];
+    for (std::size_t i = 0; i < batch_nq; ++i) {
+      const std::size_t qi = qi_start + i;
+      score_ptrs[i] = out.scores.data() + qi * capacity;
+      id_ptrs[i] = out.ids.data() + qi * capacity;
+      hit_counts[i] = 0;
     }
-    out.counts[static_cast<std::size_t>(qi)] = count;
+
+    if (use_pd) {
+      const QueryPermuteDot* pd_ptrs[kNqBatch];
+      for (std::size_t i = 0; i < batch_nq; ++i) {
+        pd_ptrs[i] = &prep.pds[global_qi(qi_start + i)];
+      }
+      score_queries_permute_dot_threshold_fill(
+          pd_ptrs, batch_nq, blocked_codes, scales, n_byte_groups, n_vectors, n_blocks,
+          score_threshold, capacity, score_ptrs, id_ptrs, hit_counts, nullptr, nullptr);
+    } else {
+      const std::uint8_t* lut_ptrs[kNqBatch];
+      float lut_scales[kNqBatch];
+      float lut_biases[kNqBatch];
+      for (std::size_t i = 0; i < batch_nq; ++i) {
+        const std::size_t gqi = global_qi(qi_start + i);
+        lut_ptrs[i] = prep.split_luts[gqi].data();
+        lut_scales[i] = prep.lut_scales[gqi];
+        lut_biases[i] = prep.lut_biases[gqi];
+      }
+      score_queries_vnni_threshold_fill(lut_ptrs, lut_scales, lut_biases, batch_nq, blocked_codes,
+                                        scales, n_byte_groups, n_vectors, n_blocks, score_threshold,
+                                        capacity, score_ptrs, id_ptrs, hit_counts, nullptr,
+                                        nullptr);
+    }
+    for (std::size_t i = 0; i < batch_nq; ++i) {
+      out.counts[qi_start + i] = hit_counts[i];
+    }
   }
   return out;
 #else
@@ -772,6 +811,7 @@ SearchResults score_prepared_vm_threshold(const PreparedQueries& prep, std::size
   (void)n_blocks;
   (void)score_threshold;
   (void)use_pd;
+  (void)n_byte_groups;
   throw std::logic_error("VM threshold shortlist requires x86_64");
 #endif
 }
@@ -1204,31 +1244,70 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
   if (shortlist_only && shortlist == 0) {
     t0 = clock::now();
     std::vector<std::size_t> hit_counts(nq, 0);
+#if defined(__x86_64__) || defined(_M_X64)
+    if (prep.backend == SearchBackendKind::VmPermuteDot ||
+        prep.backend == SearchBackendKind::VmVnni) {
+      const bool use_pd = prep.backend == SearchBackendKind::VmPermuteDot;
+      const std::size_t n_quads = (nq + kNqBatch - 1) / kNqBatch;
+#if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
+#pragma omp parallel for schedule(dynamic)
+#endif
+      for (int bi = 0; bi < static_cast<int>(n_quads); ++bi) {
+        const std::size_t qi_start = static_cast<std::size_t>(bi) * kNqBatch;
+        const std::size_t batch_nq = std::min(kNqBatch, nq - qi_start);
+        std::size_t local_counts[kNqBatch] = {};
+        if (use_pd) {
+          const QueryPermuteDot* pd_ptrs[kNqBatch];
+          for (std::size_t i = 0; i < batch_nq; ++i) {
+            pd_ptrs[i] = &prep.pds[qi_start + i];
+          }
+          score_queries_permute_dot_threshold_fill(
+              pd_ptrs, batch_nq, blocked_codes, lm_scales, prep.n_byte_groups, n_vectors, n_blocks,
+              score_threshold, /*capacity=*/0, /*out_scores=*/nullptr, /*out_ids=*/nullptr,
+              local_counts, nullptr, nullptr);
+        } else {
+          const std::uint8_t* lut_ptrs[kNqBatch];
+          float lut_scales[kNqBatch];
+          float lut_biases[kNqBatch];
+          for (std::size_t i = 0; i < batch_nq; ++i) {
+            const std::size_t qi = qi_start + i;
+            lut_ptrs[i] = prep.split_luts[qi].data();
+            lut_scales[i] = prep.lut_scales[qi];
+            lut_biases[i] = prep.lut_biases[qi];
+          }
+          score_queries_vnni_threshold_fill(
+              lut_ptrs, lut_scales, lut_biases, batch_nq, blocked_codes, lm_scales,
+              prep.n_byte_groups, n_vectors, n_blocks, score_threshold, /*capacity=*/0, nullptr,
+              nullptr, local_counts, nullptr, nullptr);
+        }
+        for (std::size_t i = 0; i < batch_nq; ++i) {
+          hit_counts[qi_start + i] = local_counts[i];
+        }
+      }
+    } else if (prep.backend == SearchBackendKind::Avx2) {
+      // AVX2 multi threshold does not support count-only; single-query kernel does.
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
-    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-      const std::size_t qis = static_cast<std::size_t>(qi);
-      std::size_t count = 0;
-#if defined(__x86_64__) || defined(_M_X64)
-      if (prep.backend == SearchBackendKind::VmPermuteDot) {
-        score_query_permute_dot_threshold_fill(
-            prep.pds[qis], blocked_codes, lm_scales, prep.n_byte_groups, n_vectors, n_blocks,
-            score_threshold, /*capacity=*/0, /*out_scores=*/nullptr, /*out_ids=*/nullptr, &count);
-      } else if (prep.backend == SearchBackendKind::VmVnni) {
-        QueryLutView view{prep.split_luts[qis].data(), prep.lut_scales[qis], prep.lut_biases[qis]};
-        score_query_vnni_threshold_fill(view, blocked_codes, lm_scales, prep.n_byte_groups, n_vectors,
-                                        n_blocks, score_threshold, /*capacity=*/0, nullptr, nullptr,
-                                        &count);
-      } else if (prep.backend == SearchBackendKind::Avx2) {
+      for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+        const std::size_t qis = static_cast<std::size_t>(qi);
+        std::size_t count = 0;
         const auto& lut = prep.luts[qis];
         QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
         score_query_avx2_perm0_threshold_fill(
             view, blocked_codes, lm_scales, prep.n_byte_groups, n_vectors, n_blocks, score_threshold,
             /*capacity=*/0, nullptr, nullptr, &count);
-      } else
+        hit_counts[qis] = count;
+      }
+    } else
 #endif
-      {
+    {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+      for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+        const std::size_t qis = static_cast<std::size_t>(qi);
+        std::size_t count = 0;
         const auto& lut = prep.luts[qis];
         for (std::size_t b = 0; b < n_blocks; ++b) {
           const std::size_t base_vec = b * kBlock;
@@ -1247,8 +1326,8 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
             if (score >= score_threshold) ++count;
           }
         }
+        hit_counts[qis] = count;
       }
-      hit_counts[qis] = count;
     }
     const double shortlist_scan_ms = ms_since(t0);
     double mean_sl = 0.0;

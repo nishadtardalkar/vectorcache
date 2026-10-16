@@ -65,10 +65,11 @@ Asymmetric throughout: query stays float (LUT); DB uses `scan_bits` codes for la
 ## Layout / SIMD
 
 - Landmark dim padded to a multiple of 8 for FastScan (`scan_dim`)
-- Codes: bit-plane pack → BLOCK=32 **PERM0** (paired with `avx2_perm0` LUT scan)
+- Codes: `repack()` → vector-major when VNNI-eligible, else BLOCK=32 **PERM0**
 - Full-dim re-rank codes: row-major flat (`n × n_byte_groups`) for sparse shortlist access
-- **Multi-query FastScan** (turbovec-style): up to 4 queries share one codes stream (`kAvx2NqBatch`); OpenMP tiles `(query-batch × block-range)`
-- Prior TurboQuant VNNI / vector-major kernels remain in-tree for full-dim paths; landmark search uses PERM0 for pack/search layout match
+- Landmark shortlist is **threshold fill** (capacity `2×S`), not a top-S heap
+- **Multi-query FastScan** (turbovec-style): VNNI/permute-dot batches up to 8 queries on one codes stream (`kNqBatch`); AVX2 PERM0 batches 4 (`kAvx2NqBatch`)
+- Single-query permute-dot uses **BLK=8** interleaved streams + depth-8 prefetch; multi-query uses BLK=1 + depth-32 prefetch
 
 ## CLI (`query-bench`)
 
