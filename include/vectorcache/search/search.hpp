@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "vectorcache/search/search_vnni.hpp"
 #include "vectorcache/transform/rotation.hpp"
 
 namespace vectorcache {
@@ -37,7 +38,7 @@ struct PreparedQueryLut {
   float bias = 0.f;
 };
 
-enum class SearchBackendKind { Avx512bw, Avx2, Scalar };
+enum class SearchBackendKind { VmPermuteDot, VmVnni, Avx2, Scalar };
 
 /// Query-side state shared across one or more blocked code ranges (buckets).
 struct PreparedQueries {
@@ -49,6 +50,11 @@ struct PreparedQueries {
 
   std::vector<float> q_rot;
   std::vector<float> bias_corrs;
+
+  std::vector<QueryPermuteDot> pds;
+  std::vector<std::vector<std::uint8_t>> split_luts;
+  std::vector<float> lut_scales;
+  std::vector<float> lut_biases;
   std::vector<PreparedQueryLut> luts;
 };
 
