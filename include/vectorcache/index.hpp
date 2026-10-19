@@ -65,9 +65,11 @@ class LandmarkIndex {
   std::vector<float> landmark_rows_;   // n * scan_dim (row-major before prepare)
   std::vector<std::uint8_t> blocked_codes_;  // landmark FastScan
   std::vector<float> scales_;                // landmark α
-  std::vector<std::uint8_t> rerank_codes_;    // full-dim flat codes (n * n_byte_groups)
+  std::vector<std::uint8_t> rerank_codes_;    // full-dim flat codes (scalar fallback)
+  std::vector<std::uint8_t> rerank_blocked_;  // full-dim FastScan layout (SIMD rerank)
   std::vector<float> rerank_scales_;          // full-dim TurboQuant α
   mutable std::size_t n_blocks_ = 0;
+  mutable std::size_t rerank_n_blocks_ = 0;
   std::size_t n_vectors_ = 0;
   mutable bool prepared_ = false;
   mutable std::vector<float> rotate_scratch_;

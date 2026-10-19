@@ -141,6 +141,9 @@ void LandmarkIndex::prepare() {
     encode(db_unit_, n_vectors_, dim_, rotation_, boundaries_, centroids_, rerank_bits_, nullptr,
            rotated_scratch, packed, rerank_scales_);
     rerank_codes_ = codes_flat_from_packed(packed, n_vectors_, rerank_bits_, dim_);
+    auto rerank_repacked = repack(packed, n_vectors_, rerank_bits_, dim_);
+    rerank_blocked_ = std::move(rerank_repacked.first);
+    rerank_n_blocks_ = rerank_repacked.second;
     db_unit_.clear();
     db_unit_.shrink_to_fit();
   }
@@ -180,8 +183,9 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
   const std::size_t kk = std::min(k, n_vectors_);
   return search_landmark_rerank(queries, nq, dim_, kk, sl, landmark_basis_, n_landmarks_, scan_dim_,
                                 lm_centroids_, scan_bits_, blocked_codes_, n_blocks_, scales_,
-                                rerank_codes_, rerank_scales_, centroids_, rerank_bits_, rotation_,
-                                score_threshold_, timings, shortlist_only);
+                                rerank_codes_, rerank_blocked_, rerank_n_blocks_, rerank_scales_,
+                                centroids_, rerank_bits_, rotation_, score_threshold_, timings,
+                                shortlist_only);
 }
 
 }  // namespace vectorcache

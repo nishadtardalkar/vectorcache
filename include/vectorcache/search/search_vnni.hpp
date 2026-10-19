@@ -38,8 +38,8 @@ void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_co
                       std::size_t& heap_mi, float bias_corr,
                       const std::uint64_t* id_map = nullptr, float score_offset = 0.f);
 
-/// Score up to 8 queries sharing one codes stream (classic VNNI / split LUT).
-/// `nq` must be in [1, 8]. For `nq==1` prefers the dual-block kernel.
+/// Score up to 10 queries sharing one codes stream (classic VNNI / split LUT).
+/// `nq` must be in [1, 10]. For `nq==1` prefers the dual-block kernel.
 /// `split_luts[qi]` already split; `lut_biases[qi]` should include any TQ+ bias.
 /// If `score_offsets` is non-null (length `nq`), adds `score_offsets[qi]` after α·LUT.
 void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_scales,
@@ -53,15 +53,20 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
                         const float* score_offsets = nullptr);
 
 /// Score one query with 4-bit permute-dot (dual-block when possible).
+/// If `hit_bitmap` is non-null, only vectors with bit set enter the heap (empty blocks skipped).
+/// `vec_offset` / `global_n_vectors` map local block indices into a global hit bitmap (block tiling).
 void score_query_permute_dot(const QueryPermuteDot& pd, std::span<const std::uint8_t> blocked_codes,
                              std::span<const float> vec_scales, std::size_t n_byte_groups,
                              std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                              float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                              float& heap_min, std::size_t& heap_mi,
-                             const std::uint64_t* id_map = nullptr, float score_offset = 0.f);
+                             const std::uint64_t* id_map = nullptr, float score_offset = 0.f,
+                             const std::uint64_t* hit_bitmap = nullptr, std::size_t vec_offset = 0,
+                             std::size_t global_n_vectors = 0);
 
-/// Score up to 8 queries with 4-bit permute-dot, one codes stream.
+/// Score up to 10 queries with 4-bit permute-dot, one codes stream.
 /// If `score_offsets` is non-null (length `nq`), adds `score_offsets[qi]` after α·LUT.
+/// If `hit_bitmaps` is non-null, `hit_bitmaps[qi]` masks which vectors enter each heap.
 void score_queries_permute_dot(const QueryPermuteDot* const* pds, std::size_t nq,
                                std::span<const std::uint8_t> blocked_codes,
                                std::span<const float> vec_scales, std::size_t n_byte_groups,
@@ -69,7 +74,9 @@ void score_queries_permute_dot(const QueryPermuteDot* const* pds, std::size_t nq
                                float* const* heap_s, std::uint64_t* const* heap_i,
                                std::size_t* heap_sz, float* heap_min, std::size_t* heap_mi,
                                const std::uint64_t* id_map = nullptr,
-                               const float* score_offsets = nullptr);
+                               const float* score_offsets = nullptr,
+                               const std::uint64_t* const* hit_bitmaps = nullptr,
+                               std::size_t vec_offset = 0, std::size_t global_n_vectors = 0);
 
 /// Threshold shortlist: keep score >= threshold into a fixed buffer (capacity).
 /// If `out_scores` is null, only count hits (no early-stop). Capacity 0 with non-null outs is a no-op.
@@ -92,8 +99,9 @@ void score_query_vnni_threshold_fill(QueryLutView lut, std::span<const std::uint
                                      float bias_corr = 0.f, const std::uint64_t* id_map = nullptr,
                                      float score_offset = 0.f);
 
-/// Multi-query threshold fill (nq ∈ [1, 8]): one codes stream shared across the batch.
-/// `nq==1` uses the BLK=8 single-query kernel; `nq>1` uses BLK=1 with depth-32 prefetch.
+/// Multi-query threshold fill (nq ∈ [1, 10]): one codes stream shared across the batch.
+/// `nq==1` uses the BLK=8 single-query kernel; `nq>1` uses BLK=1 (permute-dot PF=32;
+/// classic VNNI: no software prefetch, matching turbovec).
 void score_queries_permute_dot_threshold_fill(const QueryPermuteDot* const* pds, std::size_t nq,
                                               std::span<const std::uint8_t> blocked_codes,
                                               std::span<const float> vec_scales,

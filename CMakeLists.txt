@@ -60,7 +60,7 @@ else()
   set_source_files_properties(src/search/search_avx2.cpp PROPERTIES
     COMPILE_OPTIONS "-mavx2;-mfma")
   set_source_files_properties(src/search/search_vnni.cpp PROPERTIES
-    COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vbmi;-mavx512vnni;-mfma")
+    COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vbmi;-mavx512vnni;-mgfni;-mfma")
 endif()
 
 if(VECTORCACHE_OPENMP)

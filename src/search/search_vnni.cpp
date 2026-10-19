@@ -1,17 +1,26 @@
 #include "vectorcache/search/search_vnni.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 #include "vectorcache/pack/pack.hpp"
+#include "vectorcache/search/landmark_scan.hpp"
 #include "vectorcache/search/topk_heap.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
 #endif
 
 namespace vectorcache {
@@ -31,48 +40,213 @@ namespace {
 #define VECTORCACHE_AVX512_FN
 #endif
 
+/// turbovec `have_gfni`: GFNI high-nibble extract for permute-dot (~+4% MT).
+bool have_gfni() {
+  static std::once_flag once;
+  static bool ok = false;
+  std::call_once(once, [] {
+    if (const char* v = std::getenv("TURBOVEC_NO_GFNI"); v && v[0] != '0') {
+      ok = false;
+      return;
+    }
+#if defined(_MSC_VER)
+    int info[4] = {};
+    __cpuid(info, 0);
+    if (info[0] < 7) {
+      ok = false;
+      return;
+    }
+    __cpuidex(info, 7, 0);
+    ok = (info[2] & (1 << 8)) != 0;  // GFNI
+#else
+    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) == 0) {
+      ok = false;
+      return;
+    }
+    ok = (ecx & (1u << 8)) != 0;
+#endif
+  });
+  return ok;
+}
+
+/// High nibbles: GFNI one-op (turbovec) or `srli`+and. Templated so the hot
+/// loop is specialized (turbovec ships two `#[target_feature]` kernels).
+template <bool kGfni>
+inline __m512i hi_nibbles(__m512i c, __m512i m0f) {
+  if constexpr (kGfni) {
+    // Identity rows that map input bits 4..7 → output bits 0..3 (turbovec H38).
+    return _mm512_gf2p8affine_epi64_epi8(
+        c, _mm512_set1_epi64(static_cast<long long>(0x1020408000000000ull)), 0);
+  } else {
+    return _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f);
+  }
+}
+
+/// turbovec `avx512_post_flush_heap_update`: early-out when no lane beats heap_min.
+/// If `hit_bitmap` is non-null, only lanes with bit set are considered (pass-2 masked rerank).
 VECTORCACHE_AVX512_FN
 void flush_block_heap(__m512 f0, __m512 f1, std::size_t base_vec, std::size_t n_vectors,
                       const float* vec_scales, std::size_t k, float* heap_s, std::uint64_t* heap_i,
                       std::size_t& heap_sz, float& heap_min, std::size_t& heap_mi,
-                      const std::uint64_t* id_map, float score_offset) {
+                      const std::uint64_t* id_map, float score_offset,
+                      const std::uint64_t* hit_bitmap = nullptr, std::size_t vec_offset = 0,
+                      std::size_t global_n_vectors = 0) {
+  const std::size_t abs_base = base_vec + vec_offset;
+  const std::size_t bm_n = global_n_vectors > 0 ? global_n_vectors : (vec_offset + n_vectors);
+  const std::uint32_t bm =
+      hit_bitmap ? block_hit_mask(hit_bitmap, abs_base, bm_n) : 0xFFFFFFFFu;
+  if (bm == 0) {
+    return;
+  }
+  const std::size_t end = std::min(base_vec + kBlock, n_vectors);
+  const std::size_t end_lane = end - base_vec;
+  const float* scales_ptr = vec_scales + base_vec;
+
+  if (heap_sz >= k && end_lane == kBlock) {
+    __m512 s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(scales_ptr));
+    __m512 s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(scales_ptr + 16));
+    if (score_offset != 0.f) {
+      const __m512 off = _mm512_set1_ps(score_offset);
+      s0 = _mm512_add_ps(s0, off);
+      s1 = _mm512_add_ps(s1, off);
+    }
+    const __m512 thr = _mm512_set1_ps(heap_min);
+    std::uint32_t m0 =
+        static_cast<std::uint32_t>(_mm512_cmp_ps_mask(s0, thr, _CMP_GT_OQ)) & (bm & 0xFFFFu);
+    std::uint32_t m1 =
+        static_cast<std::uint32_t>(_mm512_cmp_ps_mask(s1, thr, _CMP_GT_OQ)) & (bm >> 16);
+    if ((m0 | m1) == 0) {
+      return;
+    }
+    alignas(64) float scores[kBlock];
+    if (m0 != 0) {
+      _mm512_storeu_ps(scores, s0);
+    }
+    if (m1 != 0) {
+      _mm512_storeu_ps(scores + 16, s1);
+    }
+    for (std::size_t half = 0; half < 2; ++half) {
+      std::uint32_t m = (half == 0) ? m0 : m1;
+      while (m != 0) {
+        const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
+        m &= m - 1;
+        const std::size_t lane = half * 16 + bit;
+        const float score = scores[lane];
+        if (score > heap_min) {
+          heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, score,
+                               topk_map_id(id_map, base_vec + lane));
+        }
+      }
+    }
+    return;
+  }
+
+  // Sparse bitmap (pass-2): bit-scan only set lanes — avoid 32-lane scalar walk.
   alignas(64) float scores[kBlock];
   _mm512_storeu_ps(scores, f0);
   _mm512_storeu_ps(scores + 16, f1);
-  const std::size_t end = std::min(base_vec + kBlock, n_vectors);
-  for (std::size_t lane = 0; lane < end - base_vec; ++lane) {
-    const std::size_t vi = base_vec + lane;
+  std::uint32_t m = bm;
+  if (end_lane < kBlock) {
+    m &= (end_lane >= 32) ? 0xFFFFFFFFu : ((std::uint32_t{1} << end_lane) - 1u);
+  }
+  while (m != 0) {
+    const unsigned lane = static_cast<unsigned>(std::countr_zero(m));
+    m &= m - 1;
     heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k,
-                         scores[lane] * vec_scales[vi] + score_offset, topk_map_id(id_map, vi));
+                         scores[lane] * scales_ptr[lane] + score_offset,
+                         topk_map_id(id_map, base_vec + lane));
   }
 }
 
-/// Returns true when the fixed buffer is full (non-count-only).
+/// SIMD early-out vs threshold (same shape as turbovec heap prune; our shortlist path).
+/// If `hit_bitmap` is non-null, set bits for hits (pass-1 filter). If `out_scores` is non-null,
+/// also append into the shortlist score/id buffers.
 VECTORCACHE_AVX512_FN
 bool flush_block_threshold(__m512 f0, __m512 f1, std::size_t base_vec, std::size_t n_vectors,
                            const float* vec_scales, float threshold, std::size_t capacity,
                            float* out_scores, std::uint64_t* out_ids, std::size_t* out_count,
-                           const std::uint64_t* id_map, float score_offset) {
-  const bool count_only = out_scores == nullptr;
+                           const std::uint64_t* id_map, float score_offset,
+                           std::uint64_t* hit_bitmap) {
+  const bool record_list = out_scores != nullptr;
+  const bool record_bits = hit_bitmap != nullptr;
+  const bool record = record_list || record_bits;
+  const std::size_t end = std::min(base_vec + kBlock, n_vectors);
+  const std::size_t end_lane = end - base_vec;
+  const float* scales_ptr = vec_scales + base_vec;
+
+  auto record_hit = [&](std::size_t lane, float score) {
+    const std::size_t vi = base_vec + lane;
+    if (record_bits) {
+      hit_bitmap[vi >> 6] |= (std::uint64_t{1} << (vi & 63u));
+    }
+    if (record_list) {
+      out_scores[*out_count] = score;
+      out_ids[*out_count] = topk_map_id(id_map, vi);
+    }
+    ++(*out_count);
+  };
+
+  if (end_lane == kBlock) {
+    __m512 s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(scales_ptr));
+    __m512 s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(scales_ptr + 16));
+    if (score_offset != 0.f) {
+      const __m512 off = _mm512_set1_ps(score_offset);
+      s0 = _mm512_add_ps(s0, off);
+      s1 = _mm512_add_ps(s1, off);
+    }
+    const __m512 thr = _mm512_set1_ps(threshold);
+    const std::uint32_t m0 = static_cast<std::uint32_t>(_mm512_cmp_ps_mask(s0, thr, _CMP_GE_OQ));
+    const std::uint32_t m1 = static_cast<std::uint32_t>(_mm512_cmp_ps_mask(s1, thr, _CMP_GE_OQ));
+    // Empty-block early-out (turbovec heap prune). Dense hits: store+scalar
+    // is faster than bit-scan — threshold shortlists are often dense.
+    if ((m0 | m1) == 0) {
+      return false;
+    }
+    alignas(64) float scores[kBlock];
+    // Selective half-store (turbovec heap flush): skip empty halves.
+    if (m0 != 0) {
+      _mm512_storeu_ps(scores, s0);
+    }
+    if (m1 != 0) {
+      _mm512_storeu_ps(scores + 16, s1);
+    }
+    for (std::size_t half = 0; half < 2; ++half) {
+      std::uint32_t m = (half == 0) ? m0 : m1;
+      while (m != 0) {
+        if (record && *out_count >= capacity) {
+          return true;
+        }
+        const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
+        m &= m - 1;
+        const std::size_t lane = half * 16 + bit;
+        if (record) {
+          record_hit(lane, scores[lane]);
+        } else {
+          ++(*out_count);
+        }
+      }
+    }
+    return record && *out_count >= capacity;
+  }
+
   alignas(64) float scores[kBlock];
   _mm512_storeu_ps(scores, f0);
   _mm512_storeu_ps(scores + 16, f1);
-  const std::size_t end = std::min(base_vec + kBlock, n_vectors);
-  for (std::size_t lane = 0; lane < end - base_vec; ++lane) {
-    if (!count_only && *out_count >= capacity) {
+  for (std::size_t lane = 0; lane < end_lane; ++lane) {
+    if (record && *out_count >= capacity) {
       return true;
     }
-    const std::size_t vi = base_vec + lane;
-    const float score = scores[lane] * vec_scales[vi] + score_offset;
+    const float score = scores[lane] * scales_ptr[lane] + score_offset;
     if (score >= threshold) {
-      if (!count_only) {
-        out_scores[*out_count] = score;
-        out_ids[*out_count] = topk_map_id(id_map, vi);
+      if (record) {
+        record_hit(lane, score);
+      } else {
+        ++(*out_count);
       }
-      ++(*out_count);
     }
   }
-  return !count_only && *out_count >= capacity;
+  return record && *out_count >= capacity;
 }
 
 VECTORCACHE_AVX512_FN
@@ -178,7 +352,7 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
                               std::size_t* heap_sz, float* heap_min, std::size_t* heap_mi,
                               const std::uint64_t* id_map, const float* score_offsets) {
   assert(n_byte_groups % 4 == 0);
-  assert(nq >= 1 && nq <= 8);
+  assert(nq >= 1 && nq <= 10);
 
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const __m512i kpos = _mm512_set1_epi32(static_cast<int>(0x30201000u));
@@ -189,7 +363,7 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t base_vec = b * kBlock;
     const std::size_t block_base = b * block_bytes;
-    __m512i acc[8][2];
+    __m512i acc[10][2];
     for (std::size_t qi = 0; qi < nq; ++qi) {
       acc[qi][0] = _mm512_setzero_si512();
       acc[qi][1] = _mm512_setzero_si512();
@@ -197,15 +371,8 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
 
     for (std::size_t q4 = 0; q4 < quads; ++q4) {
       for (std::size_t h = 0; h < 2; ++h) {
-        constexpr std::size_t kPfQuads = 32;
-        const std::size_t pf = block_base + (q4 + kPfQuads) * 128 + h * 64;
-        if (pf + 64 <= blocked_codes.size()) {
-#if defined(_MSC_VER)
-          _mm_prefetch(reinterpret_cast<const char*>(blocked_codes.data() + pf), _MM_HINT_T0);
-#else
-          __builtin_prefetch(blocked_codes.data() + pf, 0, 3);
-#endif
-        }
+        // turbovec search_multi_query_vnni::<false>: no software prefetch at NQ>1
+        // (H5/H6 — MT regressions; hardware prefetcher owns the stream).
         const __m512i c = _mm512_loadu_si512(
             reinterpret_cast<const __m512i*>(blocked_codes.data() + block_base + q4 * 128 + h * 64));
         const __m512i ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
@@ -237,19 +404,23 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
 #if !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
 /// turbovec `permute_dot::<1, 8>`: eight interleaved code streams + depth-8 prefetch.
 VECTORCACHE_AVX512_FN
+template <bool kGfni>
 void score_query_permute_dot_blk8(const QueryPermuteDot& pd,
                                   std::span<const std::uint8_t> blocked_codes,
                                   std::span<const float> vec_scales, std::size_t n_byte_groups,
                                   std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                                   float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                                   float& heap_min, std::size_t& heap_mi,
-                                  const std::uint64_t* id_map, float score_offset) {
+                                  const std::uint64_t* id_map, float score_offset,
+                                  const std::uint64_t* hit_bitmap = nullptr,
+                                  std::size_t vec_offset = 0, std::size_t global_n_vectors = 0) {
   assert(n_byte_groups % 4 == 0);
   constexpr std::size_t kBlk = 8;
   constexpr std::size_t kPfQuads = 8;
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const std::size_t quads = n_byte_groups / 4;
   const std::size_t block_bytes = n_byte_groups * kBlock;
+  const std::size_t bm_n = global_n_vectors > 0 ? global_n_vectors : (vec_offset + n_vectors);
   const __m512i levels = _mm512_xor_si512(
       _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pd.levels.data()))),
       _mm512_set1_epi8(static_cast<char>(0x80)));
@@ -259,6 +430,18 @@ void score_query_permute_dot_blk8(const QueryPermuteDot& pd,
 
   for (std::size_t b = 0; b < n_blocks; b += kBlk) {
     const std::size_t nb = std::min(kBlk, n_blocks - b);
+    if (hit_bitmap) {
+      bool any = false;
+      for (std::size_t sub = 0; sub < nb; ++sub) {
+        if (block_hit_mask(hit_bitmap, vec_offset + (b + sub) * kBlock, bm_n) != 0) {
+          any = true;
+          break;
+        }
+      }
+      if (!any) {
+        continue;
+      }
+    }
     __m512i acc[kBlk][2];
     for (std::size_t sub = 0; sub < nb; ++sub) {
       acc[sub][0] = z;
@@ -280,8 +463,7 @@ void score_query_permute_dot_blk8(const QueryPermuteDot& pd,
           const __m512i c = _mm512_loadu_si512(
               reinterpret_cast<const __m512i*>(blocked_codes.data() + block_base + q4 * 128 + h * 64));
           const __m512i vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c, m0f));
-          const __m512i vhi =
-              _mm512_shuffle_epi8(levels, _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f));
+          const __m512i vhi = _mm512_shuffle_epi8(levels, hi_nibbles<kGfni>(c, m0f));
           const std::int8_t* wp = pd.weights.data() + q4 * 8;
           std::int32_t wlo_i = 0;
           std::int32_t whi_i = 0;
@@ -297,21 +479,28 @@ void score_query_permute_dot_blk8(const QueryPermuteDot& pd,
       const __m512 f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[sub][0]), vs, vb);
       const __m512 f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[sub][1]), vs, vb);
       flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s, heap_i, heap_sz,
-                       heap_min, heap_mi, id_map, score_offset);
+                       heap_min, heap_mi, id_map, score_offset, hit_bitmap, vec_offset, bm_n);
     }
   }
 }
 
+/// turbovec `search_multi_query_permute_dot::<NQ,1>`: NQ is a compile-time
+/// constant so the qi loop and `acc[NQ][2]` stay in registers (H34/H124).
+/// Caller pads `pds`/`heap_*` to NQ; only the first `nq` lanes are flushed.
 VECTORCACHE_AVX512_FN
+template <bool kGfni, std::size_t NQ>
 void score_queries_permute_dot_multi(const QueryPermuteDot* const* pds, std::size_t nq,
                                      std::span<const std::uint8_t> blocked_codes,
                                      std::span<const float> vec_scales, std::size_t n_byte_groups,
                                      std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                                      float* const* heap_s, std::uint64_t* const* heap_i,
                                      std::size_t* heap_sz, float* heap_min, std::size_t* heap_mi,
-                                     const std::uint64_t* id_map, const float* score_offsets) {
+                                     const std::uint64_t* id_map, const float* score_offsets,
+                                     const std::uint64_t* const* hit_bitmaps = nullptr,
+                                     std::size_t vec_offset = 0, std::size_t global_n_vectors = 0) {
+  static_assert(NQ == 8 || NQ == 10);
   assert(n_byte_groups % 4 == 0);
-  assert(nq >= 1 && nq <= 8);
+  assert(nq >= 1 && nq <= NQ);
 
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const std::size_t quads = n_byte_groups / 4;
@@ -322,11 +511,25 @@ void score_queries_permute_dot_multi(const QueryPermuteDot* const* pds, std::siz
           _mm_loadu_si128(reinterpret_cast<const __m128i*>(pds[0]->levels.data()))),
       _mm512_set1_epi8(static_cast<char>(0x80)));
 
+  const std::size_t bm_n = global_n_vectors > 0 ? global_n_vectors : (vec_offset + n_vectors);
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t base_vec = b * kBlock;
+    if (hit_bitmaps) {
+      bool any = false;
+      for (std::size_t qi = 0; qi < nq; ++qi) {
+        if (hit_bitmaps[qi] &&
+            block_hit_mask(hit_bitmaps[qi], vec_offset + base_vec, bm_n) != 0) {
+          any = true;
+          break;
+        }
+      }
+      if (!any) {
+        continue;
+      }
+    }
     const std::size_t block_base = b * block_bytes;
-    __m512i acc[8][2];
-    for (std::size_t qi = 0; qi < nq; ++qi) {
+    __m512i acc[NQ][2];
+    for (std::size_t qi = 0; qi < NQ; ++qi) {
       const __m512i z = _mm512_set1_epi32(pds[qi]->zero);
       acc[qi][0] = z;
       acc[qi][1] = z;
@@ -345,12 +548,12 @@ void score_queries_permute_dot_multi(const QueryPermuteDot* const* pds, std::siz
         const __m512i c = _mm512_loadu_si512(
             reinterpret_cast<const __m512i*>(blocked_codes.data() + block_base + q4 * 128 + h * 64));
         const __m512i vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c, m0f));
-        const __m512i vhi =
-            _mm512_shuffle_epi8(levels, _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f));
-        for (std::size_t qi = 0; qi < nq; ++qi) {
+        const __m512i vhi = _mm512_shuffle_epi8(levels, hi_nibbles<kGfni>(c, m0f));
+        for (std::size_t qi = 0; qi < NQ; ++qi) {
           const std::int8_t* wp = pds[qi]->weights.data() + q4 * 8;
-          std::int32_t wlo_i = 0;
-          std::int32_t whi_i = 0;
+          // Unaligned i32 load → LLVM/MSVC fold into vpdpbusd {1to16} (turbovec).
+          std::int32_t wlo_i;
+          std::int32_t whi_i;
           std::memcpy(&wlo_i, wp, 4);
           std::memcpy(&whi_i, wp + 4, 4);
           acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vlo, _mm512_set1_epi32(wlo_i));
@@ -365,8 +568,9 @@ void score_queries_permute_dot_multi(const QueryPermuteDot* const* pds, std::siz
       const __m512 f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[qi][0]), vs, vb);
       const __m512 f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[qi][1]), vs, vb);
       const float off = score_offsets ? score_offsets[qi] : 0.f;
+      const std::uint64_t* bm = hit_bitmaps ? hit_bitmaps[qi] : nullptr;
       flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s[qi], heap_i[qi],
-                       heap_sz[qi], heap_min[qi], heap_mi[qi], id_map, off);
+                       heap_sz[qi], heap_min[qi], heap_mi[qi], id_map, off, bm, vec_offset, bm_n);
     }
   }
 }
@@ -525,7 +729,8 @@ void score_query_permute_dot(const QueryPermuteDot& pd, std::span<const std::uin
                              std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                              float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                              float& heap_min, std::size_t& heap_mi, const std::uint64_t* id_map,
-                             float score_offset) {
+                             float score_offset, const std::uint64_t* hit_bitmap,
+                             std::size_t vec_offset, std::size_t global_n_vectors) {
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
   (void)pd;
@@ -542,10 +747,22 @@ void score_query_permute_dot(const QueryPermuteDot& pd, std::span<const std::uin
   (void)heap_mi;
   (void)id_map;
   (void)score_offset;
+  (void)hit_bitmap;
+  (void)vec_offset;
+  (void)global_n_vectors;
   throw std::logic_error("score_query_permute_dot unavailable on MinGW Win64");
 #else
-  score_query_permute_dot_blk8(pd, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k,
-                               heap_s, heap_i, heap_sz, heap_min, heap_mi, id_map, score_offset);
+  if (have_gfni()) {
+    score_query_permute_dot_blk8<true>(pd, blocked_codes, vec_scales, n_byte_groups, n_vectors,
+                                       n_blocks, k, heap_s, heap_i, heap_sz, heap_min, heap_mi,
+                                       id_map, score_offset, hit_bitmap, vec_offset,
+                                       global_n_vectors);
+  } else {
+    score_query_permute_dot_blk8<false>(pd, blocked_codes, vec_scales, n_byte_groups, n_vectors,
+                                        n_blocks, k, heap_s, heap_i, heap_sz, heap_min, heap_mi,
+                                        id_map, score_offset, hit_bitmap, vec_offset,
+                                        global_n_vectors);
+  }
 #endif
 #else
   (void)pd;
@@ -562,6 +779,9 @@ void score_query_permute_dot(const QueryPermuteDot& pd, std::span<const std::uin
   (void)heap_mi;
   (void)id_map;
   (void)score_offset;
+  (void)hit_bitmap;
+  (void)vec_offset;
+  (void)global_n_vectors;
   throw std::logic_error("score_query_permute_dot is only available on x86_64");
 #endif
 }
@@ -572,7 +792,9 @@ void score_queries_permute_dot(const QueryPermuteDot* const* pds, std::size_t nq
                                std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                                float* const* heap_s, std::uint64_t* const* heap_i,
                                std::size_t* heap_sz, float* heap_min, std::size_t* heap_mi,
-                               const std::uint64_t* id_map, const float* score_offsets) {
+                               const std::uint64_t* id_map, const float* score_offsets,
+                               const std::uint64_t* const* hit_bitmaps, std::size_t vec_offset,
+                               std::size_t global_n_vectors) {
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
   // MinGW Win64: permute-dot kernels miscompile; degrade to classic VNNI via caller.
@@ -591,18 +813,93 @@ void score_queries_permute_dot(const QueryPermuteDot* const* pds, std::size_t nq
   (void)heap_mi;
   (void)id_map;
   (void)score_offsets;
+  (void)hit_bitmaps;
+  (void)vec_offset;
+  (void)global_n_vectors;
   throw std::logic_error("score_queries_permute_dot unavailable on MinGW Win64");
 #else
   if (nq == 1) {
     const float off = score_offsets ? score_offsets[0] : 0.f;
-    score_query_permute_dot_blk8(*pds[0], blocked_codes, vec_scales, n_byte_groups, n_vectors,
-                                 n_blocks, k, heap_s[0], heap_i[0], heap_sz[0], heap_min[0],
-                                 heap_mi[0], id_map, off);
+    const std::uint64_t* bm = hit_bitmaps ? hit_bitmaps[0] : nullptr;
+    if (have_gfni()) {
+      score_query_permute_dot_blk8<true>(*pds[0], blocked_codes, vec_scales, n_byte_groups,
+                                         n_vectors, n_blocks, k, heap_s[0], heap_i[0], heap_sz[0],
+                                         heap_min[0], heap_mi[0], id_map, off, bm, vec_offset,
+                                         global_n_vectors);
+    } else {
+      score_query_permute_dot_blk8<false>(*pds[0], blocked_codes, vec_scales, n_byte_groups,
+                                          n_vectors, n_blocks, k, heap_s[0], heap_i[0], heap_sz[0],
+                                          heap_min[0], heap_mi[0], id_map, off, bm, vec_offset,
+                                          global_n_vectors);
+    }
     return;
   }
-  score_queries_permute_dot_multi(pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors,
-                                  n_blocks, k, heap_s, heap_i, heap_sz, heap_min, heap_mi, id_map,
-                                  score_offsets);
+  // Pad to full NQ so the accumulate loop is compile-time constant (turbovec pad_qi).
+  if (nq > 10) {
+    throw std::invalid_argument("score_queries_permute_dot: nq > 10");
+  }
+  const std::size_t NQ = (nq > 8) ? 10 : 8;
+  const QueryPermuteDot* pad_pds[10];
+  float* pad_heap_s[10];
+  std::uint64_t* pad_heap_i[10];
+  std::size_t pad_heap_sz[10];
+  float pad_heap_min[10];
+  std::size_t pad_heap_mi[10];
+  float pad_offs[10];
+  const std::uint64_t* pad_bm[10];
+  float dummy_s = 0.f;
+  std::uint64_t dummy_i = 0;
+  const std::size_t pad_qi = nq - 1;
+  for (std::size_t i = 0; i < NQ; ++i) {
+    const std::size_t src = (i < nq) ? i : pad_qi;
+    pad_pds[i] = pds[src];
+    if (i < nq) {
+      pad_heap_s[i] = heap_s[i];
+      pad_heap_i[i] = heap_i[i];
+      pad_heap_sz[i] = heap_sz[i];
+      pad_heap_min[i] = heap_min[i];
+      pad_heap_mi[i] = heap_mi[i];
+      pad_bm[i] = hit_bitmaps ? hit_bitmaps[i] : nullptr;
+    } else {
+      pad_heap_s[i] = &dummy_s;
+      pad_heap_i[i] = &dummy_i;
+      pad_heap_sz[i] = 0;
+      pad_heap_min[i] = 0.f;
+      pad_heap_mi[i] = 0;
+      pad_bm[i] = nullptr;
+    }
+    pad_offs[i] = score_offsets ? score_offsets[src] : 0.f;
+  }
+  const float* offs_ptr = score_offsets ? pad_offs : nullptr;
+  const std::uint64_t* const* bm_ptr = hit_bitmaps ? pad_bm : nullptr;
+  if (NQ == 10) {
+    if (have_gfni()) {
+      score_queries_permute_dot_multi<true, 10>(
+          pad_pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k, pad_heap_s,
+          pad_heap_i, pad_heap_sz, pad_heap_min, pad_heap_mi, id_map, offs_ptr, bm_ptr, vec_offset,
+          global_n_vectors);
+    } else {
+      score_queries_permute_dot_multi<false, 10>(
+          pad_pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k, pad_heap_s,
+          pad_heap_i, pad_heap_sz, pad_heap_min, pad_heap_mi, id_map, offs_ptr, bm_ptr, vec_offset,
+          global_n_vectors);
+    }
+  } else if (have_gfni()) {
+    score_queries_permute_dot_multi<true, 8>(
+        pad_pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k, pad_heap_s,
+        pad_heap_i, pad_heap_sz, pad_heap_min, pad_heap_mi, id_map, offs_ptr, bm_ptr, vec_offset,
+        global_n_vectors);
+  } else {
+    score_queries_permute_dot_multi<false, 8>(
+        pad_pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k, pad_heap_s,
+        pad_heap_i, pad_heap_sz, pad_heap_min, pad_heap_mi, id_map, offs_ptr, bm_ptr, vec_offset,
+        global_n_vectors);
+  }
+  for (std::size_t i = 0; i < nq; ++i) {
+    heap_sz[i] = pad_heap_sz[i];
+    heap_min[i] = pad_heap_min[i];
+    heap_mi[i] = pad_heap_mi[i];
+  }
 #endif
 #else
   (void)pds;
@@ -620,6 +917,9 @@ void score_queries_permute_dot(const QueryPermuteDot* const* pds, std::size_t nq
   (void)heap_mi;
   (void)id_map;
   (void)score_offsets;
+  (void)hit_bitmaps;
+  (void)vec_offset;
+  (void)global_n_vectors;
   throw std::logic_error("score_queries_permute_dot is only available on x86_64");
 #endif
 }
@@ -640,6 +940,7 @@ namespace {
 
 /// Single-query threshold: BLK=8 streams + depth-8 prefetch (matches heap blk8 / turbovec).
 VECTORCACHE_AVX512_FN_THR
+template <bool kGfni>
 void score_query_permute_dot_threshold_blk8(const QueryPermuteDot& pd,
                                             std::span<const std::uint8_t> blocked_codes,
                                             std::span<const float> vec_scales,
@@ -691,8 +992,7 @@ void score_query_permute_dot_threshold_blk8(const QueryPermuteDot& pd,
           const __m512i c = _mm512_loadu_si512(
               reinterpret_cast<const __m512i*>(blocked_codes.data() + block_base + q4 * 128 + h * 64));
           const __m512i vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c, m0f));
-          const __m512i vhi =
-              _mm512_shuffle_epi8(levels, _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f));
+          const __m512i vhi = _mm512_shuffle_epi8(levels, hi_nibbles<kGfni>(c, m0f));
           const std::int8_t* wp = pd.weights.data() + q4 * 8;
           std::int32_t wlo_i = 0;
           std::int32_t whi_i = 0;
@@ -708,7 +1008,8 @@ void score_query_permute_dot_threshold_blk8(const QueryPermuteDot& pd,
       const __m512 f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[sub][0]), vs, vb);
       const __m512 f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[sub][1]), vs, vb);
       if (flush_block_threshold(f0, f1, base_vec, n_vectors, vec_scales.data(), threshold, capacity,
-                                out_scores, out_ids, out_count, id_map, score_offset)) {
+                                out_scores, out_ids, out_count, id_map, score_offset,
+                                /*hit_bitmap=*/nullptr)) {
         return;
       }
     }
@@ -716,7 +1017,9 @@ void score_query_permute_dot_threshold_blk8(const QueryPermuteDot& pd,
 }
 
 /// Multi-query threshold: codes loaded once, BLK=1, depth-32 prefetch (turbovec NQ>1).
+/// Const NQ + pad (turbovec H34): always accumulate all NQ lanes; flush first `nq`.
 VECTORCACHE_AVX512_FN_THR
+template <bool kGfni, std::size_t NQ>
 void score_queries_permute_dot_threshold_multi(const QueryPermuteDot* const* pds, std::size_t nq,
                                                std::span<const std::uint8_t> blocked_codes,
                                                std::span<const float> vec_scales,
@@ -727,8 +1030,9 @@ void score_queries_permute_dot_threshold_multi(const QueryPermuteDot* const* pds
                                                std::size_t* out_counts,
                                                const std::uint64_t* id_map,
                                                const float* score_offsets) {
+  static_assert(NQ == 8 || NQ == 10);
   assert(n_byte_groups % 4 == 0);
-  assert(nq >= 1 && nq <= 8);
+  assert(nq >= 1 && nq <= NQ);
   const bool count_only = out_scores == nullptr;
   constexpr std::size_t kPfQuads = 32;
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
@@ -751,8 +1055,8 @@ void score_queries_permute_dot_threshold_multi(const QueryPermuteDot* const* pds
     if (all_full()) break;
     const std::size_t base_vec = b * kBlock;
     const std::size_t block_base = b * block_bytes;
-    __m512i acc[8][2];
-    for (std::size_t qi = 0; qi < nq; ++qi) {
+    __m512i acc[NQ][2];
+    for (std::size_t qi = 0; qi < NQ; ++qi) {
       const __m512i z = _mm512_set1_epi32(pds[qi]->zero);
       acc[qi][0] = z;
       acc[qi][1] = z;
@@ -770,13 +1074,12 @@ void score_queries_permute_dot_threshold_multi(const QueryPermuteDot* const* pds
         const __m512i c = _mm512_loadu_si512(
             reinterpret_cast<const __m512i*>(blocked_codes.data() + block_base + q4 * 128 + h * 64));
         const __m512i vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c, m0f));
-        const __m512i vhi =
-            _mm512_shuffle_epi8(levels, _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f));
-        for (std::size_t qi = 0; qi < nq; ++qi) {
-          if (!count_only && out_counts[qi] >= capacity) continue;
+        const __m512i vhi = _mm512_shuffle_epi8(levels, hi_nibbles<kGfni>(c, m0f));
+        // Always score all NQ padded lanes (turbovec); capacity gated at block level.
+        for (std::size_t qi = 0; qi < NQ; ++qi) {
           const std::int8_t* wp = pds[qi]->weights.data() + q4 * 8;
-          std::int32_t wlo_i = 0;
-          std::int32_t whi_i = 0;
+          std::int32_t wlo_i;
+          std::int32_t whi_i;
           std::memcpy(&wlo_i, wp, 4);
           std::memcpy(&whi_i, wp + 4, 4);
           acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vlo, _mm512_set1_epi32(wlo_i));
@@ -794,7 +1097,8 @@ void score_queries_permute_dot_threshold_multi(const QueryPermuteDot* const* pds
       float* scores_qi = count_only ? nullptr : out_scores[qi];
       std::uint64_t* ids_qi = count_only ? nullptr : out_ids[qi];
       flush_block_threshold(f0, f1, base_vec, n_vectors, vec_scales.data(), threshold, capacity,
-                            scores_qi, ids_qi, &out_counts[qi], id_map, off);
+                            scores_qi, ids_qi, &out_counts[qi], id_map, off,
+                            /*hit_bitmap=*/nullptr);
     }
   }
 }
@@ -870,7 +1174,8 @@ void score_query_vnni_threshold_impl(QueryLutView lut, std::span<const std::uint
       const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
       const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
       if (flush_block_threshold(f0, f1, base_vec, n_vectors, vec_scales.data(), threshold, capacity,
-                                out_scores, out_ids, out_count, id_map, score_offset)) {
+                                out_scores, out_ids, out_count, id_map, score_offset,
+                                /*hit_bitmap=*/nullptr)) {
         return;
       }
     }
@@ -900,7 +1205,8 @@ void score_query_vnni_threshold_impl(QueryLutView lut, std::span<const std::uint
     const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
     const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
     if (flush_block_threshold(f0, f1, base_vec, n_vectors, vec_scales.data(), threshold, capacity,
-                              out_scores, out_ids, out_count, id_map, score_offset)) {
+                              out_scores, out_ids, out_count, id_map, score_offset,
+                              /*hit_bitmap=*/nullptr)) {
       return;
     }
   }
@@ -916,9 +1222,8 @@ void score_queries_vnni_threshold_multi(const std::uint8_t* const* split_luts,
                                         std::uint64_t* const* out_ids, std::size_t* out_counts,
                                         const std::uint64_t* id_map, const float* score_offsets) {
   assert(n_byte_groups % 4 == 0);
-  assert(nq >= 1 && nq <= 8);
+  assert(nq >= 1 && nq <= 10);
   const bool count_only = out_scores == nullptr;
-  constexpr std::size_t kPfQuads = 32;
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const __m512i kpos = _mm512_set1_epi32(static_cast<int>(0x30201000u));
   const __m512i ones = _mm512_set1_epi8(1);
@@ -937,21 +1242,14 @@ void score_queries_vnni_threshold_multi(const std::uint8_t* const* split_luts,
     if (all_full()) break;
     const std::size_t base_vec = b * kBlock;
     const std::size_t block_base = b * block_bytes;
-    __m512i acc[8][2];
+    __m512i acc[10][2];
     for (std::size_t qi = 0; qi < nq; ++qi) {
       acc[qi][0] = _mm512_setzero_si512();
       acc[qi][1] = _mm512_setzero_si512();
     }
     for (std::size_t q4 = 0; q4 < quads; ++q4) {
       for (std::size_t h = 0; h < 2; ++h) {
-        const std::size_t pf = block_base + (q4 + kPfQuads) * 128 + h * 64;
-        if (pf + 64 <= blocked_codes.size()) {
-#if defined(_MSC_VER)
-          _mm_prefetch(reinterpret_cast<const char*>(blocked_codes.data() + pf), _MM_HINT_T0);
-#else
-          __builtin_prefetch(blocked_codes.data() + pf, 0, 3);
-#endif
-        }
+        // turbovec multi VNNI: no software prefetch (NQ>1).
         const __m512i c = _mm512_loadu_si512(
             reinterpret_cast<const __m512i*>(blocked_codes.data() + block_base + q4 * 128 + h * 64));
         const __m512i ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
@@ -977,7 +1275,8 @@ void score_queries_vnni_threshold_multi(const std::uint8_t* const* split_luts,
       float* scores_qi = count_only ? nullptr : out_scores[qi];
       std::uint64_t* ids_qi = count_only ? nullptr : out_ids[qi];
       flush_block_threshold(f0, f1, base_vec, n_vectors, vec_scales.data(), threshold, capacity,
-                            scores_qi, ids_qi, &out_counts[qi], id_map, off);
+                            scores_qi, ids_qi, &out_counts[qi], id_map, off,
+                            /*hit_bitmap=*/nullptr);
     }
   }
 }
@@ -1011,9 +1310,15 @@ void score_query_permute_dot_threshold_fill(const QueryPermuteDot& pd,
   (void)score_offset;
   throw std::logic_error("score_query_permute_dot_threshold_fill unavailable on MinGW Win64");
 #else
-  score_query_permute_dot_threshold_blk8(pd, blocked_codes, vec_scales, n_byte_groups, n_vectors,
-                                         n_blocks, threshold, capacity, out_scores, out_ids,
-                                         out_count, id_map, score_offset);
+  if (have_gfni()) {
+    score_query_permute_dot_threshold_blk8<true>(
+        pd, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, threshold, capacity,
+        out_scores, out_ids, out_count, id_map, score_offset);
+  } else {
+    score_query_permute_dot_threshold_blk8<false>(
+        pd, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, threshold, capacity,
+        out_scores, out_ids, out_count, id_map, score_offset);
+  }
 #endif
 #else
   (void)pd;
@@ -1090,8 +1395,8 @@ void score_queries_permute_dot_threshold_fill(const QueryPermuteDot* const* pds,
                                               const std::uint64_t* id_map,
                                               const float* score_offsets) {
   if (nq == 0) return;
-  if (nq > 8) {
-    throw std::invalid_argument("score_queries_permute_dot_threshold_fill: nq > 8");
+  if (nq > 10) {
+    throw std::invalid_argument("score_queries_permute_dot_threshold_fill: nq > 10");
   }
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
@@ -1114,14 +1419,66 @@ void score_queries_permute_dot_threshold_fill(const QueryPermuteDot* const* pds,
     const float off = score_offsets ? score_offsets[0] : 0.f;
     float* scores0 = out_scores ? out_scores[0] : nullptr;
     std::uint64_t* ids0 = out_ids ? out_ids[0] : nullptr;
-    score_query_permute_dot_threshold_blk8(*pds[0], blocked_codes, vec_scales, n_byte_groups,
-                                           n_vectors, n_blocks, threshold, capacity, scores0, ids0,
-                                           &out_counts[0], id_map, off);
+    if (have_gfni()) {
+      score_query_permute_dot_threshold_blk8<true>(
+          *pds[0], blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, threshold,
+          capacity, scores0, ids0, &out_counts[0], id_map, off);
+    } else {
+      score_query_permute_dot_threshold_blk8<false>(
+          *pds[0], blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, threshold,
+          capacity, scores0, ids0, &out_counts[0], id_map, off);
+    }
     return;
   }
-  score_queries_permute_dot_threshold_multi(pds, nq, blocked_codes, vec_scales, n_byte_groups,
-                                            n_vectors, n_blocks, threshold, capacity, out_scores,
-                                            out_ids, out_counts, id_map, score_offsets);
+  // Pad to full NQ (turbovec pad_qi / H34).
+  const std::size_t NQ = (nq > 8) ? 10 : 8;
+  const QueryPermuteDot* pad_pds[10];
+  float* pad_scores[10];
+  std::uint64_t* pad_ids[10];
+  std::size_t pad_counts[10] = {};
+  float pad_offs[10];
+  float dummy_score = 0.f;
+  std::uint64_t dummy_id = 0;
+  const std::size_t pad_qi = nq - 1;
+  for (std::size_t i = 0; i < NQ; ++i) {
+    const std::size_t src = (i < nq) ? i : pad_qi;
+    pad_pds[i] = pds[src];
+    if (i < nq) {
+      pad_scores[i] = out_scores ? out_scores[i] : nullptr;
+      pad_ids[i] = out_ids ? out_ids[i] : nullptr;
+      pad_counts[i] = out_counts[i];
+    } else {
+      pad_scores[i] = &dummy_score;
+      pad_ids[i] = &dummy_id;
+      pad_counts[i] = 0;
+    }
+    pad_offs[i] = score_offsets ? score_offsets[src] : 0.f;
+  }
+  float* const* scores_arg = out_scores ? pad_scores : nullptr;
+  std::uint64_t* const* ids_arg = out_ids ? pad_ids : nullptr;
+  const float* offs_ptr = score_offsets ? pad_offs : nullptr;
+  if (NQ == 10) {
+    if (have_gfni()) {
+      score_queries_permute_dot_threshold_multi<true, 10>(
+          pad_pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, threshold,
+          capacity, scores_arg, ids_arg, pad_counts, id_map, offs_ptr);
+    } else {
+      score_queries_permute_dot_threshold_multi<false, 10>(
+          pad_pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, threshold,
+          capacity, scores_arg, ids_arg, pad_counts, id_map, offs_ptr);
+    }
+  } else if (have_gfni()) {
+    score_queries_permute_dot_threshold_multi<true, 8>(
+        pad_pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, threshold,
+        capacity, scores_arg, ids_arg, pad_counts, id_map, offs_ptr);
+  } else {
+    score_queries_permute_dot_threshold_multi<false, 8>(
+        pad_pds, nq, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, threshold,
+        capacity, scores_arg, ids_arg, pad_counts, id_map, offs_ptr);
+  }
+  for (std::size_t i = 0; i < nq; ++i) {
+    out_counts[i] = pad_counts[i];
+  }
 #endif
 #else
   (void)pds;
@@ -1150,8 +1507,8 @@ void score_queries_vnni_threshold_fill(const std::uint8_t* const* split_luts,
                                        std::uint64_t* const* out_ids, std::size_t* out_counts,
                                        const std::uint64_t* id_map, const float* score_offsets) {
   if (nq == 0) return;
-  if (nq > 8) {
-    throw std::invalid_argument("score_queries_vnni_threshold_fill: nq > 8");
+  if (nq > 10) {
+    throw std::invalid_argument("score_queries_vnni_threshold_fill: nq > 10");
   }
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)

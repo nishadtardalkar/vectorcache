@@ -574,14 +574,28 @@ int main(int argc, char** argv) {
     };
     const double project_q =
         median_of([](const vectorcache::LandmarkStageTimings& s) { return s.project_ms; });
+    const double rotate_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rotate_ms; });
+    const double lm_proj_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.landmark_project_ms; });
     const double sl_prep_q =
         median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_prep_ms; });
     const double sl_scan_q =
         median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_scan_ms; });
+    const double sl_buf_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_buf_ms; });
+    const double sl_kern_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_kernel_ms; });
+    const double sl_copy_cpu_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_copy_ms; });
     const double rr_prep_q =
         median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_prep_ms; });
     const double rr_q =
         median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_ms; });
+    const double rr_score_cpu_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_score_ms; });
+    const double rr_sel_cpu_q =
+        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_select_ms; });
     auto median_raw = [&](auto getter) {
       std::vector<double> vals;
       vals.reserve(run_stages.size());
@@ -593,6 +607,12 @@ int main(int argc, char** argv) {
         median_raw([](const vectorcache::LandmarkStageTimings& s) { return s.mean_shortlist; });
     const double max_sl =
         median_raw([](const vectorcache::LandmarkStageTimings& s) { return s.max_shortlist; });
+    // Score/select are thread-summed CPU-ms; scale to wall rerank_ms.
+    const double rr_cpu = rr_score_cpu_q + rr_sel_cpu_q;
+    const double rr_score_q =
+        (rr_cpu > 0.0 && rr_q > 0.0) ? rr_q * (rr_score_cpu_q / rr_cpu) : 0.0;
+    const double rr_sel_q = (rr_cpu > 0.0 && rr_q > 0.0) ? rr_q * (rr_sel_cpu_q / rr_cpu) : 0.0;
+    (void)sl_copy_cpu_q;
     std::cout << "stage_ms_per_query:"
               << " project=" << project_q << " shortlist_prep=" << sl_prep_q
               << " shortlist_scan=" << sl_scan_q << " rerank_prep=" << rr_prep_q
@@ -600,6 +620,10 @@ int main(int argc, char** argv) {
               << " (shortlist_total=" << (sl_prep_q + sl_scan_q)
               << " stage1=" << (project_q + sl_prep_q + sl_scan_q) << ")"
               << " mean_shortlist=" << mean_sl << " max_shortlist=" << max_sl << "\n";
+    std::cout << "kernel_ms_per_query:"
+              << " rotate=" << rotate_q << " landmark_project=" << lm_proj_q
+              << " shortlist_buf=" << sl_buf_q << " shortlist_kernel=" << sl_kern_q
+              << " rerank_score=" << rr_score_q << " rerank_select=" << rr_sel_q << "\n";
 
     if (recall) {
       ExactTopkCacheKey cache_key;
