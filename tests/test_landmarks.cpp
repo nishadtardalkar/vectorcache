@@ -28,7 +28,7 @@ TEST(Landmarks, OrthonormalColumns) {
   }
 }
 
-TEST(Landmarks, Int8ProjectionCloseToFloat) {
+TEST(Landmarks, Q4ProjectionCloseToFloat) {
   constexpr std::size_t dim = 128;
   constexpr std::size_t m = 96;
   constexpr std::size_t nq = 4;
@@ -37,6 +37,7 @@ TEST(Landmarks, Int8ProjectionCloseToFloat) {
   ASSERT_EQ(Lq.m, m);
   ASSERT_EQ(Lq.dim, dim);
   ASSERT_GE(Lq.dim_pad, dim);
+  ASSERT_EQ(Lq.codes.size(), (Lq.dim_pad / 2) * m);
 
   std::mt19937 rng(3);
   std::normal_distribution<float> dist(0.f, 1.f);
@@ -55,7 +56,7 @@ TEST(Landmarks, Int8ProjectionCloseToFloat) {
   }
 
   std::vector<float> approx(nq * m, 0.f);
-  vectorcache::project_onto_landmarks_i8(q.data(), nq, dim, Lq, approx.data(), m);
+  vectorcache::project_onto_landmarks_q4(q.data(), nq, dim, Lq, approx.data(), m);
 
   double num = 0.0;
   double den = 0.0;
@@ -66,5 +67,5 @@ TEST(Landmarks, Int8ProjectionCloseToFloat) {
     den += e * e;
   }
   const double rel = std::sqrt(num / std::max(den, 1e-30));
-  EXPECT_LT(rel, 0.05) << "rel_l2=" << rel;
+  EXPECT_LT(rel, 0.15) << "rel_l2=" << rel;
 }

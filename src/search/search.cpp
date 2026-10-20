@@ -1083,8 +1083,8 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       std::copy(row.begin(), row.end(), q_rot.begin() + static_cast<std::ptrdiff_t>(qis * dim));
     }
   }
-  project_onto_landmarks_i8(q_rot.data(), nq, dim, landmarks, q_land.data(), scan_dim);
-  // ||q_perp||^2 ≈ ||q_rot||^2 - ||q_L||^2 (int8 landmark projection).
+  project_onto_landmarks_q4(q_rot.data(), nq, dim, landmarks, q_land.data(), scan_dim);
+  // ||q_perp||^2 ≈ ||q_rot||^2 - ||q_L||^2 (4-bit landmark projection).
   for (std::size_t qi = 0; qi < nq; ++qi) {
     double q2 = 0.0;
     double l2 = 0.0;

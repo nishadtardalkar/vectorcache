@@ -117,7 +117,7 @@ PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, 
 PreparedQueries prepare_from_rows(std::span<const float> rows, std::size_t nq, std::size_t dim,
                                   std::span<const float> centroids, std::size_t bits);
 
-/// FWHT → int8 landmark project → FastScan top-k with residual-energy bound.
+/// FWHT → 4-bit landmark project → FastScan top-k with residual-energy bound.
 /// Score = s_L + ‖q_⊥‖·‖r_i‖. No full-dim re-rank.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
                                      std::size_t k, const QuantizedLandmarks& landmarks,

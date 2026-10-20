@@ -50,7 +50,7 @@ class LandmarkIndex {
   std::vector<float> lm_boundaries_;    // landmark-space FastScan quant (scan_bits)
   std::vector<float> lm_centroids_;
   std::vector<float> landmark_basis_;       // dim * m float (ingest / residual)
-  QuantizedLandmarks landmark_basis_i8_;    // int8 query projection
+  QuantizedLandmarks landmark_basis_q4_;    // 4-bit packed query projection
   std::vector<float> db_unit_;              // n * dim (scratch until prepare)
   std::vector<float> landmark_rows_;   // n * scan_dim (row-major before prepare)
   std::vector<float> residual_norms_;  // ‖r‖ of (α·ŷ) orthogonal to landmarks

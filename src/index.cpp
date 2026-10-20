@@ -77,7 +77,7 @@ LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t scan_bits, std::size_t
   lm_boundaries_ = std::move(lm_cb.first);
   lm_centroids_ = std::move(lm_cb.second);
   landmark_basis_ = make_ortho_landmarks(dim_, n_landmarks_, landmark_seed_);
-  landmark_basis_i8_ = quantize_landmarks(landmark_basis_, dim_, n_landmarks_);
+  landmark_basis_q4_ = quantize_landmarks(landmark_basis_, dim_, n_landmarks_);
   rotate_scratch_.resize(dim_);
 }
 
@@ -182,7 +182,7 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
   }
   const std::size_t nq = queries.size() / dim_;
   const std::size_t kk = std::min(k, n_vectors_);
-  return search_landmark_rerank(queries, nq, dim_, kk, landmark_basis_i8_, scan_dim_, lm_centroids_,
+  return search_landmark_rerank(queries, nq, dim_, kk, landmark_basis_q4_, scan_dim_, lm_centroids_,
                                 scan_bits_, blocked_codes_, n_blocks_, scales_, residual_norms_,
                                 rotation_, scale_resid_);
 }
