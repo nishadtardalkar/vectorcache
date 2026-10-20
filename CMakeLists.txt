@@ -49,8 +49,10 @@ add_library(vectorcache ${VECTORCACHE_SOURCES})
 target_include_directories(vectorcache PUBLIC include)
 target_compile_features(vectorcache PUBLIC cxx_std_20)
 
-target_include_directories(vectorcache PRIVATE ${VECTORCACHE_CBLAS_INCLUDE_DIR})
+target_include_directories(vectorcache PRIVATE "${VECTORCACHE_CBLAS_INCLUDE_DIR}")
 target_link_libraries(vectorcache PUBLIC ${VECTORCACHE_BLAS_LIBRARIES})
+# Imported BLAS targets may already carry includes; keep an explicit -I as well
+# so #include <cblas.h> works when only a raw .so path was found.
 
 if(MSVC)
   target_compile_options(vectorcache PRIVATE /W4 /arch:AVX2)

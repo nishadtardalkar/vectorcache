@@ -69,6 +69,20 @@ if ! load_module "$OPENBLAS_MOD"; then
   fi
 fi
 # Propagate module prefixes so cmake/VectorcacheBlas.cmake can find cblas.h.
+# Modules often only set CPATH / LIBRARY_PATH — derive OPENBLAS_ROOT from those.
+_vc_set_openblas_root_from_cblas() {
+  local cblas="$1"
+  [[ -f "$cblas" ]] || return 1
+  local inc root
+  inc="$(cd "$(dirname "$cblas")" && pwd)"
+  root="$(cd "$inc/.." && pwd)"
+  if [[ -f "$root/include/cblas.h" ]]; then
+    export OPENBLAS_ROOT="$root"
+  else
+    export OPENBLAS_ROOT="$inc"
+  fi
+  return 0
+}
 if [[ -z "${OPENBLAS_ROOT:-}" ]]; then
   for _ob in /usr /usr/local /opt/OpenBLAS \
       ${OPENBLAS_DIR:-} ${OpenBLAS_DIR:-} ${OPENBLAS_HOME:-}; do
@@ -79,10 +93,23 @@ if [[ -z "${OPENBLAS_ROOT:-}" ]]; then
   done
   unset _ob
 fi
-# Some OpenBLAS modules only set LIBRARY_PATH / CPATH.
-if [[ -z "${OPENBLAS_ROOT:-}" && -n "${LIBRARY_PATH:-}" ]]; then
-  IFS=':' read -r -a _vc_lib_paths <<< "$LIBRARY_PATH"
+if [[ -z "${OPENBLAS_ROOT:-}" ]]; then
+  IFS=':' read -r -a _vc_inc_paths <<< "${CPATH:-}:${C_INCLUDE_PATH:-}:${CPLUS_INCLUDE_PATH:-}"
+  for _inc in "${_vc_inc_paths[@]}"; do
+    [[ -n "$_inc" ]] || continue
+    if [[ -f "$_inc/cblas.h" ]]; then
+      _vc_set_openblas_root_from_cblas "$_inc/cblas.h" && break
+    fi
+    if [[ -f "$_inc/openblas/cblas.h" ]]; then
+      _vc_set_openblas_root_from_cblas "$_inc/openblas/cblas.h" && break
+    fi
+  done
+  unset _vc_inc_paths _inc
+fi
+if [[ -z "${OPENBLAS_ROOT:-}" && -n "${LIBRARY_PATH:-}${LD_LIBRARY_PATH:-}" ]]; then
+  IFS=':' read -r -a _vc_lib_paths <<< "${LIBRARY_PATH:-}:${LD_LIBRARY_PATH:-}"
   for _libdir in "${_vc_lib_paths[@]}"; do
+    [[ -n "$_libdir" ]] || continue
     _cand="$(cd "$_libdir/.." 2>/dev/null && pwd)"
     if [[ -n "$_cand" && -f "$_cand/include/cblas.h" ]]; then
       export OPENBLAS_ROOT="$_cand"
@@ -91,6 +118,10 @@ if [[ -z "${OPENBLAS_ROOT:-}" && -n "${LIBRARY_PATH:-}" ]]; then
   done
   unset _vc_lib_paths _libdir _cand
 fi
+if [[ -n "${OPENBLAS_ROOT:-}" ]]; then
+  echo "vectorcache: OPENBLAS_ROOT=${OPENBLAS_ROOT}" >&2
+fi
+unset -f _vc_set_openblas_root_from_cblas
 
 # HDF5 modules often load PrgEnv-intel, but Intel icpx cannot compile libstdc++
 # <variant> (used by Arrow) against GCC headers — pin GCC for the whole build.
