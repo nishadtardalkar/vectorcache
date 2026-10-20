@@ -40,12 +40,6 @@ inline std::uint32_t block_hit_mask(const std::uint64_t* bits, std::size_t base,
 /// for each block of kBlock vectors: for each landmark dim, kBlock floats (SoA).
 std::vector<float> pack_landmark_blocks(std::span<const float> rows, std::size_t n, std::size_t m);
 
-/// Score one query landmark vector against blocked DB; keep top-`shortlist` (min-heap).
-void landmark_shortlist_scan(std::span<const float> q_landmarks, std::size_t m,
-                             std::span<const float> blocked, std::size_t n_vectors,
-                             std::size_t n_blocks, std::size_t shortlist, float* heap_s,
-                             std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min);
-
 /// Pass-2: walk flat full-dim codes in vector order; skip empty bitmap blocks; score only
 /// vectors with bit set; write top-k into out.
 void quantized_rerank_from_bitmap(std::span<const std::uint8_t> lut_bytes, float lut_scale,

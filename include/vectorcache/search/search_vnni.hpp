@@ -88,57 +88,5 @@ void score_queries_permute_dot(const QueryPermuteDot* const* pds, std::size_t nq
                                const float* residual_scales = nullptr,
                                const float* scale_resid = nullptr);
 
-/// Threshold shortlist: keep score >= threshold into a fixed buffer (capacity).
-/// If `out_scores` is null, only count hits (no early-stop). Capacity 0 with non-null outs is a no-op.
-/// Single-query path uses BLK=8 interleaved streams + depth-8 prefetch (turbovec nq=1).
-void score_query_permute_dot_threshold_fill(const QueryPermuteDot& pd,
-                                            std::span<const std::uint8_t> blocked_codes,
-                                            std::span<const float> vec_scales,
-                                            std::size_t n_byte_groups, std::size_t n_vectors,
-                                            std::size_t n_blocks, float threshold,
-                                            std::size_t capacity, float* out_scores,
-                                            std::uint64_t* out_ids, std::size_t* out_count,
-                                            const std::uint64_t* id_map = nullptr,
-                                            float score_offset = 0.f,
-                                            const float* residual_norms = nullptr,
-                                            float residual_scale = 0.f);
-
-void score_query_vnni_threshold_fill(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
-                                     std::span<const float> vec_scales, std::size_t n_byte_groups,
-                                     std::size_t n_vectors, std::size_t n_blocks, float threshold,
-                                     std::size_t capacity, float* out_scores,
-                                     std::uint64_t* out_ids, std::size_t* out_count,
-                                     float bias_corr = 0.f, const std::uint64_t* id_map = nullptr,
-                                     float score_offset = 0.f,
-                                     const float* residual_norms = nullptr,
-                                     float residual_scale = 0.f);
-
-/// Multi-query threshold fill (nq ∈ [1, 10]): one codes stream shared across the batch.
-/// `nq==1` uses the BLK=8 single-query kernel; `nq>1` uses BLK=1 (permute-dot PF=32;
-/// classic VNNI: no software prefetch, matching turbovec).
-/// Optional `residual_norms` + per-query `residual_scales`: score += scale[qi]*‖r_i‖ (landmark residual bound).
-void score_queries_permute_dot_threshold_fill(const QueryPermuteDot* const* pds, std::size_t nq,
-                                              std::span<const std::uint8_t> blocked_codes,
-                                              std::span<const float> vec_scales,
-                                              std::size_t n_byte_groups, std::size_t n_vectors,
-                                              std::size_t n_blocks, float threshold,
-                                              std::size_t capacity, float* const* out_scores,
-                                              std::uint64_t* const* out_ids, std::size_t* out_counts,
-                                              const std::uint64_t* id_map = nullptr,
-                                              const float* score_offsets = nullptr,
-                                              const float* residual_norms = nullptr,
-                                              const float* residual_scales = nullptr);
-
-void score_queries_vnni_threshold_fill(const std::uint8_t* const* split_luts,
-                                       const float* lut_scales, const float* lut_biases,
-                                       std::size_t nq, std::span<const std::uint8_t> blocked_codes,
-                                       std::span<const float> vec_scales, std::size_t n_byte_groups,
-                                       std::size_t n_vectors, std::size_t n_blocks, float threshold,
-                                       std::size_t capacity, float* const* out_scores,
-                                       std::uint64_t* const* out_ids, std::size_t* out_counts,
-                                       const std::uint64_t* id_map = nullptr,
-                                       const float* score_offsets = nullptr,
-                                       const float* residual_norms = nullptr,
-                                       const float* residual_scales = nullptr);
-
 }  // namespace vectorcache
+

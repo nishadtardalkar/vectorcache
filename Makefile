@@ -16,9 +16,7 @@ SPLIT         ?=
 LIMIT         ?= 100000
 BITS          ?= 4
 RERANK_BITS   ?=
-LANDMARKS     ?= 96
-SHORTLIST     ?= 1024
-SCORE_THRESHOLD ?=
+LANDMARKS     ?= 1024
 QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
 K             ?= 64
@@ -60,8 +58,6 @@ BENCH_COMMON_ARGS = \
 	$(call opt_arg,BITS,bits) \
 	$(call opt_arg,RERANK_BITS,rerank-bits) \
 	$(call opt_arg,LANDMARKS,landmarks) \
-	$(call opt_arg,SHORTLIST,shortlist) \
-	$(call opt_arg,SCORE_THRESHOLD,score-threshold) \
 	$(BENCH_EXTRA_ARGS)
 
 QUERY_BENCH_ARGS = \
@@ -93,9 +89,7 @@ help:
 	@echo "  BITS            --bits / --scan-bits landmark FastScan (default $(BITS); 2-4)"
 	@echo "  RERANK_BITS     --rerank-bits full-dim re-rank (default = BITS; 2-4)"
 	@echo "  LANDMARKS       --landmarks (default $(LANDMARKS))"
-	@echo "  SHORTLIST       --shortlist (default $(SHORTLIST); max cap with SCORE_THRESHOLD)"
-	@echo "  SCORE_THRESHOLD --score-threshold landmark keep-if-score>=T (disables top-S heap)"
-	@echo "  K               --k final top-k after quantized re-rank (default $(K))"
+	@echo "  K               --k top-k heap size (default $(K))"
 	@echo "  QUERY_LIMIT     --query-limit"
 	@echo "  QUERY_SPLIT     --query-split (test for glove/sift1m; holdout for openai)"
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
@@ -106,8 +100,8 @@ help:
 	@echo "Example: make compute"
 	@echo "Example: make compute DATASET=openai-1536 BITS=2 K=64"
 	@echo "Example: make compute DATASET=sift1m QUERY_LIMIT=10000"
-	@echo "Example: make compute LANDMARKS=64 SHORTLIST=8192 K=64 RECALL=1"
-	@echo "Example: make compute BITS=2 RERANK_BITS=4 LANDMARKS=96 SHORTLIST=1024"
+	@echo "Example: make compute LANDMARKS=512 K=64 RECALL=1"
+	@echo "Example: make compute BITS=2 LANDMARKS=1024 K=64"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 
 login: $(LOGIN_READY)

@@ -2,15 +2,10 @@
 
 #include <algorithm>
 #include <bit>
-#include <cstring>
 #include <limits>
+#include <vector>
 
 #include "vectorcache/search/topk_heap.hpp"
-
-#if defined(__AVX2__) || defined(_MSC_VER)
-#include <immintrin.h>
-#define VECTORCACHE_LANDMARK_AVX2 1
-#endif
 
 namespace vectorcache {
 
@@ -31,55 +26,6 @@ std::vector<float> pack_landmark_blocks(std::span<const float> rows, std::size_t
     }
   }
   return blocked;
-}
-
-void landmark_shortlist_scan(std::span<const float> q_landmarks, std::size_t m,
-                             std::span<const float> blocked, std::size_t n_vectors,
-                             std::size_t n_blocks, std::size_t shortlist, float* heap_s,
-                             std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min) {
-  heap_sz = 0;
-  heap_min = -std::numeric_limits<float>::infinity();
-  std::size_t heap_mi = 0;
-
-  for (std::size_t b = 0; b < n_blocks; ++b) {
-    const float* blk = blocked.data() + b * m * kBlock;
-    alignas(32) float scores[kBlock];
-#if VECTORCACHE_LANDMARK_AVX2
-    __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
-    __m256 acc2 = _mm256_setzero_ps();
-    __m256 acc3 = _mm256_setzero_ps();
-    for (std::size_t d = 0; d < m; ++d) {
-      const __m256 qv = _mm256_set1_ps(q_landmarks[d]);
-      const float* col = blk + d * kBlock;
-      acc0 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(col + 0), acc0);
-      acc1 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(col + 8), acc1);
-      acc2 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(col + 16), acc2);
-      acc3 = _mm256_fmadd_ps(qv, _mm256_loadu_ps(col + 24), acc3);
-    }
-    _mm256_storeu_ps(scores + 0, acc0);
-    _mm256_storeu_ps(scores + 8, acc1);
-    _mm256_storeu_ps(scores + 16, acc2);
-    _mm256_storeu_ps(scores + 24, acc3);
-#else
-    std::memset(scores, 0, sizeof(scores));
-    for (std::size_t d = 0; d < m; ++d) {
-      const float qv = q_landmarks[d];
-      const float* col = blk + d * kBlock;
-      for (std::size_t lane = 0; lane < kBlock; ++lane) {
-        scores[lane] += qv * col[lane];
-      }
-    }
-#endif
-    for (std::size_t lane = 0; lane < kBlock; ++lane) {
-      const std::size_t vi = b * kBlock + lane;
-      if (vi >= n_vectors) {
-        break;
-      }
-      heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, shortlist, scores[lane],
-                           static_cast<std::uint64_t>(vi));
-    }
-  }
 }
 
 void quantized_rerank_from_bitmap(std::span<const std::uint8_t> lut_bytes, float lut_scale,

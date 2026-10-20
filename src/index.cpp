@@ -50,14 +50,12 @@ std::size_t pad_scan_dim(std::size_t m) { return (m + 7u) & ~std::size_t{7u}; }
 }  // namespace
 
 LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t scan_bits, std::size_t n_landmarks,
-                             std::size_t shortlist, std::uint64_t landmark_seed,
-                             std::size_t rerank_bits)
+                             std::uint64_t landmark_seed, std::size_t rerank_bits)
     : dim_(dim),
       scan_bits_(scan_bits),
       rerank_bits_(rerank_bits == 0 ? scan_bits : rerank_bits),
       n_landmarks_(n_landmarks),
       scan_dim_(pad_scan_dim(n_landmarks)),
-      shortlist_(shortlist),
       landmark_seed_(landmark_seed),
       rotation_(dim) {
   if (dim == 0 || dim % 8 != 0 || dim > kMaxDim) {
@@ -174,8 +172,7 @@ void LandmarkIndex::prepare() {
   prepared_ = true;
 }
 
-SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t k,
-                                    LandmarkStageTimings* timings, bool shortlist_only) const {
+SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t k) const {
   if (queries.size() % dim_ != 0) {
     throw std::invalid_argument("queries length must be multiple of dim");
   }
@@ -183,12 +180,10 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
     throw std::runtime_error("call prepare() before search");
   }
   const std::size_t nq = queries.size() / dim_;
-  const std::size_t sl = shortlist_ == 0 ? 0 : std::min(shortlist_, n_vectors_);
   const std::size_t kk = std::min(k, n_vectors_);
-  return search_landmark_rerank(queries, nq, dim_, kk, sl, landmark_basis_, n_landmarks_, scan_dim_,
+  return search_landmark_rerank(queries, nq, dim_, kk, landmark_basis_, n_landmarks_, scan_dim_,
                                 lm_centroids_, scan_bits_, blocked_codes_, n_blocks_, scales_,
-                                residual_norms_, rotation_, score_threshold_, timings,
-                                shortlist_only, scale_resid_);
+                                residual_norms_, rotation_, scale_resid_);
 }
 
 }  // namespace vectorcache

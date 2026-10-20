@@ -339,9 +339,7 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
                                 std::span<const std::size_t> query_indices,
                                 const float* residual_norms = nullptr,
                                 const float* residual_scales = nullptr,
-                                LandmarkStageTimings* timings = nullptr,
                                 const float* scale_resid = nullptr) {
-  (void)timings;
   const std::size_t nq = query_indices.empty() ? prep.nq : query_indices.size();
   auto global_qi = [&](std::size_t local_i) -> std::size_t {
     return query_indices.empty() ? local_i : query_indices[local_i];
@@ -902,353 +900,12 @@ PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi) {
 }
 
 
-SearchResults score_prepared_vm_threshold(const PreparedQueries& prep, std::size_t capacity,
-                                          std::span<const std::uint8_t> blocked_codes,
-                                          std::size_t n_blocks, std::span<const float> scales,
-                                          std::span<const std::size_t> query_indices,
-                                          float score_threshold,
-                                          LandmarkStageTimings* timings = nullptr,
-                                          const float* residual_norms = nullptr,
-                                          const float* residual_scales = nullptr) {
-  const std::size_t nq = query_indices.empty() ? prep.nq : query_indices.size();
-  auto global_qi = [&](std::size_t local_i) -> std::size_t {
-    return query_indices.empty() ? local_i : query_indices[local_i];
-  };
-  const std::size_t n_vectors = scales.size();
-  const bool use_pd = prep.backend == SearchBackendKind::VmPermuteDot;
-  const std::size_t n_byte_groups = prep.n_byte_groups;
-
-  SearchResults out;
-  out.nq = nq;
-  out.k = capacity;
-  out.scores.resize_uninitialized(nq * capacity);
-  out.ids.resize_uninitialized(nq * capacity);
-  out.counts.assign(nq, 0);
-  (void)timings;
-  if (nq == 0 || capacity == 0) return out;
-
-#if defined(__x86_64__) || defined(_M_X64)
-  std::size_t n_threads = 1;
-#ifdef _OPENMP
-  n_threads = static_cast<std::size_t>(std::max(1, omp_get_max_threads()));
-#endif
-  const std::size_t nq_batch = nq_batch_for(use_pd, n_threads, nq);
-
-  // turbovec block-parallelizes a *single* query (bandwidth-bound on one core).
-  // Multi-query already has query-batch tiles; merging large threshold buffers
-  // across block ranges is slower than one codes pass per batch.
-  const bool block_parallel = (nq == 1 && n_threads > 1 && single_query_parallelizes(n_vectors));
-  const std::size_t n_quads = (nq + nq_batch - 1) / nq_batch;
-
-  if (!block_parallel) {
-    // Fast path: write straight into `out` (no merge copies).
-#if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
-#pragma omp parallel for schedule(dynamic)
-#endif
-    for (int bi = 0; bi < static_cast<int>(n_quads); ++bi) {
-      const std::size_t qi_start = static_cast<std::size_t>(bi) * nq_batch;
-      const std::size_t batch_nq = std::min(nq_batch, nq - qi_start);
-      float* score_ptrs[kNqBatchWide];
-      std::uint64_t* id_ptrs[kNqBatchWide];
-      std::size_t hit_counts[kNqBatchWide] = {};
-      for (std::size_t i = 0; i < batch_nq; ++i) {
-        score_ptrs[i] = out.scores.data() + (qi_start + i) * capacity;
-        id_ptrs[i] = out.ids.data() + (qi_start + i) * capacity;
-      }
-      if (use_pd) {
-        const QueryPermuteDot* pd_ptrs[kNqBatchWide];
-        for (std::size_t i = 0; i < batch_nq; ++i) {
-          pd_ptrs[i] = &prep.pds[global_qi(qi_start + i)];
-        }
-        const float* rs_batch = nullptr;
-        float rs_local[kNqBatchWide];
-        if (residual_scales != nullptr) {
-          for (std::size_t i = 0; i < batch_nq; ++i) {
-            rs_local[i] = residual_scales[global_qi(qi_start + i)];
-          }
-          rs_batch = rs_local;
-        }
-        score_queries_permute_dot_threshold_fill(
-            pd_ptrs, batch_nq, blocked_codes, scales, n_byte_groups, n_vectors, n_blocks,
-            score_threshold, capacity, score_ptrs, id_ptrs, hit_counts, nullptr, nullptr,
-            residual_norms, rs_batch);
-      } else {
-        const std::uint8_t* lut_ptrs[kNqBatchWide];
-        float lut_scales[kNqBatchWide];
-        float lut_biases[kNqBatchWide];
-        for (std::size_t i = 0; i < batch_nq; ++i) {
-          const std::size_t gqi = global_qi(qi_start + i);
-          lut_ptrs[i] = prep.split_luts[gqi].data();
-          lut_scales[i] = prep.lut_scales[gqi];
-          lut_biases[i] = prep.lut_biases[gqi];
-        }
-        const float* rs_batch = nullptr;
-        float rs_local[kNqBatchWide];
-        if (residual_scales != nullptr) {
-          for (std::size_t i = 0; i < batch_nq; ++i) {
-            rs_local[i] = residual_scales[global_qi(qi_start + i)];
-          }
-          rs_batch = rs_local;
-        }
-        score_queries_vnni_threshold_fill(lut_ptrs, lut_scales, lut_biases, batch_nq, blocked_codes,
-                                          scales, n_byte_groups, n_vectors, n_blocks,
-                                          score_threshold, capacity, score_ptrs, id_ptrs,
-                                          hit_counts, nullptr, nullptr, residual_norms, rs_batch);
-      }
-      for (std::size_t i = 0; i < batch_nq; ++i) {
-        out.counts[qi_start + i] = hit_counts[i];
-      }
-    }
-    return out;
-  }
-
-  // nq==1: turbovec `block_range_stride` — one large range per thread, then collect+sort.
-  const std::size_t blocks_per_range = block_range_stride(n_blocks, n_threads);
-  const std::size_t n_ranges = (n_blocks + blocks_per_range - 1) / blocks_per_range;
-  std::vector<std::vector<TileCand>> per_range(n_ranges);
-#if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
-#pragma omp parallel for schedule(static)
-#endif
-  for (int rs = 0; rs < static_cast<int>(n_ranges); ++rs) {
-    const std::size_t block_start = static_cast<std::size_t>(rs) * blocks_per_range;
-    if (block_start >= n_blocks) continue;
-    const std::size_t block_end = std::min(block_start + blocks_per_range, n_blocks);
-    const std::size_t range_blocks = block_end - block_start;
-    const std::size_t vec_start = block_start * kBlock;
-    const std::size_t range_n = std::min(block_end * kBlock, n_vectors) - vec_start;
-    const std::size_t block_bytes = n_byte_groups * kBlock;
-    auto codes_span = blocked_codes.subspan(block_start * block_bytes, range_blocks * block_bytes);
-    auto scales_span = scales.subspan(vec_start, range_n);
-
-    std::vector<float> scores(capacity);
-    std::vector<std::uint64_t> ids(capacity);
-    std::size_t hit = 0;
-    float* sp = scores.data();
-    std::uint64_t* ip = ids.data();
-    const float* resid_range =
-        residual_norms != nullptr ? residual_norms + vec_start : nullptr;
-    const float rs0 = residual_scales != nullptr ? residual_scales[global_qi(0)] : 0.f;
-    if (use_pd) {
-      const QueryPermuteDot* pd = &prep.pds[global_qi(0)];
-      score_queries_permute_dot_threshold_fill(&pd, 1, codes_span, scales_span, n_byte_groups,
-                                               range_n, range_blocks, score_threshold, capacity,
-                                               &sp, &ip, &hit, nullptr, nullptr, resid_range, &rs0);
-    } else {
-      const std::uint8_t* lp = prep.split_luts[global_qi(0)].data();
-      const float ls = prep.lut_scales[global_qi(0)];
-      const float lb = prep.lut_biases[global_qi(0)];
-      score_queries_vnni_threshold_fill(&lp, &ls, &lb, 1, codes_span, scales_span, n_byte_groups,
-                                        range_n, range_blocks, score_threshold, capacity, &sp, &ip,
-                                        &hit, nullptr, nullptr, resid_range, &rs0);
-    }
-    auto& local = per_range[static_cast<std::size_t>(rs)];
-    local.reserve(hit);
-    for (std::size_t j = 0; j < hit; ++j) {
-      local.push_back(TileCand{scores[j], ids[j] + static_cast<std::uint64_t>(vec_start)});
-    }
-  }
-
-  std::vector<TileCand> merged;
-  std::size_t total = 0;
-  for (const auto& r : per_range) total += r.size();
-  merged.reserve(total);
-  for (auto& r : per_range) {
-    merged.insert(merged.end(), r.begin(), r.end());
-  }
-
-  if (merged.size() > capacity) {
-    std::partial_sort(merged.begin(), merged.begin() + static_cast<std::ptrdiff_t>(capacity),
-                      merged.end(), [](const TileCand& a, const TileCand& b) {
-                        if (a.score != b.score) return a.score > b.score;
-                        return a.id < b.id;
-                      });
-    merged.resize(capacity);
-  } else {
-    std::sort(merged.begin(), merged.end(), [](const TileCand& a, const TileCand& b) {
-      if (a.score != b.score) return a.score > b.score;
-      return a.id < b.id;
-    });
-  }
-  out.counts[0] = merged.size();
-  for (std::size_t j = 0; j < merged.size(); ++j) {
-    out.scores[j] = merged[j].score;
-    out.ids[j] = merged[j].id;
-  }
-  return out;
-#else
-  (void)blocked_codes;
-  (void)n_blocks;
-  (void)score_threshold;
-  (void)use_pd;
-  (void)n_byte_groups;
-  (void)timings;
-  throw std::logic_error("VM threshold shortlist requires x86_64");
-#endif
-}
-
-SearchResults score_prepared_perm0_threshold(const PreparedQueries& prep, std::size_t capacity,
-                                             std::span<const std::uint8_t> blocked_codes,
-                                             std::size_t n_blocks, std::span<const float> scales,
-                                             std::span<const std::size_t> query_indices,
-                                             float score_threshold) {
-  const std::size_t nq = query_indices.empty() ? prep.nq : query_indices.size();
-  auto global_qi = [&](std::size_t local_i) -> std::size_t {
-    return query_indices.empty() ? local_i : query_indices[local_i];
-  };
-  const std::size_t n_vectors = scales.size();
-  const bool use_simd = prep.backend == SearchBackendKind::Avx2;
-  const std::size_t n_byte_groups = prep.n_byte_groups;
-
-  SearchResults out;
-  out.nq = nq;
-  out.k = capacity;
-  out.scores.resize_uninitialized(nq * capacity);
-  out.ids.resize_uninitialized(nq * capacity);
-  out.counts.assign(nq, 0);
-  if (nq == 0 || capacity == 0) return out;
-
-  if (!use_simd) {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
-#endif
-    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-      const std::size_t gqi = global_qi(static_cast<std::size_t>(qi));
-      const auto& lut = prep.luts[gqi];
-      const float bias_corr = prep.bias_corrs.empty() ? 0.f : prep.bias_corrs[gqi];
-      std::size_t count = 0;
-      for (std::size_t b = 0; b < n_blocks && count < capacity; ++b) {
-        const std::size_t base_vec = b * kBlock;
-        for (std::size_t lane = 0; lane < kBlock && count < capacity; ++lane) {
-          const std::size_t vi = base_vec + lane;
-          if (vi >= n_vectors) break;
-          float score = lut.bias + bias_corr;
-          for (std::size_t g = 0; g < n_byte_groups; ++g) {
-            const auto byte_val = static_cast<std::size_t>(
-                read_code(blocked_codes, prep.bits, n_byte_groups, b, g, lane));
-            score += lut.scale * static_cast<float>(lut.uint8_luts[g * 32 + (byte_val >> 4)]);
-            score +=
-                lut.scale * static_cast<float>(lut.uint8_luts[g * 32 + 16 + (byte_val & 0x0F)]);
-          }
-          score *= scales[vi];
-          if (score >= score_threshold) {
-            out.scores[static_cast<std::size_t>(qi) * capacity + count] = score;
-            out.ids[static_cast<std::size_t>(qi) * capacity + count] =
-                static_cast<std::uint64_t>(vi);
-            ++count;
-          }
-        }
-      }
-      out.counts[static_cast<std::size_t>(qi)] = count;
-    }
-    return out;
-  }
-
-#if defined(__x86_64__) || defined(_M_X64)
-  std::size_t n_threads = 1;
-#ifdef _OPENMP
-  n_threads = static_cast<std::size_t>(std::max(1, omp_get_max_threads()));
-#endif
-  // turbovec nq=1 block-parallel covers AVX2/BW too.
-  const bool block_parallel = (nq == 1 && n_threads > 1 && single_query_parallelizes(n_vectors));
-  if (block_parallel) {
-    const std::size_t blocks_per_range = block_range_stride(n_blocks, n_threads);
-    const std::size_t n_ranges = (n_blocks + blocks_per_range - 1) / blocks_per_range;
-    std::vector<std::vector<TileCand>> per_range(n_ranges);
-#if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
-#pragma omp parallel for schedule(static)
-#endif
-    for (int rs = 0; rs < static_cast<int>(n_ranges); ++rs) {
-      const std::size_t block_start = static_cast<std::size_t>(rs) * blocks_per_range;
-      if (block_start >= n_blocks) continue;
-      const std::size_t block_end = std::min(block_start + blocks_per_range, n_blocks);
-      const std::size_t range_blocks = block_end - block_start;
-      const std::size_t vec_start = block_start * kBlock;
-      const std::size_t range_n = std::min(block_end * kBlock, n_vectors) - vec_start;
-      const std::size_t block_bytes = n_byte_groups * kBlock;
-      auto codes_span =
-          blocked_codes.subspan(block_start * block_bytes, range_blocks * block_bytes);
-      auto scales_span = scales.subspan(vec_start, range_n);
-      const std::size_t gqi = global_qi(0);
-      const auto& lut = prep.luts[gqi];
-      QueryLutView view{lut.uint8_luts.data(), lut.scale, lut.bias};
-      const float bc = prep.bias_corrs.empty() ? 0.f : prep.bias_corrs[gqi];
-      std::vector<float> scores(capacity);
-      std::vector<std::uint64_t> ids(capacity);
-      std::size_t hit = 0;
-      score_query_avx2_perm0_threshold_fill(view, codes_span, scales_span, n_byte_groups, range_n,
-                                            range_blocks, score_threshold, capacity, scores.data(),
-                                            ids.data(), &hit, bc, nullptr, 0.f);
-      auto& local = per_range[static_cast<std::size_t>(rs)];
-      local.reserve(hit);
-      for (std::size_t j = 0; j < hit; ++j) {
-        local.push_back(TileCand{scores[j], ids[j] + static_cast<std::uint64_t>(vec_start)});
-      }
-    }
-    std::vector<TileCand> merged;
-    std::size_t total = 0;
-    for (const auto& r : per_range) total += r.size();
-    merged.reserve(total);
-    for (auto& r : per_range) merged.insert(merged.end(), r.begin(), r.end());
-    if (merged.size() > capacity) {
-      std::partial_sort(merged.begin(), merged.begin() + static_cast<std::ptrdiff_t>(capacity),
-                        merged.end(), [](const TileCand& a, const TileCand& b) {
-                          if (a.score != b.score) return a.score > b.score;
-                          return a.id < b.id;
-                        });
-      merged.resize(capacity);
-    } else {
-      std::sort(merged.begin(), merged.end(), [](const TileCand& a, const TileCand& b) {
-        if (a.score != b.score) return a.score > b.score;
-        return a.id < b.id;
-      });
-    }
-    out.counts[0] = merged.size();
-    for (std::size_t j = 0; j < merged.size(); ++j) {
-      out.scores[j] = merged[j].score;
-      out.ids[j] = merged[j].id;
-    }
-    return out;
-  }
-
-  // Query-batch tiles write directly into `out`.
-  const std::size_t n_quads = (nq + kAvx2NqBatch - 1) / kAvx2NqBatch;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
-#endif
-  for (int bi = 0; bi < static_cast<int>(n_quads); ++bi) {
-    const std::size_t qi_start = static_cast<std::size_t>(bi) * kAvx2NqBatch;
-    const std::size_t batch_nq = std::min(kAvx2NqBatch, nq - qi_start);
-    QueryLutView lut_views[kAvx2NqBatch];
-    float bias_corrs[kAvx2NqBatch];
-    float* score_ptrs[kAvx2NqBatch];
-    std::uint64_t* id_ptrs[kAvx2NqBatch];
-    std::size_t hit_counts[kAvx2NqBatch] = {};
-    for (std::size_t i = 0; i < batch_nq; ++i) {
-      const std::size_t gqi = global_qi(qi_start + i);
-      const auto& lut = prep.luts[gqi];
-      lut_views[i] = QueryLutView{lut.uint8_luts.data(), lut.scale, lut.bias};
-      bias_corrs[i] = prep.bias_corrs.empty() ? 0.f : prep.bias_corrs[gqi];
-      score_ptrs[i] = out.scores.data() + (qi_start + i) * capacity;
-      id_ptrs[i] = out.ids.data() + (qi_start + i) * capacity;
-    }
-    score_queries_avx2_perm0_threshold_fill(
-        lut_views, batch_nq, blocked_codes, scales, n_byte_groups, n_vectors, n_blocks,
-        score_threshold, capacity, score_ptrs, id_ptrs, hit_counts, bias_corrs, nullptr, nullptr);
-    for (std::size_t i = 0; i < batch_nq; ++i) {
-      out.counts[qi_start + i] = hit_counts[i];
-    }
-  }
-  return out;
-#else
-  throw std::logic_error("AVX2 threshold shortlist requires x86_64");
-#endif
-}
 
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                              std::span<const float> scales, std::span<const std::uint64_t> id_map,
-                             std::span<const std::size_t> query_indices, float score_threshold,
-                             LandmarkStageTimings* timings, std::span<const float> residual_norms,
+                             std::span<const std::size_t> query_indices,
+                             std::span<const float> residual_norms,
                              std::span<const float> residual_scales,
                              std::span<const float> scale_resid) {
   if (!query_indices.empty()) {
@@ -1283,69 +940,39 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
   const float* scale_resid_ptr = scale_resid.empty() ? nullptr : scale_resid.data();
 
   SearchResults out;
-  if (std::isfinite(score_threshold)) {
-    const std::size_t capacity = k == 0 ? n_vectors : std::min(k, n_vectors);
-    if (prep.backend == SearchBackendKind::VmPermuteDot ||
-        prep.backend == SearchBackendKind::VmVnni) {
-      out = score_prepared_vm_threshold(prep, capacity, blocked_codes, n_blocks, scales,
-                                        query_indices, score_threshold, timings, resid_ptr,
-                                        resid_sc_ptr);
-    } else {
-      out = score_prepared_perm0_threshold(prep, capacity, blocked_codes, n_blocks, scales,
-                                           query_indices, score_threshold);
-      // AVX2 path: apply residual bound after fill (membership was s_L-only).
-      if (resid_ptr != nullptr && resid_sc_ptr != nullptr) {
-        for (std::size_t local = 0; local < out.nq; ++local) {
-          const std::size_t gqi = query_indices.empty() ? local : query_indices[local];
-          const float rs = resid_sc_ptr[gqi];
-          const std::size_t n_cand =
-              out.counts.empty() ? out.k : std::min(out.counts[local], out.k);
-          for (std::size_t j = 0; j < n_cand; ++j) {
-            const std::size_t vi = static_cast<std::size_t>(out.ids[local * out.k + j]);
-            out.scores[local * out.k + j] += rs * resid_ptr[vi];
-          }
-        }
-      }
-      if (timings) {
-      }
-    }
+  const std::size_t effective_k = std::min(k, n_vectors);
+  if (prep.backend == SearchBackendKind::VmPermuteDot ||
+      prep.backend == SearchBackendKind::VmVnni) {
+    out = score_prepared_vm(prep, effective_k, blocked_codes, n_blocks, scales, query_indices,
+                            resid_ptr, resid_sc_ptr, scale_resid_ptr);
   } else {
-    const std::size_t effective_k = std::min(k, n_vectors);
-    if (prep.backend == SearchBackendKind::VmPermuteDot ||
-        prep.backend == SearchBackendKind::VmVnni) {
-      out = score_prepared_vm(prep, effective_k, blocked_codes, n_blocks, scales, query_indices,
-                              resid_ptr, resid_sc_ptr, timings, scale_resid_ptr);
-    } else {
-      out = score_prepared_perm0(prep, effective_k, blocked_codes, n_blocks, scales, query_indices);
-      // AVX2/scalar heap: apply residual after (membership was s_L-only).
-      if (resid_ptr != nullptr && resid_sc_ptr != nullptr) {
-        for (std::size_t local = 0; local < out.nq; ++local) {
-          const std::size_t gqi = query_indices.empty() ? local : query_indices[local];
-          const float rs = resid_sc_ptr[gqi];
-          for (std::size_t j = 0; j < out.k; ++j) {
-            const std::size_t vi = static_cast<std::size_t>(out.ids[local * out.k + j]);
-            if (vi < n_vectors) out.scores[local * out.k + j] += rs * resid_ptr[vi];
-          }
-          // Re-sort after residual correction.
-          std::vector<std::size_t> order(out.k);
-          for (std::size_t j = 0; j < out.k; ++j) order[j] = j;
-          float* sc = out.scores.data() + local * out.k;
-          std::uint64_t* id = out.ids.data() + local * out.k;
-          std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-            if (sc[a] != sc[b]) return sc[a] > sc[b];
-            return id[a] < id[b];
-          });
-          std::vector<float> sc_tmp(out.k);
-          std::vector<std::uint64_t> id_tmp(out.k);
-          for (std::size_t j = 0; j < out.k; ++j) {
-            sc_tmp[j] = sc[order[j]];
-            id_tmp[j] = id[order[j]];
-          }
-          std::copy(sc_tmp.begin(), sc_tmp.end(), sc);
-          std::copy(id_tmp.begin(), id_tmp.end(), id);
+    out = score_prepared_perm0(prep, effective_k, blocked_codes, n_blocks, scales, query_indices);
+    // AVX2/scalar heap: apply residual after (membership was s_L-only).
+    if (resid_ptr != nullptr && resid_sc_ptr != nullptr) {
+      for (std::size_t local = 0; local < out.nq; ++local) {
+        const std::size_t gqi = query_indices.empty() ? local : query_indices[local];
+        const float rs = resid_sc_ptr[gqi];
+        for (std::size_t j = 0; j < out.k; ++j) {
+          const std::size_t vi = static_cast<std::size_t>(out.ids[local * out.k + j]);
+          if (vi < n_vectors) out.scores[local * out.k + j] += rs * resid_ptr[vi];
         }
-      }
-      if (timings) {
+        // Re-sort after residual correction.
+        std::vector<std::size_t> order(out.k);
+        for (std::size_t j = 0; j < out.k; ++j) order[j] = j;
+        float* sc = out.scores.data() + local * out.k;
+        std::uint64_t* id = out.ids.data() + local * out.k;
+        std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+          if (sc[a] != sc[b]) return sc[a] > sc[b];
+          return id[a] < id[b];
+        });
+        std::vector<float> sc_tmp(out.k);
+        std::vector<std::uint64_t> id_tmp(out.k);
+        for (std::size_t j = 0; j < out.k; ++j) {
+          sc_tmp[j] = sc[order[j]];
+          id_tmp[j] = id[order[j]];
+        }
+        std::copy(sc_tmp.begin(), sc_tmp.end(), sc);
+        std::copy(id_tmp.begin(), id_tmp.end(), id);
       }
     }
   }
@@ -1499,21 +1126,19 @@ SearchResults search_flat(std::span<const float> queries, std::size_t nq, std::s
 }
 
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
-                                     std::size_t k, std::size_t shortlist,
-                                     std::span<const float> landmark_basis, std::size_t n_landmarks,
-                                     std::size_t scan_dim, std::span<const float> lm_centroids,
-                                     std::size_t scan_bits, std::span<const std::uint8_t> blocked_codes,
-                                     std::size_t n_blocks, std::span<const float> lm_scales,
+                                     std::size_t k, std::span<const float> landmark_basis,
+                                     std::size_t n_landmarks, std::size_t scan_dim,
+                                     std::span<const float> lm_centroids, std::size_t scan_bits,
+                                     std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                                     std::span<const float> lm_scales,
                                      std::span<const float> residual_norms, const Rotation& rotation,
-                                     float score_threshold, LandmarkStageTimings* timings,
-                                     bool shortlist_only, std::span<const float> scale_resid) {
-
-  SearchResults out;
-  out.nq = nq;
-  out.k = k;
-  out.scores.assign(nq * k, 0.f);
-  out.ids.assign(nq * k, 0);
+                                     std::span<const float> scale_resid) {
   if (nq == 0 || lm_scales.empty() || k == 0) {
+    SearchResults out;
+    out.nq = nq;
+    out.k = k;
+    out.scores.assign(nq * k, 0.f);
+    out.ids.assign(nq * k, 0);
     return out;
   }
   if (scan_dim < n_landmarks || scan_dim % 8 != 0) {
@@ -1528,22 +1153,14 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
   if (!scale_resid.empty() && scale_resid.size() != 2 * lm_scales.size()) {
     throw std::invalid_argument("search_landmark_rerank: scale_resid size mismatch");
   }
-  const bool use_threshold = std::isfinite(score_threshold);
-  if (use_threshold && shortlist == 0 && !shortlist_only) {
-    throw std::invalid_argument(
-        "search_landmark_rerank: shortlist is the mean target "
-        "(buffer capacity = 2xshortlist) and must be > 0 when using score_threshold");
+  if (dim % 8 != 0) {
+    throw std::invalid_argument("search_landmark_rerank: dim must be multiple of 8");
   }
-  if (!use_threshold && shortlist_only) {
-    throw std::invalid_argument(
-        "search_landmark_rerank: shortlist_only requires finite score_threshold");
+  if (landmark_basis.size() < n_landmarks * dim) {
+    throw std::invalid_argument("search_landmark_rerank: landmark_basis too short");
   }
 
   const std::size_t n_vectors = lm_scales.size();
-  // Threshold mode: buffer = 2×shortlist. Heap mode: top-k heap (shortlist unused).
-  const std::size_t sl =
-      use_threshold ? (shortlist == 0 ? n_vectors : std::min(2 * shortlist, n_vectors))
-                    : std::min(k, n_vectors);
   const std::size_t kk = std::min(k, n_vectors);
 
   std::vector<float> q_land(nq * scan_dim, 0.f);
@@ -1567,12 +1184,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       std::copy(row.begin(), row.end(), q_rot.begin() + static_cast<std::ptrdiff_t>(qis * dim));
     }
   }
-  if (dim % 8 != 0) {
-    throw std::invalid_argument("search_landmark_rerank: dim must be multiple of 8");
-  }
-  if (landmark_basis.size() < n_landmarks * dim) {
-    throw std::invalid_argument("search_landmark_rerank: landmark_basis too short");
-  }
   project_onto_landmarks(q_rot.data(), nq, dim, landmark_basis.data(), n_landmarks, q_land.data(),
                          scan_dim);
   // ||q_perp||^2 = ||q_rot||^2 - ||q_L||^2 (orthonormal landmarks).
@@ -1586,155 +1197,11 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     q_perp[qi] = static_cast<float>(std::sqrt(std::max(0.0, q2 - l2)));
   }
   auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
-
-  if (shortlist_only && shortlist == 0) {
-    // Count-only uncapped (tune-mean-shortlist): capacity 0 outs ⇒ hit counts only.
-    std::vector<std::size_t> hit_counts(nq, 0);
-#if defined(__x86_64__) || defined(_M_X64)
-    if (prep.backend == SearchBackendKind::VmPermuteDot ||
-        prep.backend == SearchBackendKind::VmVnni) {
-      const bool use_pd = prep.backend == SearchBackendKind::VmPermuteDot;
-      std::size_t n_threads_co = 1;
-#ifdef _OPENMP
-      n_threads_co = static_cast<std::size_t>(std::max(1, omp_get_max_threads()));
-#endif
-      const std::size_t nq_batch = nq_batch_for(use_pd, n_threads_co, nq);
-      const std::size_t n_quads = (nq + nq_batch - 1) / nq_batch;
-#if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
-#pragma omp parallel for schedule(dynamic)
-#endif
-      for (int bi = 0; bi < static_cast<int>(n_quads); ++bi) {
-        const std::size_t qi_start = static_cast<std::size_t>(bi) * nq_batch;
-        const std::size_t batch_nq = std::min(nq_batch, nq - qi_start);
-        std::size_t local_counts[kNqBatchWide] = {};
-        float rs_local[kNqBatchWide];
-        for (std::size_t i = 0; i < batch_nq; ++i) {
-          rs_local[i] = q_perp[qi_start + i];
-        }
-        if (use_pd) {
-          const QueryPermuteDot* pd_ptrs[kNqBatchWide];
-          for (std::size_t i = 0; i < batch_nq; ++i) {
-            pd_ptrs[i] = &prep.pds[qi_start + i];
-          }
-          score_queries_permute_dot_threshold_fill(
-              pd_ptrs, batch_nq, blocked_codes, lm_scales, prep.n_byte_groups, n_vectors, n_blocks,
-              score_threshold, /*capacity=*/0, /*out_scores=*/nullptr, /*out_ids=*/nullptr,
-              local_counts, nullptr, nullptr, residual_norms.data(), rs_local);
-        } else {
-          const std::uint8_t* lut_ptrs[kNqBatchWide];
-          float lut_scales[kNqBatchWide];
-          float lut_biases[kNqBatchWide];
-          for (std::size_t i = 0; i < batch_nq; ++i) {
-            const std::size_t qi = qi_start + i;
-            lut_ptrs[i] = prep.split_luts[qi].data();
-            lut_scales[i] = prep.lut_scales[qi];
-            lut_biases[i] = prep.lut_biases[qi];
-          }
-          score_queries_vnni_threshold_fill(
-              lut_ptrs, lut_scales, lut_biases, batch_nq, blocked_codes, lm_scales,
-              prep.n_byte_groups, n_vectors, n_blocks, score_threshold, /*capacity=*/0, nullptr,
-              nullptr, local_counts, nullptr, nullptr, residual_norms.data(), rs_local);
-        }
-        for (std::size_t i = 0; i < batch_nq; ++i) {
-          hit_counts[qi_start + i] = local_counts[i];
-        }
-      }
-    } else
-#endif
-    {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
-#endif
-      for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-        const std::size_t qis = static_cast<std::size_t>(qi);
-        std::size_t count = 0;
-        const auto& lut = prep.luts[qis];
-        const float rs = q_perp[qis];
-        for (std::size_t b = 0; b < n_blocks; ++b) {
-          const std::size_t base_vec = b * kBlock;
-          for (std::size_t lane = 0; lane < kBlock; ++lane) {
-            const std::size_t vi = base_vec + lane;
-            if (vi >= n_vectors) break;
-            float score = lut.bias;
-            for (std::size_t g = 0; g < prep.n_byte_groups; ++g) {
-              const auto byte_val = static_cast<std::size_t>(
-                  read_code(blocked_codes, prep.bits, prep.n_byte_groups, b, g, lane));
-              score += lut.scale * static_cast<float>(lut.uint8_luts[g * 32 + (byte_val >> 4)]);
-              score += lut.scale *
-                       static_cast<float>(lut.uint8_luts[g * 32 + 16 + (byte_val & 0x0F)]);
-            }
-            score *= lm_scales[vi];
-            score += rs * residual_norms[vi];
-            if (score >= score_threshold) ++count;
-          }
-        }
-        hit_counts[qis] = count;
-      }
-    }
-    double mean_sl = 0.0;
-    double max_sl = 0.0;
-    for (std::size_t c : hit_counts) {
-      mean_sl += static_cast<double>(c);
-      max_sl = std::max(max_sl, static_cast<double>(c));
-    }
-    if (nq > 0) mean_sl /= static_cast<double>(nq);
-    if (timings != nullptr) {
-      timings->mean_shortlist = mean_sl;
-      timings->max_shortlist = max_sl;
-    }
-    out.k = kk;
-    return out;
-  }
-  SearchResults cand =
-      score_prepared(prep, sl, blocked_codes, n_blocks, lm_scales, {}, {}, score_threshold,
-                     timings ? timings : nullptr, residual_norms, q_perp, scale_resid);
-
-  double mean_sl = 0.0;
-  double max_sl = 0.0;
-  for (std::size_t qi = 0; qi < nq; ++qi) {
-    const std::size_t n_cand =
-        cand.counts.empty() ? cand.k : std::min(cand.counts[qi], cand.k);
-    mean_sl += static_cast<double>(n_cand);
-    max_sl = std::max(max_sl, static_cast<double>(n_cand));
-  }
-  if (nq > 0) mean_sl /= static_cast<double>(nq);
-
-  if (!shortlist_only) {
-    // Final top-k from residual-corrected landmark scores (no full-dim re-rank).
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-      const std::size_t qis = static_cast<std::size_t>(qi);
-      const std::size_t n_cand =
-          cand.counts.empty() ? cand.k : std::min(cand.counts[qis], cand.k);
-      std::vector<std::size_t> order(n_cand);
-      for (std::size_t j = 0; j < n_cand; ++j) order[j] = j;
-      const float* cs = cand.scores.data() + qis * cand.k;
-      const std::uint64_t* ci = cand.ids.data() + qis * cand.k;
-      std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-        if (cs[a] != cs[b]) return cs[a] > cs[b];
-        return ci[a] < ci[b];
-      });
-      const std::size_t take = std::min(kk, n_cand);
-      for (std::size_t j = 0; j < take; ++j) {
-        out.scores[qis * kk + j] = cs[order[j]];
-        out.ids[qis * kk + j] = ci[order[j]];
-      }
-      for (std::size_t j = take; j < kk; ++j) {
-        out.scores[qis * kk + j] = 0.f;
-        out.ids[qis * kk + j] = 0;
-      }
-    }
-  }
-
-  out.k = kk;
-  if (timings != nullptr) {
-    timings->mean_shortlist = mean_sl;
-    timings->max_shortlist = max_sl;
-  }
-  return out;
+  return score_prepared(prep, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms, q_perp,
+                        scale_resid);
 }
+
+
 
 
 void merge_search_results(SearchResults& dst, const SearchResults& src) {

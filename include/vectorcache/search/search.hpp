@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <span>
 #include <utility>
@@ -14,7 +13,7 @@
 
 namespace vectorcache {
 
-/// Contiguous buffer that can grow without value-initializing (threshold shortlists).
+/// Contiguous buffer that can grow without value-initializing.
 template <typename T>
 struct UninitBuffer {
   std::unique_ptr<T[]> data_;
@@ -82,12 +81,6 @@ struct SearchResults {
   std::vector<std::size_t> counts;
 };
 
-/// Optional search stats (not wall-clock). Query wall time is measured by the caller.
-struct LandmarkStageTimings {
-  double mean_shortlist = 0;  // mean candidates / query after shortlist stage
-  double max_shortlist = 0;   // max candidates on any query
-};
-
 struct PreparedQueryLut {
   std::vector<std::uint8_t> uint8_luts;
   float scale = 1.f;
@@ -123,37 +116,30 @@ PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, 
 PreparedQueries prepare_from_rows(std::span<const float> rows, std::size_t nq, std::size_t dim,
                                   std::span<const float> centroids, std::size_t bits);
 
-/// FWHT → landmark project → FastScan with residual-energy bound.
+/// FWHT → landmark project → FastScan top-k with residual-energy bound.
 /// Score = s_L + ‖q_⊥‖·‖r_i‖. No full-dim re-rank.
-/// NaN `score_threshold` ⇒ top-k heap on residual-corrected scores.
-/// Finite `score_threshold` ⇒ fixed buffer of capacity `2×shortlist` (0 = uncapped / tune-only).
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
-                                     std::size_t k, std::size_t shortlist,
-                                     std::span<const float> landmark_basis, std::size_t n_landmarks,
-                                     std::size_t scan_dim, std::span<const float> lm_centroids,
-                                     std::size_t scan_bits, std::span<const std::uint8_t> blocked_codes,
-                                     std::size_t n_blocks, std::span<const float> lm_scales,
+                                     std::size_t k, std::span<const float> landmark_basis,
+                                     std::size_t n_landmarks, std::size_t scan_dim,
+                                     std::span<const float> lm_centroids, std::size_t scan_bits,
+                                     std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
+                                     std::span<const float> lm_scales,
                                      std::span<const float> residual_norms, const Rotation& rotation,
-                                     float score_threshold, LandmarkStageTimings* timings = nullptr,
-                                     bool shortlist_only = false,
                                      std::span<const float> scale_resid = {});
 
 /// Copy prepared state for a single query index (for per-query IVF probing).
 PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
 
-/// Score a contiguous blocked range using prepared query state.
+/// Score a contiguous blocked range using prepared query state (top-k heap).
 /// If `id_map` is non-empty it must have `scales.size()` entries; local ids are remapped.
 /// If `query_indices` is non-empty, only those prepared queries are scored (output nq =
 /// query_indices.size()); otherwise all `prep.nq` queries are scored.
-/// NaN `score_threshold` ⇒ top-k heap; finite ⇒ fixed-buffer collect.
 /// Optional residual bound: score += residual_scales[qi] * residual_norms[vi].
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                              std::span<const float> scales,
                              std::span<const std::uint64_t> id_map = {},
                              std::span<const std::size_t> query_indices = {},
-                             float score_threshold = std::numeric_limits<float>::quiet_NaN(),
-                             LandmarkStageTimings* timings = nullptr,
                              std::span<const float> residual_norms = {},
                              std::span<const float> residual_scales = {},
                              std::span<const float> scale_resid = {});

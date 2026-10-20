@@ -15,7 +15,6 @@ inline constexpr std::size_t kNormChains = 8;
 inline constexpr std::size_t kFlushEvery = 256;
 inline constexpr std::size_t kMinCalibrationRows = 2;
 inline constexpr std::size_t kRecommendedCalibrationRows = 1000;
-inline constexpr std::size_t kDefaultLandmarks = 96;
-inline constexpr std::size_t kDefaultShortlist = 1024;
+inline constexpr std::size_t kDefaultLandmarks = 1024;
 
 }  // namespace vectorcache

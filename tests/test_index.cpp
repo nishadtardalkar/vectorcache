@@ -19,7 +19,7 @@ TEST(Index, AddAndSearchReturnsIds) {
   std::vector<float> queries(nq * dim);
   for (float& x : queries) x = dist(rng);
 
-  vectorcache::LandmarkIndex index(dim, 4, /*n_landmarks=*/48, /*shortlist=*/64);
+  vectorcache::LandmarkIndex index(dim, 4, /*n_landmarks=*/48);
   index.add(db);
   index.prepare();
   auto res = index.search(queries, k);
@@ -43,7 +43,7 @@ TEST(Index, SelfQueryHighScore) {
   std::vector<float> db(n * dim);
   for (float& x : db) x = dist(rng);
 
-  vectorcache::LandmarkIndex index(dim, 4, 96, 32);
+  vectorcache::LandmarkIndex index(dim, 4, /*n_landmarks=*/96);
   index.add(db);
   index.prepare();
   auto res = index.search(std::span<const float>(db.data(), dim), 1);
@@ -52,7 +52,7 @@ TEST(Index, SelfQueryHighScore) {
   EXPECT_GT(res.scores[0], 0.9f);
 }
 
-TEST(Index, MultiQueryThresholdMatchesSingle) {
+TEST(Index, MultiQueryMatchesSingle) {
   constexpr std::size_t dim = 64;
   constexpr std::size_t n = 512;
   constexpr std::size_t nq = 8;
@@ -65,7 +65,7 @@ TEST(Index, MultiQueryThresholdMatchesSingle) {
   std::vector<float> queries(nq * dim);
   for (float& x : queries) x = dist(rng);
 
-  vectorcache::LandmarkIndex index(dim, 4, /*n_landmarks=*/48, /*shortlist=*/128);
+  vectorcache::LandmarkIndex index(dim, 4, /*n_landmarks=*/48);
   index.add(db);
   index.prepare();
 
@@ -94,8 +94,8 @@ TEST(Index, SeparateScanAndRerankBits) {
   std::vector<float> queries(nq * dim);
   for (float& x : queries) x = dist(rng);
 
-  vectorcache::LandmarkIndex index(dim, /*scan_bits=*/2, /*n_landmarks=*/32, /*shortlist=*/48,
-                                   /*landmark_seed=*/0, /*rerank_bits=*/4);
+  vectorcache::LandmarkIndex index(dim, /*scan_bits=*/2, /*n_landmarks=*/32, /*landmark_seed=*/0,
+                                   /*rerank_bits=*/4);
   EXPECT_EQ(index.scan_bits(), 2u);
   EXPECT_EQ(index.rerank_bits(), 4u);
   EXPECT_EQ(index.bit_width(), 2u);
