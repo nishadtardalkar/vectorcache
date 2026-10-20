@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1030,7 +1031,11 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                                      std::span<const float> lm_scales,
                                      std::span<const float> residual_norms, const Rotation& rotation,
-                                     std::span<const float> scale_resid) {
+                                     std::span<const float> scale_resid,
+                                     SearchStageTimings* timings) {
+  if (timings != nullptr) {
+    *timings = SearchStageTimings{};
+  }
   if (nq == 0 || lm_scales.empty() || k == 0) {
     SearchResults out;
     out.nq = nq;
@@ -1095,8 +1100,17 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     q_perp[qi] = static_cast<float>(std::sqrt(std::max(0.0, q2 - l2)));
   }
   auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
-  return score_prepared(prep, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms, q_perp,
-                        scale_resid);
+
+  using clock = std::chrono::steady_clock;
+  const auto t_scan0 = clock::now();
+  SearchResults out =
+      score_prepared(prep, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms, q_perp,
+                     scale_resid);
+  if (timings != nullptr) {
+    timings->fastscan_ms =
+        std::chrono::duration<double, std::milli>(clock::now() - t_scan0).count();
+  }
+  return out;
 }
 
 

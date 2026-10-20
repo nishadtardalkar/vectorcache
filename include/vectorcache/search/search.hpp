@@ -82,6 +82,12 @@ struct SearchResults {
   std::vector<std::size_t> counts;
 };
 
+/// Optional wall-clock breakdown for one search call (milliseconds).
+struct SearchStageTimings {
+  /// Blocked FastScan / permute-dot over codes (`score_prepared`) — turbovec-comparable kernel.
+  double fastscan_ms = 0.0;
+};
+
 struct PreparedQueryLut {
   std::vector<std::uint8_t> uint8_luts;
   float scale = 1.f;
@@ -119,6 +125,7 @@ PreparedQueries prepare_from_rows(std::span<const float> rows, std::size_t nq, s
 
 /// FWHT → 4-bit landmark project → FastScan top-k with residual-energy bound.
 /// Score = s_L + ‖q_⊥‖·‖r_i‖. No full-dim re-rank.
+/// If `timings` is non-null, fills `fastscan_ms` for the code-scan kernel only.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
                                      std::size_t k, const QuantizedLandmarks& landmarks,
                                      std::size_t scan_dim, std::span<const float> lm_centroids,
@@ -126,7 +133,8 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                                      std::span<const float> lm_scales,
                                      std::span<const float> residual_norms, const Rotation& rotation,
-                                     std::span<const float> scale_resid = {});
+                                     std::span<const float> scale_resid = {},
+                                     SearchStageTimings* timings = nullptr);
 
 /// Copy prepared state for a single query index (for per-query IVF probing).
 PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);

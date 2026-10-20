@@ -173,7 +173,8 @@ void LandmarkIndex::prepare() {
   prepared_ = true;
 }
 
-SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t k) const {
+SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t k,
+                                    SearchStageTimings* timings) const {
   if (queries.size() % dim_ != 0) {
     throw std::invalid_argument("queries length must be multiple of dim");
   }
@@ -184,7 +185,7 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
   const std::size_t kk = std::min(k, n_vectors_);
   return search_landmark_rerank(queries, nq, dim_, kk, landmark_basis_q4_, scan_dim_, lm_centroids_,
                                 scan_bits_, blocked_codes_, n_blocks_, scales_, residual_norms_,
-                                rotation_, scale_resid_);
+                                rotation_, scale_resid_, timings);
 }
 
 }  // namespace vectorcache
