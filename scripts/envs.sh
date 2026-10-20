@@ -5,9 +5,10 @@
 #   export VECTORCACHE_MODULE_CURL=libcurl/8.5.0
 #   export VECTORCACHE_MODULE_ARROW=apache-arrow/15.0.0
 #   export VECTORCACHE_MODULE_HDF5=hdf5/1.14.3
+#   export VECTORCACHE_MODULE_OPENBLAS=openblas/0.3.26
 #
 # Find names on your cluster:
-#   module avail 2>&1 | grep -iE 'curl|arrow|hdf5'
+#   module avail 2>&1 | grep -iE 'curl|arrow|hdf5|openblas|mkl'
 
 module_exists() {
   local name="$1"
@@ -56,10 +57,40 @@ fi
 CURL_MOD="${VECTORCACHE_MODULE_CURL:-curl}"
 ARROW_MOD="${VECTORCACHE_MODULE_ARROW:-arrow}"
 HDF5_MOD="${VECTORCACHE_MODULE_HDF5:-hdf5}"
+OPENBLAS_MOD="${VECTORCACHE_MODULE_OPENBLAS:-openblas}"
 
 load_module "$CURL_MOD" || warn_missing "libcurl for fetch-datasets" "$CURL_MOD"
 load_module "$ARROW_MOD" || warn_missing "Apache Arrow for Parquet datasets" "$ARROW_MOD"
 load_module "$HDF5_MOD" || warn_missing "HDF5 for GloVe reader" "$HDF5_MOD"
+# Landmark projection needs CBLAS (SGEMM). Prefer OpenBLAS; fall back to MKL.
+if ! load_module "$OPENBLAS_MOD"; then
+  if ! load_module mkl && ! load_module intel-mkl; then
+    warn_missing "OpenBLAS/MKL for landmark CBLAS" "$OPENBLAS_MOD"
+  fi
+fi
+# Propagate module prefixes so cmake/VectorcacheBlas.cmake can find cblas.h.
+if [[ -z "${OPENBLAS_ROOT:-}" ]]; then
+  for _ob in /usr /usr/local /opt/OpenBLAS \
+      ${OPENBLAS_DIR:-} ${OpenBLAS_DIR:-} ${OPENBLAS_HOME:-}; do
+    if [[ -n "$_ob" && -f "$_ob/include/cblas.h" ]]; then
+      export OPENBLAS_ROOT="$_ob"
+      break
+    fi
+  done
+  unset _ob
+fi
+# Some OpenBLAS modules only set LIBRARY_PATH / CPATH.
+if [[ -z "${OPENBLAS_ROOT:-}" && -n "${LIBRARY_PATH:-}" ]]; then
+  IFS=':' read -r -a _vc_lib_paths <<< "$LIBRARY_PATH"
+  for _libdir in "${_vc_lib_paths[@]}"; do
+    _cand="$(cd "$_libdir/.." 2>/dev/null && pwd)"
+    if [[ -n "$_cand" && -f "$_cand/include/cblas.h" ]]; then
+      export OPENBLAS_ROOT="$_cand"
+      break
+    fi
+  done
+  unset _vc_lib_paths _libdir _cand
+fi
 
 # HDF5 modules often load PrgEnv-intel, but Intel icpx cannot compile libstdc++
 # <variant> (used by Arrow) against GCC headers — pin GCC for the whole build.
