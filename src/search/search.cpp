@@ -18,17 +18,15 @@
 #include "vectorcache/search/search_vnni.hpp"
 #include "vectorcache/search/topk_heap.hpp"
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
 #if defined(_MSC_VER)
 #include <intrin.h>
+#endif
 #endif
 
 #ifdef _OPENMP
 #include <omp.h>
-#endif
-
-#include <cblas.h>
-#ifndef blasint
-using blasint = int;
 #endif
 
 namespace vectorcache {
@@ -42,25 +40,105 @@ constexpr std::size_t kMinTileBlocks = 1024;
 constexpr std::size_t kMinTileBlocksX86 = kMinTileBlocks * 3;
 constexpr std::size_t kSingleQueryParallelMinBlocks = 1024;
 
+#if defined(__x86_64__) || defined(_M_X64)
+inline float hsum256_ps(__m256 v) {
+  const __m128 lo = _mm256_castps256_ps128(v);
+  const __m128 hi = _mm256_extractf128_ps(v, 1);
+  __m128 s = _mm_add_ps(lo, hi);
+  s = _mm_add_ps(s, _mm_movehdup_ps(s));
+  s = _mm_add_ss(s, _mm_movehl_ps(s, s));
+  return _mm_cvtss_f32(s);
+}
+
 /// q_land[qi, 0:m) = landmark_basis[0:m, :] · q_rot[qi, :]
-/// Q_land = Q_rot · Lᵀ via CBLAS SGEMM (L is row-major [m × dim]).
-/// ldc = scan_dim leaves trailing pad columns untouched (pre-zeroed by caller).
+/// Landmark-tile outer keeps L hot; query micro-tile reuses each L load.
 void project_onto_landmarks(const float* q_rot, std::size_t nq, std::size_t dim,
                             const float* landmark_basis, std::size_t n_landmarks, float* q_land,
                             std::size_t scan_dim) {
-  if (nq == 0 || n_landmarks == 0 || dim == 0) return;
-#if defined(OPENBLAS_VERSION)
+  constexpr std::size_t kLmTile = 8;
+  constexpr std::size_t kQTile = 4;
+  const std::size_t m_aligned = n_landmarks & ~(kLmTile - 1);
+  const std::size_t nq_aligned = nq - (nq % kQTile);
+
+  for (std::size_t j0 = 0; j0 < m_aligned; j0 += kLmTile) {
 #ifdef _OPENMP
-  openblas_set_num_threads((std::max)(1, omp_get_max_threads()));
-#else
-  openblas_set_num_threads(1);
+#pragma omp parallel for schedule(static)
 #endif
+    for (int qi0 = 0; qi0 < static_cast<int>(nq_aligned); qi0 += static_cast<int>(kQTile)) {
+      const std::size_t base = static_cast<std::size_t>(qi0);
+      __m256 acc[kQTile][kLmTile];
+      for (std::size_t r = 0; r < kQTile; ++r)
+        for (std::size_t t = 0; t < kLmTile; ++t) acc[r][t] = _mm256_setzero_ps();
+      for (std::size_t i = 0; i < dim; i += 8) {
+        __m256 Lv[kLmTile];
+        for (std::size_t t = 0; t < kLmTile; ++t) {
+          Lv[t] = _mm256_loadu_ps(landmark_basis + (j0 + t) * dim + i);
+        }
+        for (std::size_t r = 0; r < kQTile; ++r) {
+          const __m256 qv = _mm256_loadu_ps(q_rot + (base + r) * dim + i);
+          for (std::size_t t = 0; t < kLmTile; ++t) {
+            acc[r][t] = _mm256_fmadd_ps(qv, Lv[t], acc[r][t]);
+          }
+        }
+      }
+      for (std::size_t r = 0; r < kQTile; ++r) {
+        float* dest = q_land + (base + r) * scan_dim + j0;
+        for (std::size_t t = 0; t < kLmTile; ++t) dest[t] = hsum256_ps(acc[r][t]);
+      }
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
 #endif
-  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, static_cast<blasint>(nq),
-              static_cast<blasint>(n_landmarks), static_cast<blasint>(dim), 1.f, q_rot,
-              static_cast<blasint>(dim), landmark_basis, static_cast<blasint>(dim), 0.f, q_land,
-              static_cast<blasint>(scan_dim));
+    for (int qi = static_cast<int>(nq_aligned); qi < static_cast<int>(nq); ++qi) {
+      const std::size_t qis = static_cast<std::size_t>(qi);
+      __m256 acc[kLmTile];
+      for (std::size_t t = 0; t < kLmTile; ++t) acc[t] = _mm256_setzero_ps();
+      for (std::size_t i = 0; i < dim; i += 8) {
+        const __m256 qv = _mm256_loadu_ps(q_rot + qis * dim + i);
+        for (std::size_t t = 0; t < kLmTile; ++t) {
+          acc[t] = _mm256_fmadd_ps(
+              qv, _mm256_loadu_ps(landmark_basis + (j0 + t) * dim + i), acc[t]);
+        }
+      }
+      float* dest = q_land + qis * scan_dim + j0;
+      for (std::size_t t = 0; t < kLmTile; ++t) dest[t] = hsum256_ps(acc[t]);
+    }
+  }
+
+  for (std::size_t j = m_aligned; j < n_landmarks; ++j) {
+    const float* Lj = landmark_basis + j * dim;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+      const float* q = q_rot + static_cast<std::size_t>(qi) * dim;
+      __m256 acc = _mm256_setzero_ps();
+      for (std::size_t i = 0; i < dim; i += 8) {
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + i), _mm256_loadu_ps(Lj + i), acc);
+      }
+      q_land[static_cast<std::size_t>(qi) * scan_dim + j] = hsum256_ps(acc);
+    }
+  }
 }
+#else
+void project_onto_landmarks(const float* q_rot, std::size_t nq, std::size_t dim,
+                            const float* landmark_basis, std::size_t n_landmarks, float* q_land,
+                            std::size_t scan_dim) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+    const float* row = q_rot + static_cast<std::size_t>(qi) * dim;
+    float* dest = q_land + static_cast<std::size_t>(qi) * scan_dim;
+    for (std::size_t j = 0; j < n_landmarks; ++j) {
+      float s = 0.f;
+      const float* Lj = landmark_basis + j * dim;
+      for (std::size_t i = 0; i < dim; ++i) s += row[i] * Lj[i];
+      dest[j] = s;
+    }
+  }
+}
+#endif
 
 std::size_t nq_batch_for(bool use_permute_dot, std::size_t n_threads, std::size_t nq) {
   if (use_permute_dot && n_threads <= 1 && (nq + kNqBatchWide - 1) / kNqBatchWide <
