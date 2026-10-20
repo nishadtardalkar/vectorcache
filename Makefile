@@ -10,10 +10,10 @@ BUILD_TYPE    ?= Release
 JOBS          ?= $(shell nproc 2>/dev/null || echo 4)
 DATA_DIR      ?= data
 DATASETS      ?= all
-DATASET       ?= sift1m
+DATASET       ?= openai-1536
 NPY           ?=
 SPLIT         ?=
-LIMIT         ?=
+LIMIT         ?= 100000
 BITS          ?= 4
 RERANK_BITS   ?=
 LANDMARKS     ?= 96
@@ -89,7 +89,7 @@ help:
 	@echo ""
 	@echo "Bench variables (map to query-bench CLI):"
 	@echo "  DATASET / NPY   --dataset or --npy (default DATASET=$(DATASET))"
-	@echo "  LIMIT           --limit (default: full dataset; 0 = all)"
+	@echo "  LIMIT           --limit (default $(LIMIT); 0 = all)"
 	@echo "  BITS            --bits / --scan-bits landmark FastScan (default $(BITS); 2-4)"
 	@echo "  RERANK_BITS     --rerank-bits full-dim re-rank (default = BITS; 2-4)"
 	@echo "  LANDMARKS       --landmarks (default $(LANDMARKS))"
