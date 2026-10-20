@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "vectorcache/search/search_vnni.hpp"
+#include "vectorcache/transform/landmarks.hpp"
 #include "vectorcache/transform/rotation.hpp"
 
 namespace vectorcache {
@@ -116,12 +117,12 @@ PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, 
 PreparedQueries prepare_from_rows(std::span<const float> rows, std::size_t nq, std::size_t dim,
                                   std::span<const float> centroids, std::size_t bits);
 
-/// FWHT → landmark project → FastScan top-k with residual-energy bound.
+/// FWHT → int8 landmark project → FastScan top-k with residual-energy bound.
 /// Score = s_L + ‖q_⊥‖·‖r_i‖. No full-dim re-rank.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
-                                     std::size_t k, std::span<const float> landmark_basis,
-                                     std::size_t n_landmarks, std::size_t scan_dim,
-                                     std::span<const float> lm_centroids, std::size_t scan_bits,
+                                     std::size_t k, const QuantizedLandmarks& landmarks,
+                                     std::size_t scan_dim, std::span<const float> lm_centroids,
+                                     std::size_t scan_bits,
                                      std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                                      std::span<const float> lm_scales,
                                      std::span<const float> residual_norms, const Rotation& rotation,
