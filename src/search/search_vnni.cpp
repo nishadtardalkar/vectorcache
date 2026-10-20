@@ -491,8 +491,9 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
 
 #if !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
 /// turbovec `permute_dot::<1, 8>`: eight interleaved code streams + depth-8 prefetch.
-VECTORCACHE_AVX512_FN
+// GNU attributes must follow `template <...>` (not precede it).
 template <bool kGfni>
+VECTORCACHE_AVX512_FN
 void score_query_permute_dot_blk8(const QueryPermuteDot& pd,
                                   std::span<const std::uint8_t> blocked_codes,
                                   std::span<const float> vec_scales, std::size_t n_byte_groups,
@@ -577,8 +578,8 @@ void score_query_permute_dot_blk8(const QueryPermuteDot& pd,
 /// turbovec `search_multi_query_permute_dot::<NQ,1>`: NQ is a compile-time
 /// constant so the qi loop and `acc[NQ][2]` stay in registers (H34/H124).
 /// Caller pads `pds`/`heap_*` to NQ; only the first `nq` lanes are flushed.
-VECTORCACHE_AVX512_FN
 template <bool kGfni, std::size_t NQ>
+VECTORCACHE_AVX512_FN
 void score_queries_permute_dot_multi(const QueryPermuteDot* const* pds, std::size_t nq,
                                      std::span<const std::uint8_t> blocked_codes,
                                      std::span<const float> vec_scales, std::size_t n_byte_groups,
@@ -673,20 +674,9 @@ void score_queries_permute_dot_multi(const QueryPermuteDot* const* pds, std::siz
   }
 }
 
-// Threshold kernels: noipa only (ISA from TU flags); keep out-of-line like heap path.
-#if defined(__GNUC__) || defined(__clang__)
-#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
-#define VECTORCACHE_AVX512_FN_THR
-#else
-#define VECTORCACHE_AVX512_FN_THR __attribute__((noinline, noipa))
-#endif
-#else
-#define VECTORCACHE_AVX512_FN_THR
-#endif
-
 /// Single-query threshold: BLK=8 streams + depth-8 prefetch (matches heap blk8 / turbovec).
-VECTORCACHE_AVX512_FN_THR
 template <bool kGfni>
+VECTORCACHE_AVX512_FN
 void score_query_permute_dot_threshold_blk8(const QueryPermuteDot& pd,
                                             std::span<const std::uint8_t> blocked_codes,
                                             std::span<const float> vec_scales,
@@ -764,8 +754,8 @@ void score_query_permute_dot_threshold_blk8(const QueryPermuteDot& pd,
 
 /// Multi-query threshold: codes loaded once, BLK=1, depth-32 prefetch (turbovec NQ>1).
 /// Const NQ + pad (turbovec H34): always accumulate all NQ lanes; flush first `nq`.
-VECTORCACHE_AVX512_FN_THR
 template <bool kGfni, std::size_t NQ>
+VECTORCACHE_AVX512_FN
 void score_queries_permute_dot_threshold_multi(const QueryPermuteDot* const* pds, std::size_t nq,
                                                std::span<const std::uint8_t> blocked_codes,
                                                std::span<const float> vec_scales,
@@ -854,7 +844,7 @@ void score_queries_permute_dot_threshold_multi(const QueryPermuteDot* const* pds
   }
 }
 
-VECTORCACHE_AVX512_FN_THR
+VECTORCACHE_AVX512_FN
 void score_query_vnni_threshold_impl(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
                                      std::span<const float> vec_scales, std::size_t n_byte_groups,
                                      std::size_t n_vectors, std::size_t n_blocks, float threshold,
@@ -965,7 +955,7 @@ void score_query_vnni_threshold_impl(QueryLutView lut, std::span<const std::uint
   }
 }
 
-VECTORCACHE_AVX512_FN_THR
+VECTORCACHE_AVX512_FN
 void score_queries_vnni_threshold_multi(const std::uint8_t* const* split_luts,
                                         const float* lut_scales, const float* lut_biases,
                                         std::size_t nq, std::span<const std::uint8_t> blocked_codes,
