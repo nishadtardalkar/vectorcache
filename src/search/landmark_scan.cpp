@@ -2,8 +2,8 @@
 
 #include <algorithm>
 #include <bit>
-#include <chrono>
 #include <cstring>
+#include <limits>
 
 #include "vectorcache/search/topk_heap.hpp"
 
@@ -38,7 +38,7 @@ void landmark_shortlist_scan(std::span<const float> q_landmarks, std::size_t m,
                              std::size_t n_blocks, std::size_t shortlist, float* heap_s,
                              std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min) {
   heap_sz = 0;
-  heap_min = 0.f;
+  heap_min = -std::numeric_limits<float>::infinity();
   std::size_t heap_mi = 0;
 
   for (std::size_t b = 0; b < n_blocks; ++b) {
@@ -86,17 +86,14 @@ void quantized_rerank_from_bitmap(std::span<const std::uint8_t> lut_bytes, float
                                   float lut_bias, std::span<const std::uint8_t> codes_flat,
                                   std::size_t n_byte_groups, std::span<const float> scales,
                                   const std::uint64_t* hit_bitmap, std::size_t n_vectors,
-                                  std::size_t k, float* out_scores, std::uint64_t* out_ids,
-                                  double* score_ms_out, double* select_ms_out) {
-  using clock = std::chrono::steady_clock;
-  const auto t_score0 = clock::now();
+                                  std::size_t k, float* out_scores, std::uint64_t* out_ids) {
 
   const std::size_t n_blocks = (n_vectors + kBlock - 1) / kBlock;
   const std::size_t kk = std::min(k, n_vectors);
   std::vector<float> heap_s(kk);
   std::vector<std::uint64_t> heap_i(kk);
   std::size_t heap_sz = 0;
-  float heap_min = 0.f;
+  float heap_min = -std::numeric_limits<float>::infinity();
   std::size_t heap_mi = 0;
 
   for (std::size_t b = 0; b < n_blocks; ++b) {
@@ -136,10 +133,7 @@ void quantized_rerank_from_bitmap(std::span<const std::uint8_t> lut_bytes, float
                            static_cast<std::uint64_t>(vi));
     }
   }
-  const double score_ms =
-      std::chrono::duration<double, std::milli>(clock::now() - t_score0).count();
 
-  const auto t_sel0 = clock::now();
   std::vector<std::pair<float, std::uint64_t>> pairs(heap_sz);
   for (std::size_t i = 0; i < heap_sz; ++i) {
     pairs[i] = {heap_s[i], heap_i[i]};
@@ -154,10 +148,6 @@ void quantized_rerank_from_bitmap(std::span<const std::uint8_t> lut_bytes, float
     out_scores[i] = 0.f;
     out_ids[i] = 0;
   }
-  const double select_ms =
-      std::chrono::duration<double, std::milli>(clock::now() - t_sel0).count();
-  if (score_ms_out) *score_ms_out += score_ms;
-  if (select_ms_out) *select_ms_out += select_ms;
 }
 
 }  // namespace vectorcache

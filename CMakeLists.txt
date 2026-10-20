@@ -43,9 +43,14 @@ if(VECTORCACHE_BUILD_GLOVE)
   list(APPEND VECTORCACHE_SOURCES src/datasets/hdf5.cpp)
 endif()
 
+include(cmake/VectorcacheBlas.cmake)
+
 add_library(vectorcache ${VECTORCACHE_SOURCES})
 target_include_directories(vectorcache PUBLIC include)
 target_compile_features(vectorcache PUBLIC cxx_std_20)
+
+target_include_directories(vectorcache PRIVATE ${VECTORCACHE_CBLAS_INCLUDE_DIR})
+target_link_libraries(vectorcache PUBLIC ${VECTORCACHE_BLAS_LIBRARIES})
 
 if(MSVC)
   target_compile_options(vectorcache PRIVATE /W4 /arch:AVX2)
@@ -130,6 +135,7 @@ endif()
 if(VECTORCACHE_BUILD_TOOLS)
   add_executable(query-bench tools/query-bench.cpp)
   target_link_libraries(query-bench PRIVATE vectorcache CLI11::CLI11)
+  vectorcache_copy_openblas_dll(query-bench)
 endif()
 
 if(VECTORCACHE_BUILD_TESTS)
@@ -151,6 +157,7 @@ if(VECTORCACHE_BUILD_TESTS)
     tests/test_landmarks.cpp
   )
   target_link_libraries(vectorcache_tests PRIVATE vectorcache GTest::gtest)
+  vectorcache_copy_openblas_dll(vectorcache_tests)
   include(GoogleTest)
   gtest_discover_tests(vectorcache_tests)
 endif()

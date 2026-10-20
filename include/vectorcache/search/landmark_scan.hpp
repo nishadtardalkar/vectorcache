@@ -52,7 +52,6 @@ void quantized_rerank_from_bitmap(std::span<const std::uint8_t> lut_bytes, float
                                   float lut_bias, std::span<const std::uint8_t> codes_flat,
                                   std::size_t n_byte_groups, std::span<const float> scales,
                                   const std::uint64_t* hit_bitmap, std::size_t n_vectors,
-                                  std::size_t k, float* out_scores, std::uint64_t* out_ids,
-                                  double* score_ms_out = nullptr, double* select_ms_out = nullptr);
+                                  std::size_t k, float* out_scores, std::uint64_t* out_ids);
 
 }  // namespace vectorcache

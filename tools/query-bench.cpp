@@ -339,12 +339,12 @@ int main(int argc, char** argv) {
   app.add_option("--rerank-bits", rerank_bits,
                  "Bits for full-dim quantized re-rank (2-4; default = --bits)")
       ->check(CLI::Range(0, 4));
-  app.add_option("--k", k, "Final top-k after quantized re-rank");
+  app.add_option("--k", k, "Final top-k (heap size when no --score-threshold)");
   app.add_option("--landmarks", landmarks, "Orthonormal landmark dims for shortlist scan");
   app.add_option("--shortlist", shortlist,
-                 "Mean shortlist target (fixed buffer = 2×shortlist); requires --score-threshold");
+                 "Mean shortlist target (buffer = 2×shortlist); only with --score-threshold");
   app.add_option("--score-threshold", score_threshold,
-                 "Keep landmark scores >= T into a fixed 2×shortlist buffer; stop when full");
+                 "Optional: keep scores >= T into 2×shortlist buffer (default: top-k heap)");
   app.add_option("--tune-mean-shortlist", tune_mean_shortlist,
                  "Binary-search --score-threshold for this mean shortlist size (ingest once)");
   app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
@@ -424,9 +424,7 @@ int main(int argc, char** argv) {
     if (tune_mean_shortlist > 0) {
       score_threshold = std::numeric_limits<float>::quiet_NaN();  // set after tune
     }
-    if (tune_mean_shortlist == 0 && !std::isfinite(score_threshold)) {
-      throw std::runtime_error("require --score-threshold or --tune-mean-shortlist (no heap shortlist)");
-    }
+    // Default: top-k heap (NaN score_threshold). Threshold / tune remain optional.
     if (std::isfinite(score_threshold) && shortlist == 0 && tune_mean_shortlist == 0) {
       throw std::runtime_error("--shortlist must be > 0 (mean target; cap=2×)");
     }
@@ -444,7 +442,6 @@ int main(int argc, char** argv) {
 
     vectorcache::SearchResults last;
     std::vector<double> run_ms;
-    std::vector<vectorcache::LandmarkStageTimings> run_stages;
 
     // During threshold tune, keep shortlist uncapped (0).
     const std::size_t index_shortlist = tune_mean_shortlist > 0 ? 0 : shortlist;
@@ -551,12 +548,10 @@ int main(int argc, char** argv) {
     }
 
     for (std::size_t r = 0; r < timing_runs; ++r) {
-      vectorcache::LandmarkStageTimings stages;
       const auto a = std::chrono::steady_clock::now();
-      last = index.search(queries.data, k, &stages);
+      last = index.search(queries.data, k);
       const auto b = std::chrono::steady_clock::now();
       run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
-      run_stages.push_back(stages);
     }
 
     std::sort(run_ms.begin(), run_ms.end());
@@ -564,66 +559,6 @@ int main(int argc, char** argv) {
     const double nq = static_cast<double>(queries.rows);
     const double ms_per_query = median_ms / nq;
     std::cout << "search_median_ms=" << median_ms << " ms_per_query=" << ms_per_query << "\n";
-
-    auto median_of = [&](auto getter) {
-      std::vector<double> vals;
-      vals.reserve(run_stages.size());
-      for (const auto& s : run_stages) vals.push_back(getter(s));
-      std::sort(vals.begin(), vals.end());
-      return vals[vals.size() / 2] / nq;
-    };
-    const double project_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.project_ms; });
-    const double rotate_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rotate_ms; });
-    const double lm_proj_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.landmark_project_ms; });
-    const double sl_prep_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_prep_ms; });
-    const double sl_scan_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_scan_ms; });
-    const double sl_buf_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_buf_ms; });
-    const double sl_kern_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_kernel_ms; });
-    const double sl_copy_cpu_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.shortlist_copy_ms; });
-    const double rr_prep_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_prep_ms; });
-    const double rr_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_ms; });
-    const double rr_score_cpu_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_score_ms; });
-    const double rr_sel_cpu_q =
-        median_of([](const vectorcache::LandmarkStageTimings& s) { return s.rerank_select_ms; });
-    auto median_raw = [&](auto getter) {
-      std::vector<double> vals;
-      vals.reserve(run_stages.size());
-      for (const auto& s : run_stages) vals.push_back(getter(s));
-      std::sort(vals.begin(), vals.end());
-      return vals[vals.size() / 2];
-    };
-    const double mean_sl =
-        median_raw([](const vectorcache::LandmarkStageTimings& s) { return s.mean_shortlist; });
-    const double max_sl =
-        median_raw([](const vectorcache::LandmarkStageTimings& s) { return s.max_shortlist; });
-    // Score/select are thread-summed CPU-ms; scale to wall rerank_ms.
-    const double rr_cpu = rr_score_cpu_q + rr_sel_cpu_q;
-    const double rr_score_q =
-        (rr_cpu > 0.0 && rr_q > 0.0) ? rr_q * (rr_score_cpu_q / rr_cpu) : 0.0;
-    const double rr_sel_q = (rr_cpu > 0.0 && rr_q > 0.0) ? rr_q * (rr_sel_cpu_q / rr_cpu) : 0.0;
-    (void)sl_copy_cpu_q;
-    std::cout << "stage_ms_per_query:"
-              << " project=" << project_q << " shortlist_prep=" << sl_prep_q
-              << " shortlist_scan=" << sl_scan_q << " rerank_prep=" << rr_prep_q
-              << " rerank=" << rr_q
-              << " (shortlist_total=" << (sl_prep_q + sl_scan_q)
-              << " stage1=" << (project_q + sl_prep_q + sl_scan_q) << ")"
-              << " mean_shortlist=" << mean_sl << " max_shortlist=" << max_sl << "\n";
-    std::cout << "kernel_ms_per_query:"
-              << " rotate=" << rotate_q << " landmark_project=" << lm_proj_q
-              << " shortlist_buf=" << sl_buf_q << " shortlist_kernel=" << sl_kern_q
-              << " rerank_score=" << rr_score_q << " rerank_select=" << rr_sel_q << "\n";
 
     if (recall) {
       ExactTopkCacheKey cache_key;

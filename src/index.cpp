@@ -72,7 +72,6 @@ LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t scan_bits, std::size_t
   if (n_landmarks == 0 || n_landmarks > dim) {
     throw std::invalid_argument("n_landmarks must be in 1..dim");
   }
-  // shortlist == 0 allowed only with a finite score_threshold (uncapped); checked at search().
   auto cb = codebook(rerank_bits_, dim_);
   boundaries_ = std::move(cb.first);
   centroids_ = std::move(cb.second);
@@ -83,7 +82,8 @@ LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t scan_bits, std::size_t
   rotate_scratch_.resize(dim_);
 }
 
-void LandmarkIndex::encode_row(const float* src, float* unit_out, float* landmark_row_out) {
+void LandmarkIndex::encode_row(const float* src, float* unit_out, float* landmark_row_out,
+                               float* residual_out) {
   l2_normalize_into(src, unit_out, dim_);
   std::copy(unit_out, unit_out + static_cast<std::ptrdiff_t>(dim_), rotate_scratch_.begin());
   rotation_.apply(rotate_scratch_);
@@ -102,6 +102,12 @@ void LandmarkIndex::encode_row(const float* src, float* unit_out, float* landmar
       (yhat_norm2 > kDegenerateInnerEps) ? static_cast<float>(dot / yhat_norm2) : 0.f;
 
   std::fill(landmark_row_out, landmark_row_out + scan_dim_, 0.f);
+  double land_norm2 = 0.0;
+  double v_norm2 = 0.0;
+  for (std::size_t i = 0; i < dim_; ++i) {
+    const double vi = static_cast<double>(alpha) * yhat[i];
+    v_norm2 += vi * vi;
+  }
   for (std::size_t j = 0; j < n_landmarks_; ++j) {
     double s = 0.0;
     const float* Lj = landmark_basis_.data() + j * dim_;
@@ -109,7 +115,10 @@ void LandmarkIndex::encode_row(const float* src, float* unit_out, float* landmar
       s += static_cast<double>(alpha * yhat[i]) * Lj[i];
     }
     landmark_row_out[j] = static_cast<float>(s);
+    land_norm2 += s * s;
   }
+  // ‖r‖ = ‖(α·ŷ) - P_L(α·ŷ)‖ with orthonormal L columns.
+  *residual_out = static_cast<float>(std::sqrt(std::max(0.0, v_norm2 - land_norm2)));
 }
 
 void LandmarkIndex::add(std::span<const float> vectors) {
@@ -124,29 +133,19 @@ void LandmarkIndex::add(std::span<const float> vectors) {
   n_vectors_ += n;
   db_unit_.resize(n_vectors_ * dim_);
   landmark_rows_.resize(n_vectors_ * scan_dim_);
+  residual_norms_.resize(n_vectors_);
   prepared_ = false;
 
   for (std::size_t i = 0; i < n; ++i) {
     encode_row(vectors.data() + i * dim_, db_unit_.data() + (base + i) * dim_,
-               landmark_rows_.data() + (base + i) * scan_dim_);
+               landmark_rows_.data() + (base + i) * scan_dim_, &residual_norms_[base + i]);
   }
 }
 
 void LandmarkIndex::prepare() {
-  // Full-dim TurboQuant codes for re-rank (drop unit floats after).
-  {
-    std::vector<float> rotated_scratch;
-    std::vector<std::uint8_t> packed;
-    rerank_scales_.clear();
-    encode(db_unit_, n_vectors_, dim_, rotation_, boundaries_, centroids_, rerank_bits_, nullptr,
-           rotated_scratch, packed, rerank_scales_);
-    rerank_codes_ = codes_flat_from_packed(packed, n_vectors_, rerank_bits_, dim_);
-    auto rerank_repacked = repack(packed, n_vectors_, rerank_bits_, dim_);
-    rerank_blocked_ = std::move(rerank_repacked.first);
-    rerank_n_blocks_ = rerank_repacked.second;
-    db_unit_.clear();
-    db_unit_.shrink_to_fit();
-  }
+  // Drop unit floats — single-scan path does not keep full-dim re-rank codes.
+  db_unit_.clear();
+  db_unit_.shrink_to_fit();
 
   // L2-normalize landmark rows for TurboQuant-style α, then FastScan-pack.
   std::vector<float> unit_lm(n_vectors_ * scan_dim_);
@@ -161,10 +160,15 @@ void LandmarkIndex::prepare() {
   scales_.clear();
   encode_prerotated(unit_lm, norms, n_vectors_, scan_dim_, lm_boundaries_, lm_centroids_,
                     scan_bits_, nullptr, packed, scales_);
-  // Same pack dispatch as flat TurboQuant (VNNI/vector-major when available, else PERM0).
   auto repacked = repack(packed, n_vectors_, scan_bits_, scan_dim_);
   blocked_codes_ = std::move(repacked.first);
   n_blocks_ = repacked.second;
+  // Pack α and ‖r‖ as AoS pairs so flush loads one stream.
+  scale_resid_.resize(2 * n_vectors_);
+  for (std::size_t i = 0; i < n_vectors_; ++i) {
+    scale_resid_[2 * i] = scales_[i];
+    scale_resid_[2 * i + 1] = residual_norms_[i];
+  }
   landmark_rows_.clear();
   landmark_rows_.shrink_to_fit();
   prepared_ = true;
@@ -183,9 +187,8 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
   const std::size_t kk = std::min(k, n_vectors_);
   return search_landmark_rerank(queries, nq, dim_, kk, sl, landmark_basis_, n_landmarks_, scan_dim_,
                                 lm_centroids_, scan_bits_, blocked_codes_, n_blocks_, scales_,
-                                rerank_codes_, rerank_blocked_, rerank_n_blocks_, rerank_scales_,
-                                centroids_, rerank_bits_, rotation_, score_threshold_, timings,
-                                shortlist_only);
+                                residual_norms_, rotation_, score_threshold_, timings,
+                                shortlist_only, scale_resid_);
 }
 
 }  // namespace vectorcache

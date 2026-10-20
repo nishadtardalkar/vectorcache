@@ -1,10 +1,10 @@
 # VectorCache Algorithm
 
-Two-stage ANN over a flat corpus (`LandmarkIndex`):
+Single-scan ANN over a flat corpus (`LandmarkIndex`):
 
-**FWHT → quant → orthonormal landmark shortlist → quantized re-rank.**
+**FWHT → quant → orthonormal landmark FastScan with residual-energy bound (no full-dim re-rank).**
 
-Defaults: `scan_bits=4`, `rerank_bits=4` (same unless overridden), `m=96` landmarks, shortlist `S=1024`, final top-`k` after re-rank. `dim` must be a positive multiple of 8, ≤ 16384.
+Score = landmark IP \(s_L\) + \(\|q_\perp\|\cdot\|r_i\|\), where \(r_i\) is the component of \(\alpha\cdot\hat y\) orthogonal to the landmarks. Defaults: `scan_bits=4`, `m=96` landmarks, shortlist `S=1024`, final top-`k` from the shortlist buffer. `dim` must be a positive multiple of 8, ≤ 16384.
 
 ## Ingest
 

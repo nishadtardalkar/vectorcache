@@ -12,64 +12,40 @@ inline bool topk_worse(float sa, std::uint64_t ia, float sb, std::uint64_t ib) {
   return ia > ib;
 }
 
-inline void topk_sift_up(float* heap_s, std::uint64_t* heap_i, std::size_t idx) {
-  while (idx > 0) {
-    const std::size_t parent = (idx - 1) / 2;
-    if (!topk_worse(heap_s[idx], heap_i[idx], heap_s[parent], heap_i[parent])) break;
-    const float ts = heap_s[idx];
-    const std::uint64_t ti = heap_i[idx];
-    heap_s[idx] = heap_s[parent];
-    heap_i[idx] = heap_i[parent];
-    heap_s[parent] = ts;
-    heap_i[parent] = ti;
-    idx = parent;
+/// turbovec `rescan_min`: find worst entry (lowest score; ties → largest id).
+inline void rescan_min(const float* heap_s, const std::uint64_t* heap_i, std::size_t k,
+                       float& heap_min, std::size_t& heap_mi) {
+  std::size_t mi = 0;
+  for (std::size_t h = 1; h < k; ++h) {
+    if (topk_worse(heap_s[h], heap_i[h], heap_s[mi], heap_i[mi])) {
+      mi = h;
+    }
   }
+  heap_min = heap_s[mi];
+  heap_mi = mi;
 }
 
-inline void topk_sift_down(float* heap_s, std::uint64_t* heap_i, std::size_t heap_sz,
-                           std::size_t idx) {
-  for (;;) {
-    std::size_t best = idx;
-    const std::size_t left = 2 * idx + 1;
-    const std::size_t right = left + 1;
-    if (left < heap_sz &&
-        topk_worse(heap_s[left], heap_i[left], heap_s[best], heap_i[best])) {
-      best = left;
-    }
-    if (right < heap_sz &&
-        topk_worse(heap_s[right], heap_i[right], heap_s[best], heap_i[best])) {
-      best = right;
-    }
-    if (best == idx) break;
-    const float ts = heap_s[idx];
-    const std::uint64_t ti = heap_i[idx];
-    heap_s[idx] = heap_s[best];
-    heap_i[idx] = heap_i[best];
-    heap_s[best] = ts;
-    heap_i[best] = ti;
-    idx = best;
-  }
-}
-
-/// Binary min-heap top-k. When full, root is the worst entry (`heap_min` / index 0).
+/// Flat top-k with O(k) rescan (turbovec), not a binary heap.
+/// `heap_min` starts as `-infinity` or a cross-range prune seed. While filling,
+/// only scores strictly above `heap_min` are kept (unseeded -inf → accept all
+/// finite scores). Once full, replaces at `heap_mi` when `score > heap_min`.
 inline void heap_push_or_replace(float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                                  float& heap_min, std::size_t& heap_mi, std::size_t k, float score,
                                  std::uint64_t id) {
   if (heap_sz < k) {
+    if (!(score > heap_min)) {
+      return;
+    }
     heap_s[heap_sz] = score;
     heap_i[heap_sz] = id;
-    topk_sift_up(heap_s, heap_i, heap_sz);
     ++heap_sz;
     if (heap_sz == k) {
-      heap_min = heap_s[0];
-      heap_mi = 0;
+      rescan_min(heap_s, heap_i, k, heap_min, heap_mi);
     }
   } else if (score > heap_min) {
-    heap_s[0] = score;
-    heap_i[0] = id;
-    topk_sift_down(heap_s, heap_i, heap_sz, 0);
-    heap_min = heap_s[0];
-    heap_mi = 0;
+    heap_s[heap_mi] = score;
+    heap_i[heap_mi] = id;
+    rescan_min(heap_s, heap_i, k, heap_min, heap_mi);
   }
 }
 

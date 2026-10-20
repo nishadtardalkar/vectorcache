@@ -4,6 +4,7 @@
 #include <cassert>
 #include <bit>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 #include "vectorcache/constants.hpp"
@@ -286,7 +287,7 @@ void score_queries_avx2_perm0(const QueryLutView* luts, std::size_t nq,
       pad_heap_s[i] = &dummy_s;
       pad_heap_i[i] = &dummy_i;
       pad_heap_sz[i] = 0;
-      pad_heap_min[i] = 0.f;
+      pad_heap_min[i] = -std::numeric_limits<float>::infinity();
       pad_heap_mi[i] = 0;
     }
     pad_bias[i] = bias_corrs ? bias_corrs[src] : 0.f;

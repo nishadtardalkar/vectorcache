@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -14,7 +15,7 @@ TEST(TopkHeap, ExactTopKWithTies) {
   std::vector<float> heap_s(k);
   std::vector<std::uint64_t> heap_i(k);
   std::size_t heap_sz = 0;
-  float heap_min = 0.f;
+  float heap_min = -std::numeric_limits<float>::infinity();
   std::size_t heap_mi = 0;
 
   // Scores = id * 0.01f so top-k are the largest ids; a few equal scores to exercise ties.
