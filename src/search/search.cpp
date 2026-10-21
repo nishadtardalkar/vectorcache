@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -1272,102 +1273,16 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
 
   SearchResults out;
   if (use_staged) {
-    // Stage 1: turbovec H99 buffered collector on the sign plane.
-    // Capacity 2S, returns S. Not a top-S heap — that was the regression.
+    // No mid-plane: collect the exact cut E directly (capacity 2E H99), not S then
+    // re-rank to E — same sign scores either way, less collector traffic than 2S.
+    const std::size_t e_len = planes_exact_len(kk, s_len);
+    const std::size_t sign_cap = std::min(n_vectors, std::max<std::size_t>(2 * e_len, e_len));
+
     const auto t_sign0 = clock::now();
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
-    const std::size_t cap = 2 * s_len;
-    // Seed from a strided sample of the whole index (not a prefix — that
-    // biases the threshold and can lock out true neighbours while still
-    // filling S, so the short-count rescan never fires).
-    std::vector<float> seed_mins(nq, -std::numeric_limits<float>::infinity());
-    {
-      const std::size_t n_s_target = std::min(n_vectors, static_cast<std::size_t>(2048));
-      const std::size_t n_s_blocks =
-          std::min(sign_n_blocks, (n_s_target + kBlock - 1) / kBlock);
-      if (n_s_blocks > 0 && n_s_blocks * kBlock >= 6 && 2 * s_len < n_vectors) {
-        const std::size_t block_bytes = prep_sign.n_byte_groups * kBlock;
-        std::vector<std::uint8_t> sample_codes(n_s_blocks * block_bytes);
-        std::vector<float> sample_scales(n_s_blocks * kBlock, 0.f);
-        for (std::size_t i = 0; i < n_s_blocks; ++i) {
-          const std::size_t b = (i * sign_n_blocks) / n_s_blocks;
-          std::memcpy(sample_codes.data() + i * block_bytes,
-                      sign_codes.data() + b * block_bytes, block_bytes);
-          const std::size_t v0 = b * kBlock;
-          const std::size_t n_copy = std::min(kBlock, n_vectors - v0);
-          std::memcpy(sample_scales.data() + i * kBlock, lm_scales.data() + v0,
-                      n_copy * sizeof(float));
-        }
-        const std::size_t n_s = n_s_blocks * kBlock;
-        const float r_s = static_cast<float>(s_len * n_s) / static_cast<float>(n_vectors);
-        const float over = std::min(4.f, 1.f + 4.f / std::sqrt(std::max(1.f, r_s)));
-        const std::size_t r = std::min(
-            n_s, std::max<std::size_t>(6, static_cast<std::size_t>(std::ceil(over * r_s))));
-        SearchResults sample =
-            score_prepared(prep_sign, r, sample_codes, n_s_blocks, sample_scales);
-        for (std::size_t qi = 0; qi < nq; ++qi) {
-          seed_mins[qi] = sample.scores[qi * sample.k + (sample.k - 1)];
-        }
-      }
-    }
     SearchResults shortlist =
-        score_prepared(prep_sign, cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {}, {},
-                       nullptr, /*buffered=*/true, seed_mins.data());
-    // turbovec: seed is a guess — rescan unseeded any query that came back short.
-    if (!shortlist.counts.empty()) {
-      std::vector<std::size_t> redo;
-      for (std::size_t qi = 0; qi < nq; ++qi) {
-        if (shortlist.counts[qi] < s_len) redo.push_back(qi);
-      }
-      if (!redo.empty()) {
-        SearchResults again =
-            score_prepared(prep_sign, cap, sign_codes, sign_n_blocks, lm_scales, {}, redo, {}, {},
-                           {}, nullptr, /*buffered=*/true, nullptr);
-        for (std::size_t i = 0; i < redo.size(); ++i) {
-          const std::size_t qi = redo[i];
-          const std::size_t nk = std::min(shortlist.k, again.k);
-          for (std::size_t j = 0; j < nk; ++j) {
-            shortlist.scores[qi * shortlist.k + j] = again.scores[i * again.k + j];
-            shortlist.ids[qi * shortlist.k + j] = again.ids[i * again.k + j];
-          }
-          if (!shortlist.counts.empty()) shortlist.counts[qi] = nk;
-        }
-      }
-    }
-
-    // Buffered shortlist is unordered (nth_element). Rank by sign score before
-    // cutting to E — taking ids[0..E) of an unordered S was a random subset
-    // and collapsed recall@1 from ~0.98 → ~0.7.
-    const std::size_t e_len = planes_exact_len(kk, std::min(s_len, shortlist.k));
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-      const std::size_t qis = static_cast<std::size_t>(qi);
-      const std::size_t n_have =
-          shortlist.counts.empty() ? shortlist.k : std::min(shortlist.k, shortlist.counts[qis]);
-      if (n_have <= 1) continue;
-      std::vector<std::size_t> order(n_have);
-      for (std::size_t j = 0; j < n_have; ++j) order[j] = j;
-      float* sc = shortlist.scores.data() + qis * shortlist.k;
-      std::uint64_t* ids = shortlist.ids.data() + qis * shortlist.k;
-      const std::size_t n_rank = std::min(e_len, n_have);
-      std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(n_rank),
-                        order.end(), [&](std::size_t a, std::size_t b) {
-                          if (sc[a] != sc[b]) return sc[a] > sc[b];
-                          return ids[a] < ids[b];
-                        });
-      std::vector<float> sc_tmp(n_rank);
-      std::vector<std::uint64_t> id_tmp(n_rank);
-      for (std::size_t j = 0; j < n_rank; ++j) {
-        sc_tmp[j] = sc[order[j]];
-        id_tmp[j] = ids[order[j]];
-      }
-      for (std::size_t j = 0; j < n_rank; ++j) {
-        sc[j] = sc_tmp[j];
-        ids[j] = id_tmp[j];
-      }
-    }
+        score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
+                       {}, nullptr, /*buffered=*/true);
     if (timings != nullptr) {
       timings->sign_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
@@ -1381,17 +1296,21 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     out.k = kk;
     out.scores.assign(nq * kk, 0.f);
     out.ids.assign(nq * kk, 0);
+    const std::size_t sl_k = shortlist.k;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
     for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
       const std::size_t qis = static_cast<std::size_t>(qi);
-      std::vector<std::uint8_t> gathered(e_len * n_byte_groups_4);
-      std::vector<float> scales_e(e_len);
-      std::vector<float> scale_resid_e(2 * e_len);
-      std::vector<std::uint64_t> id_map_e(e_len);
-      for (std::size_t j = 0; j < e_len; ++j) {
-        const std::uint64_t id = shortlist.ids[qis * shortlist.k + j];
+      const std::size_t n_cand =
+          shortlist.counts.empty() ? std::min(e_len, sl_k)
+                                   : std::min(e_len, shortlist.counts[qis]);
+      std::vector<std::uint8_t> gathered(n_cand * n_byte_groups_4);
+      std::vector<float> scales_e(n_cand);
+      std::vector<float> scale_resid_e(2 * n_cand);
+      std::vector<std::uint64_t> id_map_e(n_cand);
+      for (std::size_t j = 0; j < n_cand; ++j) {
+        const std::uint64_t id = shortlist.ids[qis * sl_k + j];
         const std::size_t vi = static_cast<std::size_t>(id);
         id_map_e[j] = id;
         if (vi < n_vectors) {
@@ -1408,7 +1327,7 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
           }
         }
       }
-      auto packed_e = pack_flat_for_search(gathered, e_len, scan_bits, n_byte_groups_4);
+      auto packed_e = pack_flat_for_search(gathered, n_cand, scan_bits, n_byte_groups_4);
       const std::size_t qi_one[1] = {qis};
       SearchResults one =
           score_prepared(prep_exact, kk, packed_e.first, packed_e.second, scales_e, id_map_e,

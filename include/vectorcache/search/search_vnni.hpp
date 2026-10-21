@@ -55,6 +55,16 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
                         const float* residual_norms = nullptr,
                         const float* residual_scales = nullptr);
 
+/// Same VNNI accumulate as `score_queries_vnni`, but writes `α · lut` into dense
+/// `score_rows[qi][0..n_vectors)` (no top-k / collector). Dual-block + LUT hoist.
+/// Used for staged sign shortlist → `nth_element` top-S after the scan.
+void score_queries_vnni_to_rows(const std::uint8_t* const* split_luts, const float* lut_scales,
+                                const float* lut_biases, std::size_t nq,
+                                std::span<const std::uint8_t> blocked_codes,
+                                std::span<const float> vec_scales, std::size_t n_byte_groups,
+                                std::size_t n_vectors, std::size_t n_blocks,
+                                float* const* score_rows);
+
 /// Score one query with 4-bit permute-dot (dual-block when possible).
 /// If `hit_bitmap` is non-null, only vectors with bit set enter the heap (empty blocks skipped).
 /// `vec_offset` / `global_n_vectors` map local block indices into a global hit bitmap (block tiling).

@@ -273,7 +273,8 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
       << " VECTORCACHE_PLANES_MIN="
       << (std::getenv("VECTORCACHE_PLANES_MIN") ? std::getenv("VECTORCACHE_PLANES_MIN") : "(unset)")
       << "\n";
-  out << "planes_for()=" << (planes_for(bits, n_byte_groups) ? 1 : 0)
+  out << "use_planes4()=" << (use_planes4() ? 1 : 0)
+      << " planes_for()=" << (planes_for(bits, n_byte_groups) ? 1 : 0)
       << " planes_min_vectors=" << planes_min_vectors() << "\n";
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -447,8 +448,8 @@ std::uint8_t read_code(std::span<const std::uint8_t> blocked, std::size_t bits,
 }
 
 bool use_planes4() {
-  if (const char* v = std::getenv("TURBOVEC_4BIT_PLANES"); v && v[0] == '0' && v[1] == '\0') {
-    return false;
+  if (const char* v = std::getenv("TURBOVEC_4BIT_PLANES"); v != nullptr && v[0] == '0') {
+    return false;  // "0", "0…": kill switch
   }
   return true;
 }
