@@ -276,6 +276,11 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
   out << "use_planes4()=" << (use_planes4() ? 1 : 0)
       << " planes_for()=" << (planes_for(bits, n_byte_groups) ? 1 : 0)
       << " planes_min_vectors=" << planes_min_vectors() << "\n";
+  // Sign shortlist uses classic VNNI (vpermb LUT), not permute-dot — same split
+  // as turbovec's 2-bit kernel. Full 4-bit scan is permute-dot when VM.
+  if (planes_for(bits, n_byte_groups)) {
+    out << "sign_kernel=avx512_vnni_lut (vpermb)  exact_kernel=avx512_permute_dot\n";
+  }
 
 #if defined(__x86_64__) || defined(_M_X64)
   unsigned leaf7_ebx = 0, leaf7_ecx = 0;

@@ -35,10 +35,13 @@ namespace {
 #if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
 #define VECTORCACHE_AVX512_FN
 #else
-// Per-fn ISA (turbovec #[target_feature]): VNNI+GFNI so LLVM can emit
-// vpdpbusd {1to16} / vgf2p8affineqb without relying on TU-wide flags alone.
-#define VECTORCACHE_AVX512_FN \
-  __attribute__((noinline, noipa, target("avx512f,avx512bw,avx512vnni,gfni")))
+// Per-fn ISA (turbovec #[target_feature]): VBMI is load-bearing for the
+// classic VNNI LUT path — without it `vpermb` is emulated (~3× slower).
+// VNNI+GFNI cover permute-dot / affine high-nibble extract.
+#define VECTORCACHE_AVX512_FN                                                         \
+  __attribute__((                                                                     \
+      noinline, noipa,                                                                \
+      target("avx512f,avx512bw,avx512vbmi,avx512vnni,gfni")))
 #endif
 #else
 #define VECTORCACHE_AVX512_FN
@@ -327,6 +330,12 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
 }
 
 #if !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
+/// Classic VNNI LUT multi-query (sign / 2-bit). `NQ` is a compile-time constant so
+/// `acc[NQ][2]` stays in ZMM — a runtime `nq` index spills every accumulator
+/// (MSVC measured `sub rsp,0x740` on the untemplated form; turbovec H34).
+/// Single-block only: dual-block would need 4·NQ ZMMs and spill again at NQ=8.
+/// Caller pads to NQ; only the first `nq` lanes are flushed.
+template <std::size_t NQ>
 VECTORCACHE_AVX512_FN
 void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float* lut_scales,
                               const float* lut_biases, std::size_t nq,
@@ -338,8 +347,9 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
                               const std::uint64_t* id_map, const float* score_offsets,
                               const float* residual_norms = nullptr,
                               const float* residual_scales = nullptr) {
+  static_assert(NQ == 8 || NQ == 10);
   assert(n_byte_groups % 4 == 0);
-  assert(nq >= 1 && nq <= 10);
+  assert(nq >= 1 && nq <= NQ);
 
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const __m512i kpos = _mm512_set1_epi32(static_cast<int>(0x30201000u));
@@ -347,93 +357,38 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
   const std::size_t quads = n_byte_groups / 4;
   const std::size_t block_bytes = n_byte_groups * kBlock;
 
-  // Dual-block: one codes stream shared across two FastScan blocks (same as single-query
-  // VNNI / to_rows). Amortizes LUT loads for the sign-plane shortlist.
-  const std::size_t n_pairs = n_blocks / 2;
-  for (std::size_t pb = 0; pb < n_pairs; ++pb) {
-    const std::size_t b = pb * 2;
-    const std::size_t base0 = b * block_bytes;
-    const std::size_t base1 = base0 + block_bytes;
-    __m512i a0[10][2];
-    __m512i a1[10][2];
-    for (std::size_t qi = 0; qi < nq; ++qi) {
-      a0[qi][0] = _mm512_setzero_si512();
-      a0[qi][1] = _mm512_setzero_si512();
-      a1[qi][0] = _mm512_setzero_si512();
-      a1[qi][1] = _mm512_setzero_si512();
-    }
-    for (std::size_t q4 = 0; q4 < quads; ++q4) {
-      __m512i tlo[10];
-      __m512i thi[10];
-      for (std::size_t qi = 0; qi < nq; ++qi) {
-        const std::uint8_t* tp = split_luts[qi] + q4 * 128;
-        tlo[qi] = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp));
-        thi[qi] = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp + 64));
-      }
-      for (std::size_t h = 0; h < 2; ++h) {
-        const __m512i c0 = _mm512_loadu_si512(
-            reinterpret_cast<const __m512i*>(blocked_codes.data() + base0 + q4 * 128 + h * 64));
-        const __m512i c1 = _mm512_loadu_si512(
-            reinterpret_cast<const __m512i*>(blocked_codes.data() + base1 + q4 * 128 + h * 64));
-        const __m512i i0lo = _mm512_or_si512(_mm512_and_si512(c0, m0f), kpos);
-        const __m512i i0hi =
-            _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(c0, 4), m0f), kpos);
-        const __m512i i1lo = _mm512_or_si512(_mm512_and_si512(c1, m0f), kpos);
-        const __m512i i1hi =
-            _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(c1, 4), m0f), kpos);
-        for (std::size_t qi = 0; qi < nq; ++qi) {
-          a0[qi][h] = _mm512_dpbusd_epi32(a0[qi][h], _mm512_permutexvar_epi8(i0lo, tlo[qi]), ones);
-          a0[qi][h] = _mm512_dpbusd_epi32(a0[qi][h], _mm512_permutexvar_epi8(i0hi, thi[qi]), ones);
-          a1[qi][h] = _mm512_dpbusd_epi32(a1[qi][h], _mm512_permutexvar_epi8(i1lo, tlo[qi]), ones);
-          a1[qi][h] = _mm512_dpbusd_epi32(a1[qi][h], _mm512_permutexvar_epi8(i1hi, thi[qi]), ones);
-        }
-      }
-    }
-    for (std::size_t qi = 0; qi < nq; ++qi) {
-      const __m512 vs = _mm512_set1_ps(lut_scales[qi]);
-      const __m512 vb = _mm512_set1_ps(lut_biases[qi]);
-      const float off = score_offsets ? score_offsets[qi] : 0.f;
-      const float rs = residual_scales ? residual_scales[qi] : 0.f;
-      for (std::size_t i = 0; i < 2; ++i) {
-        const __m512i* a = (i == 0) ? a0[qi] : a1[qi];
-        const std::size_t base_vec = (b + i) * kBlock;
-        const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
-        const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
-        flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s[qi], heap_i[qi],
-                         heap_sz[qi], heap_min[qi], heap_mi[qi], id_map, off, nullptr, 0, 0,
-                         residual_norms, rs);
-      }
-    }
-  }
-
-  for (std::size_t b = n_pairs * 2; b < n_blocks; ++b) {
+  for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t base_vec = b * kBlock;
     const std::size_t block_base = b * block_bytes;
-    __m512i acc[10][2];
-    for (std::size_t qi = 0; qi < nq; ++qi) {
+    __m512i acc[NQ][2];
+    for (std::size_t qi = 0; qi < NQ; ++qi) {
       acc[qi][0] = _mm512_setzero_si512();
       acc[qi][1] = _mm512_setzero_si512();
     }
+
     for (std::size_t q4 = 0; q4 < quads; ++q4) {
-      __m512i tlo[10];
-      __m512i thi[10];
-      for (std::size_t qi = 0; qi < nq; ++qi) {
+      // LUT is query×quad — hoist out of h (same table for both halves).
+      __m512i tlo[NQ];
+      __m512i thi[NQ];
+      for (std::size_t qi = 0; qi < NQ; ++qi) {
         const std::uint8_t* tp = split_luts[qi] + q4 * 128;
         tlo[qi] = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp));
         thi[qi] = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp + 64));
       }
       for (std::size_t h = 0; h < 2; ++h) {
+        // turbovec search_multi_query_vnni::<false>: no software prefetch at NQ>1.
         const __m512i c = _mm512_loadu_si512(
             reinterpret_cast<const __m512i*>(blocked_codes.data() + block_base + q4 * 128 + h * 64));
         const __m512i ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
         const __m512i ihi =
             _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(c, 4), m0f), kpos);
-        for (std::size_t qi = 0; qi < nq; ++qi) {
+        for (std::size_t qi = 0; qi < NQ; ++qi) {
           acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], _mm512_permutexvar_epi8(ilo, tlo[qi]), ones);
           acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], _mm512_permutexvar_epi8(ihi, thi[qi]), ones);
         }
       }
     }
+
     for (std::size_t qi = 0; qi < nq; ++qi) {
       const __m512 vs = _mm512_set1_ps(lut_scales[qi]);
       const __m512 vb = _mm512_set1_ps(lut_biases[qi]);
@@ -888,9 +843,55 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
                           off, residual_norms, rs);
   }
 #else
-  score_queries_vnni_multi(split_luts, lut_scales, lut_biases, nq, blocked_codes, vec_scales,
-                           n_byte_groups, n_vectors, n_blocks, k, heap_s, heap_i, heap_sz, heap_min,
-                           heap_mi, id_map, score_offsets, residual_norms, residual_scales);
+  // Pad to full NQ so `acc[qi]` indices are compile-time constants (turbovec H34).
+  if (nq > 10) {
+    throw std::invalid_argument("score_queries_vnni: nq > 10");
+  }
+  const std::size_t NQ = (nq > 8) ? 10 : 8;
+  const std::uint8_t* pad_luts[10];
+  float pad_scales[10];
+  float pad_biases[10];
+  float* pad_heap_s[10];
+  std::uint64_t* pad_heap_i[10];
+  std::size_t pad_heap_sz[10];
+  float pad_heap_min[10];
+  std::size_t pad_heap_mi[10];
+  float pad_offs[10];
+  float pad_rs[10];
+  float dummy_s = 0.f;
+  std::uint64_t dummy_i = 0;
+  const std::size_t pad_qi = nq - 1;
+  for (std::size_t i = 0; i < NQ; ++i) {
+    const std::size_t src = (i < nq) ? i : pad_qi;
+    pad_luts[i] = split_luts[src];
+    pad_scales[i] = lut_scales[src];
+    pad_biases[i] = lut_biases[src];
+    pad_heap_s[i] = (i < nq) ? heap_s[i] : &dummy_s;
+    pad_heap_i[i] = (i < nq) ? heap_i[i] : &dummy_i;
+    pad_heap_sz[i] = (i < nq) ? heap_sz[i] : 0;
+    pad_heap_min[i] = (i < nq) ? heap_min[i] : 0.f;
+    pad_heap_mi[i] = (i < nq) ? heap_mi[i] : 0;
+    pad_offs[i] = score_offsets ? score_offsets[src] : 0.f;
+    pad_rs[i] = residual_scales ? residual_scales[src] : 0.f;
+  }
+  const float* offs_ptr = score_offsets ? pad_offs : nullptr;
+  const float* rs_ptr = residual_scales ? pad_rs : nullptr;
+  if (NQ == 10) {
+    score_queries_vnni_multi<10>(pad_luts, pad_scales, pad_biases, nq, blocked_codes, vec_scales,
+                                 n_byte_groups, n_vectors, n_blocks, k, pad_heap_s, pad_heap_i,
+                                 pad_heap_sz, pad_heap_min, pad_heap_mi, id_map, offs_ptr,
+                                 residual_norms, rs_ptr);
+  } else {
+    score_queries_vnni_multi<8>(pad_luts, pad_scales, pad_biases, nq, blocked_codes, vec_scales,
+                                n_byte_groups, n_vectors, n_blocks, k, pad_heap_s, pad_heap_i,
+                                pad_heap_sz, pad_heap_min, pad_heap_mi, id_map, offs_ptr,
+                                residual_norms, rs_ptr);
+  }
+  for (std::size_t i = 0; i < nq; ++i) {
+    heap_sz[i] = pad_heap_sz[i];
+    heap_min[i] = pad_heap_min[i];
+    heap_mi[i] = pad_heap_mi[i];
+  }
 #endif
 #else
   (void)split_luts;
