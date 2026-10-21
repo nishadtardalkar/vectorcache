@@ -1270,22 +1270,32 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     // Capacity 2S, returns S. Not a top-S heap — that was the regression.
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
     const std::size_t cap = 2 * s_len;
-    // Seed thresholds from a prefix of blocks (turbovec sample seed): r-th
-    // best on the sample so the collector admits hundreds, not tens of thousands.
+    // Seed from a strided sample of the whole index (not a prefix — that
+    // biases the threshold and can lock out true neighbours while still
+    // filling S, so the short-count rescan never fires).
     std::vector<float> seed_mins(nq, -std::numeric_limits<float>::infinity());
     {
       const std::size_t n_s_target = std::min(n_vectors, static_cast<std::size_t>(2048));
       const std::size_t n_s_blocks =
           std::min(sign_n_blocks, (n_s_target + kBlock - 1) / kBlock);
-      const std::size_t n_s = std::min(n_vectors, n_s_blocks * kBlock);
-      if (n_s_blocks > 0 && n_s >= 6 && 2 * s_len < n_vectors) {
+      if (n_s_blocks > 0 && n_s_blocks * kBlock >= 6 && 2 * s_len < n_vectors) {
+        const std::size_t block_bytes = prep_sign.n_byte_groups * kBlock;
+        std::vector<std::uint8_t> sample_codes(n_s_blocks * block_bytes);
+        std::vector<float> sample_scales(n_s_blocks * kBlock, 0.f);
+        for (std::size_t i = 0; i < n_s_blocks; ++i) {
+          const std::size_t b = (i * sign_n_blocks) / n_s_blocks;
+          std::memcpy(sample_codes.data() + i * block_bytes,
+                      sign_codes.data() + b * block_bytes, block_bytes);
+          const std::size_t v0 = b * kBlock;
+          const std::size_t n_copy = std::min(kBlock, n_vectors - v0);
+          std::memcpy(sample_scales.data() + i * kBlock, lm_scales.data() + v0,
+                      n_copy * sizeof(float));
+        }
+        const std::size_t n_s = n_s_blocks * kBlock;
         const float r_s = static_cast<float>(s_len * n_s) / static_cast<float>(n_vectors);
         const float over = std::min(4.f, 1.f + 4.f / std::sqrt(std::max(1.f, r_s)));
         const std::size_t r = std::min(
             n_s, std::max<std::size_t>(6, static_cast<std::size_t>(std::ceil(over * r_s))));
-        const std::size_t sample_bytes = n_s_blocks * prep_sign.n_byte_groups * kBlock;
-        auto sample_codes = sign_codes.subspan(0, sample_bytes);
-        auto sample_scales = lm_scales.subspan(0, n_s);
         SearchResults sample =
             score_prepared(prep_sign, r, sample_codes, n_s_blocks, sample_scales);
         for (std::size_t qi = 0; qi < nq; ++qi) {
@@ -1318,9 +1328,42 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       }
     }
 
-    // Stage 2: gather top-E by sign into a tiny blocked pack; same permute-dot
-    // kernel as the full scan (SIMD), not a scalar LUT walk over S.
+    // Buffered shortlist is unordered (nth_element). Rank by sign score before
+    // cutting to E — taking ids[0..E) of an unordered S was a random subset
+    // and collapsed recall@1 from ~0.98 → ~0.7.
     const std::size_t e_len = planes_exact_len(kk, std::min(s_len, shortlist.k));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+      const std::size_t qis = static_cast<std::size_t>(qi);
+      const std::size_t n_have =
+          shortlist.counts.empty() ? shortlist.k : std::min(shortlist.k, shortlist.counts[qis]);
+      if (n_have <= 1) continue;
+      std::vector<std::size_t> order(n_have);
+      for (std::size_t j = 0; j < n_have; ++j) order[j] = j;
+      float* sc = shortlist.scores.data() + qis * shortlist.k;
+      std::uint64_t* ids = shortlist.ids.data() + qis * shortlist.k;
+      const std::size_t n_rank = std::min(e_len, n_have);
+      std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(n_rank),
+                        order.end(), [&](std::size_t a, std::size_t b) {
+                          if (sc[a] != sc[b]) return sc[a] > sc[b];
+                          return ids[a] < ids[b];
+                        });
+      std::vector<float> sc_tmp(n_rank);
+      std::vector<std::uint64_t> id_tmp(n_rank);
+      for (std::size_t j = 0; j < n_rank; ++j) {
+        sc_tmp[j] = sc[order[j]];
+        id_tmp[j] = ids[order[j]];
+      }
+      for (std::size_t j = 0; j < n_rank; ++j) {
+        sc[j] = sc_tmp[j];
+        ids[j] = id_tmp[j];
+      }
+    }
+
+    // Stage 2: gather top-E (by sign) into a tiny blocked pack; same permute-dot
+    // kernel as the full scan (SIMD), not a scalar LUT walk over S.
     auto prep_exact = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
     out.nq = nq;
     out.k = kk;
