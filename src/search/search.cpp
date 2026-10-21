@@ -239,7 +239,8 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
                                 const float* residual_norms = nullptr,
                                 const float* residual_scales = nullptr,
                                 const float* scale_resid = nullptr,
-                                const std::uint64_t* const* hit_bitmaps = nullptr) {
+                                const std::uint64_t* const* hit_bitmaps = nullptr,
+                                bool buffered = false, const float* seed_mins = nullptr) {
   const std::size_t nq = query_indices.empty() ? prep.nq : query_indices.size();
   auto global_qi = [&](std::size_t local_i) -> std::size_t {
     return query_indices.empty() ? local_i : query_indices[local_i];
@@ -247,12 +248,18 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   const std::size_t n_vectors = scales.size();
   const std::size_t n_byte_groups = prep.n_byte_groups;
   const bool use_pd = prep.backend == SearchBackendKind::VmPermuteDot;
+  // turbovec buffered collector: capacity = effective_k (=2S), output shortlist = k/2 (=S).
+  const std::size_t out_k =
+      buffered ? std::max<std::size_t>(effective_k / 2, 1) : effective_k;
 
   SearchResults out;
   out.nq = nq;
-  out.k = effective_k;
-  out.scores.assign(nq * effective_k, 0.f);
-  out.ids.assign(nq * effective_k, 0);
+  out.k = out_k;
+  out.scores.assign(nq * out_k, 0.f);
+  out.ids.assign(nq * out_k, 0);
+  if (buffered) {
+    out.counts.assign(nq, 0);
+  }
   if (nq == 0) {
     return out;
   }
@@ -297,10 +304,14 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   std::vector<std::atomic<std::uint32_t>> prune_seed(nq);
   {
     const float ninf = -std::numeric_limits<float>::infinity();
-    std::uint32_t ninf_bits = 0;
-    std::memcpy(&ninf_bits, &ninf, sizeof(ninf_bits));
     for (std::size_t i = 0; i < nq; ++i) {
-      prune_seed[i].store(ninf_bits, std::memory_order_relaxed);
+      float seed = ninf;
+      if (seed_mins != nullptr) {
+        seed = seed_mins[global_qi(i)];
+      }
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &seed, sizeof(bits));
+      prune_seed[i].store(bits, std::memory_order_relaxed);
     }
   }
   // MinGW Win64 miscompiles concurrent AVX-512 VNNI under OpenMP; keep the VM
@@ -335,7 +346,7 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       std::vector<std::uint64_t> heap_i_store(batch_nq * effective_k);
       std::vector<std::size_t> heap_sz(batch_nq, 0);
       std::vector<float> heap_min(batch_nq);
-      std::vector<std::size_t> heap_mi(batch_nq, 0);
+      std::vector<std::size_t> heap_mi(batch_nq, buffered ? kHeapBuffered : 0);
       std::vector<float*> heap_s_ptrs(batch_nq);
       std::vector<std::uint64_t*> heap_i_ptrs(batch_nq);
       for (std::size_t i = 0; i < batch_nq; ++i) {
@@ -396,7 +407,8 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       }
       for (std::size_t i = 0; i < batch_nq; ++i) {
         const std::size_t qi = tile.qi_start + i;
-        if (heap_sz[i] >= effective_k) {
+        // Heap: publish once full. Collector: publish once threshold is real (sz ≥ S).
+        if (heap_sz[i] >= effective_k || (buffered && heap_sz[i] >= out_k)) {
           // Atomic max of heap_min bits (valid prune seed for later tiles).
           std::uint32_t want = 0;
           std::memcpy(&want, &heap_min[i], sizeof(want));
@@ -437,15 +449,29 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
 
   for (std::size_t qi = 0; qi < nq; ++qi) {
     auto& cands = all_cands[qi];
-    const std::size_t kk = std::min(effective_k, cands.size());
-    std::partial_sort(cands.begin(), cands.begin() + static_cast<std::ptrdiff_t>(kk), cands.end(),
-                      [](const TileCand& a, const TileCand& b) {
-                        if (a.score != b.score) return a.score > b.score;
-                        return a.id < b.id;
-                      });
+    const std::size_t kk = std::min(out_k, cands.size());
+    if (buffered) {
+      // turbovec buffered_select: shortlist is rescored — order unused.
+      if (cands.size() > kk) {
+        std::nth_element(cands.begin(), cands.begin() + static_cast<std::ptrdiff_t>(kk), cands.end(),
+                         [](const TileCand& a, const TileCand& b) {
+                           if (a.score != b.score) return a.score > b.score;
+                           return a.id < b.id;
+                         });
+      }
+    } else {
+      std::partial_sort(cands.begin(), cands.begin() + static_cast<std::ptrdiff_t>(kk), cands.end(),
+                        [](const TileCand& a, const TileCand& b) {
+                          if (a.score != b.score) return a.score > b.score;
+                          return a.id < b.id;
+                        });
+    }
     for (std::size_t j = 0; j < kk; ++j) {
-      out.scores[qi * effective_k + j] = cands[j].score;
-      out.ids[qi * effective_k + j] = cands[j].id;
+      out.scores[qi * out_k + j] = cands[j].score;
+      out.ids[qi * out_k + j] = cands[j].id;
+    }
+    if (buffered) {
+      out.counts[qi] = kk;
     }
   }
   return out;
@@ -927,7 +953,8 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const float> residual_norms,
                              std::span<const float> residual_scales,
                              std::span<const float> scale_resid,
-                             const std::uint64_t* const* hit_bitmaps) {
+                             const std::uint64_t* const* hit_bitmaps, bool buffered,
+                             const float* seed_mins) {
   if (!query_indices.empty()) {
     for (std::size_t qi : query_indices) {
       if (qi >= prep.nq) {
@@ -964,8 +991,11 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
   if (prep.backend == SearchBackendKind::VmPermuteDot ||
       prep.backend == SearchBackendKind::VmVnni) {
     out = score_prepared_vm(prep, effective_k, blocked_codes, n_blocks, scales, query_indices,
-                            resid_ptr, resid_sc_ptr, scale_resid_ptr, hit_bitmaps);
+                            resid_ptr, resid_sc_ptr, scale_resid_ptr, hit_bitmaps, buffered,
+                            seed_mins);
   } else {
+    (void)buffered;
+    (void)seed_mins;
     out = score_prepared_perm0(prep, effective_k, blocked_codes, n_blocks, scales, query_indices);
     // AVX2/scalar heap: apply residual after (membership was s_L-only).
     if (resid_ptr != nullptr && resid_sc_ptr != nullptr) {
@@ -1236,69 +1266,102 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
 
   SearchResults out;
   if (use_staged) {
-    // Stage 1: sign-plane VNNI over all n (¼ of full 4-bit bytes) → shortlist S.
+    // Stage 1: turbovec H99 buffered collector on the sign plane.
+    // Capacity 2S, returns S. Not a top-S heap — that was the regression.
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
+    const std::size_t cap = 2 * s_len;
+    // Seed thresholds from a prefix of blocks (turbovec sample seed): r-th
+    // best on the sample so the collector admits hundreds, not tens of thousands.
+    std::vector<float> seed_mins(nq, -std::numeric_limits<float>::infinity());
+    {
+      const std::size_t n_s_target = std::min(n_vectors, static_cast<std::size_t>(2048));
+      const std::size_t n_s_blocks =
+          std::min(sign_n_blocks, (n_s_target + kBlock - 1) / kBlock);
+      const std::size_t n_s = std::min(n_vectors, n_s_blocks * kBlock);
+      if (n_s_blocks > 0 && n_s >= 6 && 2 * s_len < n_vectors) {
+        const float r_s = static_cast<float>(s_len * n_s) / static_cast<float>(n_vectors);
+        const float over = std::min(4.f, 1.f + 4.f / std::sqrt(std::max(1.f, r_s)));
+        const std::size_t r = std::min(
+            n_s, std::max<std::size_t>(6, static_cast<std::size_t>(std::ceil(over * r_s))));
+        const std::size_t sample_bytes = n_s_blocks * prep_sign.n_byte_groups * kBlock;
+        auto sample_codes = sign_codes.subspan(0, sample_bytes);
+        auto sample_scales = lm_scales.subspan(0, n_s);
+        SearchResults sample =
+            score_prepared(prep_sign, r, sample_codes, n_s_blocks, sample_scales);
+        for (std::size_t qi = 0; qi < nq; ++qi) {
+          seed_mins[qi] = sample.scores[qi * sample.k + (sample.k - 1)];
+        }
+      }
+    }
     SearchResults shortlist =
-        score_prepared(prep_sign, s_len, sign_codes, sign_n_blocks, lm_scales);
+        score_prepared(prep_sign, cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {}, {},
+                       nullptr, /*buffered=*/true, seed_mins.data());
+    // turbovec: seed is a guess — rescan unseeded any query that came back short.
+    if (!shortlist.counts.empty()) {
+      std::vector<std::size_t> redo;
+      for (std::size_t qi = 0; qi < nq; ++qi) {
+        if (shortlist.counts[qi] < s_len) redo.push_back(qi);
+      }
+      if (!redo.empty()) {
+        SearchResults again =
+            score_prepared(prep_sign, cap, sign_codes, sign_n_blocks, lm_scales, {}, redo, {}, {},
+                           {}, nullptr, /*buffered=*/true, nullptr);
+        for (std::size_t i = 0; i < redo.size(); ++i) {
+          const std::size_t qi = redo[i];
+          const std::size_t nk = std::min(shortlist.k, again.k);
+          for (std::size_t j = 0; j < nk; ++j) {
+            shortlist.scores[qi * shortlist.k + j] = again.scores[i * again.k + j];
+            shortlist.ids[qi * shortlist.k + j] = again.ids[i * again.k + j];
+          }
+          if (!shortlist.counts.empty()) shortlist.counts[qi] = nk;
+        }
+      }
+    }
 
-    // Stage 2: exact score shortlist IDs from flat codes with a LUT — no densify/repack.
-    // Repacking E×n_byte_groups per query was dominating wall time.
-    const std::size_t n_hit_cap = std::min(s_len, shortlist.k);
+    // Stage 2: gather top-E by sign into a tiny blocked pack; same permute-dot
+    // kernel as the full scan (SIMD), not a scalar LUT walk over S.
+    const std::size_t e_len = planes_exact_len(kk, std::min(s_len, shortlist.k));
+    auto prep_exact = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
     out.nq = nq;
     out.k = kk;
     out.scores.assign(nq * kk, 0.f);
     out.ids.assign(nq * kk, 0);
-    std::vector<PreparedQueryLut> exact_luts(nq);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
-      const std::size_t qis = static_cast<std::size_t>(qi);
-      auto qrow = std::span<const float>(q_land.data() + qis * scan_dim, scan_dim);
-      exact_luts[qis] = build_query_lut(qrow, lm_centroids, scan_bits, scan_dim);
-    }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
     for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
       const std::size_t qis = static_cast<std::size_t>(qi);
-      const PreparedQueryLut& lut = exact_luts[qis];
-      const float qperp = q_perp[qis];
-      std::vector<float> heap_s(kk);
-      std::vector<std::uint64_t> heap_i(kk);
-      std::size_t heap_sz = 0;
-      float heap_min = -std::numeric_limits<float>::infinity();
-      std::size_t heap_mi = 0;
-      for (std::size_t j = 0; j < n_hit_cap; ++j) {
+      std::vector<std::uint8_t> gathered(e_len * n_byte_groups_4);
+      std::vector<float> scales_e(e_len);
+      std::vector<float> scale_resid_e(2 * e_len);
+      std::vector<std::uint64_t> id_map_e(e_len);
+      for (std::size_t j = 0; j < e_len; ++j) {
         const std::uint64_t id = shortlist.ids[qis * shortlist.k + j];
         const std::size_t vi = static_cast<std::size_t>(id);
-        if (vi >= n_vectors) {
-          continue;
+        id_map_e[j] = id;
+        if (vi < n_vectors) {
+          std::memcpy(gathered.data() + j * n_byte_groups_4,
+                      codes_flat.data() + vi * n_byte_groups_4, n_byte_groups_4);
+          if (!scale_resid.empty()) {
+            scale_resid_e[2 * j] = scale_resid[2 * vi];
+            scale_resid_e[2 * j + 1] = scale_resid[2 * vi + 1];
+            scales_e[j] = scale_resid[2 * vi];
+          } else {
+            scales_e[j] = lm_scales[vi];
+            scale_resid_e[2 * j] = lm_scales[vi];
+            scale_resid_e[2 * j + 1] = residual_norms[vi];
+          }
         }
-        const std::uint8_t* row = codes_flat.data() + vi * n_byte_groups_4;
-        float score = lut.bias;
-        for (std::size_t g = 0; g < n_byte_groups_4; ++g) {
-          const auto byte_val = static_cast<std::size_t>(row[g]);
-          score += lut.scale * static_cast<float>(lut.uint8_luts[g * 32 + (byte_val >> 4)]);
-          score +=
-              lut.scale * static_cast<float>(lut.uint8_luts[g * 32 + 16 + (byte_val & 0x0F)]);
-        }
-        const float alpha = !scale_resid.empty() ? scale_resid[2 * vi] : lm_scales[vi];
-        const float resid =
-            !scale_resid.empty() ? scale_resid[2 * vi + 1] : residual_norms[vi];
-        score = score * alpha + qperp * resid;
-        heap_push_or_replace(heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi, kk, score,
-                             id);
       }
-      std::vector<std::size_t> order(heap_sz);
-      for (std::size_t j = 0; j < heap_sz; ++j) order[j] = j;
-      std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-        if (heap_s[a] != heap_s[b]) return heap_s[a] > heap_s[b];
-        return heap_i[a] < heap_i[b];
-      });
-      for (std::size_t j = 0; j < heap_sz; ++j) {
-        out.scores[qis * kk + j] = heap_s[order[j]];
-        out.ids[qis * kk + j] = heap_i[order[j]];
+      auto packed_e = pack_flat_for_search(gathered, e_len, scan_bits, n_byte_groups_4);
+      const std::size_t qi_one[1] = {qis};
+      SearchResults one =
+          score_prepared(prep_exact, kk, packed_e.first, packed_e.second, scales_e, id_map_e,
+                         std::span<const std::size_t>(qi_one, 1), {}, q_perp, scale_resid_e);
+      const std::size_t n_out = std::min(kk, one.k);
+      for (std::size_t j = 0; j < n_out; ++j) {
+        out.scores[qis * kk + j] = one.scores[j];
+        out.ids[qis * kk + j] = one.ids[j];
       }
     }
   } else {

@@ -3,9 +3,16 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <utility>
+#include <vector>
 
 namespace vectorcache {
+
+/// turbovec `HEAP_BUFFERED`: `heap_mi` marker — arrays are a threshold-fill
+/// collector (capacity `k`), not a top-k min-heap. Append above threshold; at
+/// capacity keep best `k/2` and raise the threshold to the worst kept.
+constexpr std::size_t kHeapBuffered = std::numeric_limits<std::size_t>::max();
 
 /// True if (sa, ia) is strictly worse than (sb, ib) for a min-heap of top-k scores
 /// (lower score is worse; on equal score, larger id is worse — matches prior rescan).
@@ -56,14 +63,56 @@ inline void topk_heapify(float* heap_s, std::uint64_t* heap_i, std::size_t k) {
   }
 }
 
-/// Flat top-k. For small `k` (≤64) uses turbovec O(k) rescan; for larger shortlists
-/// (staged sign plane, S≈16k) uses a binary min-heap so replaces are O(log k).
-/// `heap_min` starts as `-infinity` or a cross-range prune seed. While filling,
-/// only scores strictly above `heap_min` are kept (unseeded -inf → accept all
-/// finite scores). Once full, replaces the worst when `score > heap_min`.
+/// turbovec `compact_half`: keep best `k/2` of a full collector; return new threshold.
+inline float compact_half(float* heap_s, std::uint64_t* heap_i, std::size_t k) {
+  const std::size_t keep = std::max<std::size_t>(k / 2, 1);
+  std::vector<std::size_t> order(k);
+  for (std::size_t i = 0; i < k; ++i) order[i] = i;
+  std::nth_element(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(keep - 1), order.end(),
+                   [&](std::size_t a, std::size_t b) {
+                     if (heap_s[a] != heap_s[b]) return heap_s[a] > heap_s[b];
+                     return heap_i[a] < heap_i[b];
+                   });
+  std::vector<float> hs(keep);
+  std::vector<std::uint64_t> hi(keep);
+  for (std::size_t j = 0; j < keep; ++j) {
+    hs[j] = heap_s[order[j]];
+    hi[j] = heap_i[order[j]];
+  }
+  for (std::size_t j = 0; j < keep; ++j) {
+    heap_s[j] = hs[j];
+    heap_i[j] = hi[j];
+  }
+  // Threshold = worst of the kept half (order[keep-1] after nth_element is one of the
+  // keep-best; find min among kept).
+  float thr = hs[0];
+  for (std::size_t j = 1; j < keep; ++j) {
+    if (hs[j] < thr) thr = hs[j];
+  }
+  return thr;
+}
+
+/// Flat top-k, or turbovec buffered collector when `heap_mi == kHeapBuffered`.
+/// Collector: append scores above `heap_min`; at capacity `k` keep best `k/2`
+/// and raise the threshold — O(1) admit, rare compact. Heap path: O(k) rescan
+/// for small k, binary heap for k≥128.
 inline void heap_push_or_replace(float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                                  float& heap_min, std::size_t& heap_mi, std::size_t k, float score,
                                  std::uint64_t id) {
+  if (heap_mi == kHeapBuffered) {
+    if (!(score > heap_min)) {
+      return;
+    }
+    heap_s[heap_sz] = score;
+    heap_i[heap_sz] = id;
+    ++heap_sz;
+    if (heap_sz == k) {
+      heap_min = compact_half(heap_s, heap_i, k);
+      heap_sz = std::max<std::size_t>(k / 2, 1);
+    }
+    return;
+  }
+
   constexpr std::size_t kBinaryHeapMinK = 128;
   if (k < kBinaryHeapMinK) {
     if (heap_sz < k) {

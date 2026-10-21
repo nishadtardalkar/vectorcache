@@ -149,7 +149,9 @@ void flush_block_heap(__m512 f0, __m512 f1, std::size_t base_vec, std::size_t n_
     return use_aos ? sr_ptr[2 * lane] : scales_ptr[lane];
   };
 
-  if (heap_sz >= k && end_lane == kBlock) {
+  // Full heap OR buffered collector (turbovec H99): threshold-prune whole blocks.
+  // Collector size stays ~k/2 after compact, so we must not require heap_sz >= k.
+  if ((heap_sz >= k || heap_mi == kHeapBuffered) && end_lane == kBlock) {
     __m512 s0, s1;
     if (use_aos) {
       __m512 a0, r0, a1, r1;

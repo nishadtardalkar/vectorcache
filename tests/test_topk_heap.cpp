@@ -82,3 +82,33 @@ TEST(TopkHeap, LargeKBinaryHeapMatchesPartialSort) {
   std::sort(want.begin(), want.end());
   EXPECT_EQ(got, want);
 }
+
+TEST(TopkHeap, BufferedCollectorKeepsTopHalf) {
+  // turbovec H99: capacity 2S. After each fill, best S are kept; between
+  // compacts sz ∈ [S, 2S). Final buffer must still contain the global top-S.
+  constexpr std::size_t cap = 64;  // 2S
+  constexpr std::size_t keep = cap / 2;
+  constexpr std::size_t n = 500;
+
+  std::vector<float> heap_s(cap);
+  std::vector<std::uint64_t> heap_i(cap);
+  std::size_t heap_sz = 0;
+  float heap_min = -std::numeric_limits<float>::infinity();
+  std::size_t heap_mi = vectorcache::kHeapBuffered;
+
+  for (std::size_t i = 0; i < n; ++i) {
+    const float score = static_cast<float>(i);
+    vectorcache::heap_push_or_replace(heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi, cap,
+                                      score, static_cast<std::uint64_t>(i));
+  }
+  ASSERT_EQ(heap_mi, vectorcache::kHeapBuffered);
+  ASSERT_GE(heap_sz, keep);
+  ASSERT_LT(heap_sz, cap);
+  std::vector<std::uint64_t> got(heap_i.begin(),
+                                 heap_i.begin() + static_cast<std::ptrdiff_t>(heap_sz));
+  std::sort(got.begin(), got.end());
+  for (std::size_t i = 0; i < keep; ++i) {
+    const std::uint64_t id = static_cast<std::uint64_t>(n - keep + i);
+    EXPECT_TRUE(std::binary_search(got.begin(), got.end(), id)) << "missing top id " << id;
+  }
+}
