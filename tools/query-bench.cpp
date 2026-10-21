@@ -430,6 +430,8 @@ int main(int argc, char** argv) {
     std::vector<double> run_ms;
     std::vector<double> fastscan_ms;
     std::vector<double> sign_ms;
+    std::vector<double> sign_vnni_ms;
+    std::vector<double> sign_epilogue_ms;
     std::vector<double> exact_ms;
 
     vectorcache::LandmarkIndex index(db.cols, bits, landmarks, /*landmark_seed=*/0,
@@ -453,16 +455,22 @@ int main(int argc, char** argv) {
       run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
       fastscan_ms.push_back(stages.fastscan_ms);
       sign_ms.push_back(stages.sign_ms);
+      sign_vnni_ms.push_back(stages.sign_vnni_ms);
+      sign_epilogue_ms.push_back(stages.sign_epilogue_ms);
       exact_ms.push_back(stages.exact_ms);
     }
 
     std::sort(run_ms.begin(), run_ms.end());
     std::sort(fastscan_ms.begin(), fastscan_ms.end());
     std::sort(sign_ms.begin(), sign_ms.end());
+    std::sort(sign_vnni_ms.begin(), sign_vnni_ms.end());
+    std::sort(sign_epilogue_ms.begin(), sign_epilogue_ms.end());
     std::sort(exact_ms.begin(), exact_ms.end());
     const double median_ms = run_ms[run_ms.size() / 2];
     const double median_fastscan_ms = fastscan_ms[fastscan_ms.size() / 2];
     const double median_sign_ms = sign_ms[sign_ms.size() / 2];
+    const double median_sign_vnni_ms = sign_vnni_ms[sign_vnni_ms.size() / 2];
+    const double median_sign_epilogue_ms = sign_epilogue_ms[sign_epilogue_ms.size() / 2];
     const double median_exact_ms = exact_ms[exact_ms.size() / 2];
     const double nq = static_cast<double>(queries.rows);
     const double ms_per_query = median_ms / nq;
@@ -475,6 +483,13 @@ int main(int argc, char** argv) {
       // Staged breakdown: 1-bit sign corpus scan vs 4-bit exact on shortlist.
       std::cout << "sign_median_ms=" << median_sign_ms
                 << " sign_ms_per_query=" << (median_sign_ms / nq) << "\n";
+      const double kernel_cpu = median_sign_vnni_ms + median_sign_epilogue_ms;
+      const double vnni_frac = kernel_cpu > 0.0 ? (median_sign_vnni_ms / kernel_cpu) : 0.0;
+      const double epi_frac = kernel_cpu > 0.0 ? (median_sign_epilogue_ms / kernel_cpu) : 0.0;
+      // Summed over OpenMP threads (CPU ms); fractions compare VNNI vs epilogue.
+      std::cout << "sign_vnni_cpu_ms=" << median_sign_vnni_ms
+                << " sign_epilogue_cpu_ms=" << median_sign_epilogue_ms
+                << " sign_vnni_frac=" << vnni_frac << " sign_epilogue_frac=" << epi_frac << "\n";
       std::cout << "exact_median_ms=" << median_exact_ms
                 << " exact_ms_per_query=" << (median_exact_ms / nq) << "\n";
     }

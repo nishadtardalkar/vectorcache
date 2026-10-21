@@ -1,8 +1,10 @@
 #include "vectorcache/search/search_vnni.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +27,25 @@
 
 namespace vectorcache {
 namespace {
+
+std::atomic<VnniKernelProfile*> g_vnni_profile{nullptr};
+
+inline void profile_add_ns(std::atomic<std::uint64_t>* bucket,
+                           std::chrono::steady_clock::time_point t0,
+                           std::chrono::steady_clock::time_point t1) {
+  if (bucket == nullptr) {
+    return;
+  }
+  const auto ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  if (ns > 0) {
+    bucket->fetch_add(static_cast<std::uint64_t>(ns), std::memory_order_relaxed);
+  }
+}
+
+inline VnniKernelProfile* active_vnni_profile() {
+  return g_vnni_profile.load(std::memory_order_relaxed);
+}
 
 #if defined(__x86_64__) || defined(_M_X64)
 
@@ -254,6 +275,10 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
   const __m512 vs = _mm512_set1_ps(lut.scale);
   const __m512 vb = _mm512_set1_ps(bias);
 
+  VnniKernelProfile* const prof = active_vnni_profile();
+  std::atomic<std::uint64_t>* const vnni_ns = prof ? &prof->vnni_ns : nullptr;
+  std::atomic<std::uint64_t>* const epi_ns = prof ? &prof->epilogue_ns : nullptr;
+
   const std::size_t n_pairs = n_blocks / 2;
   for (std::size_t pb = 0; pb < n_pairs; ++pb) {
     const std::size_t b = pb * 2;
@@ -262,6 +287,7 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
     __m512i a0[2] = {_mm512_setzero_si512(), _mm512_setzero_si512()};
     __m512i a1[2] = {_mm512_setzero_si512(), _mm512_setzero_si512()};
 
+    const auto t_vnni0 = std::chrono::steady_clock::now();
     for (std::size_t q4 = 0; q4 < quads; ++q4) {
       for (std::size_t h = 0; h < 2; ++h) {
         const std::size_t pf = base0 + (q4 + 8) * 128 + h * 64;
@@ -291,7 +317,10 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
         a1[h] = _mm512_dpbusd_epi32(a1[h], _mm512_permutexvar_epi8(i1hi, thi), ones);
       }
     }
+    const auto t_vnni1 = std::chrono::steady_clock::now();
+    profile_add_ns(vnni_ns, t_vnni0, t_vnni1);
 
+    const auto t_epi0 = std::chrono::steady_clock::now();
     for (std::size_t i = 0; i < 2; ++i) {
       const __m512i* a = (i == 0) ? a0 : a1;
       const std::size_t base_vec = (b + i) * kBlock;
@@ -301,11 +330,14 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
                        heap_min, heap_mi, id_map, score_offset, nullptr, 0, 0, residual_norms,
                        residual_scale);
     }
+    const auto t_epi1 = std::chrono::steady_clock::now();
+    profile_add_ns(epi_ns, t_epi0, t_epi1);
   }
 
   for (std::size_t b = n_pairs * 2; b < n_blocks; ++b) {
     const std::size_t base = b * block_bytes;
     __m512i a[2] = {_mm512_setzero_si512(), _mm512_setzero_si512()};
+    const auto t_vnni0 = std::chrono::steady_clock::now();
     for (std::size_t q4 = 0; q4 < quads; ++q4) {
       for (std::size_t h = 0; h < 2; ++h) {
         const std::uint8_t* tp = lut.uint8_luts + q4 * 128;
@@ -320,12 +352,18 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
         a[h] = _mm512_dpbusd_epi32(a[h], _mm512_permutexvar_epi8(ihi, thi), ones);
       }
     }
+    const auto t_vnni1 = std::chrono::steady_clock::now();
+    profile_add_ns(vnni_ns, t_vnni0, t_vnni1);
+
+    const auto t_epi0 = std::chrono::steady_clock::now();
     const std::size_t base_vec = b * kBlock;
     const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
     const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
     flush_block_heap(f0, f1, base_vec, n_vectors, vec_scales.data(), k, heap_s, heap_i, heap_sz,
                      heap_min, heap_mi, id_map, score_offset, nullptr, 0, 0, residual_norms,
                      residual_scale);
+    const auto t_epi1 = std::chrono::steady_clock::now();
+    profile_add_ns(epi_ns, t_epi0, t_epi1);
   }
 }
 
@@ -356,6 +394,9 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
   const __m512i ones = _mm512_set1_epi8(1);
   const std::size_t quads = n_byte_groups / 4;
   const std::size_t block_bytes = n_byte_groups * kBlock;
+  VnniKernelProfile* const prof = active_vnni_profile();
+  std::atomic<std::uint64_t>* const vnni_ns = prof ? &prof->vnni_ns : nullptr;
+  std::atomic<std::uint64_t>* const epi_ns = prof ? &prof->epilogue_ns : nullptr;
 
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t base_vec = b * kBlock;
@@ -366,6 +407,7 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
       acc[qi][1] = _mm512_setzero_si512();
     }
 
+    const auto t_vnni0 = std::chrono::steady_clock::now();
     for (std::size_t q4 = 0; q4 < quads; ++q4) {
       // LUT is query×quad — hoist out of h (same table for both halves).
       __m512i tlo[NQ];
@@ -388,7 +430,10 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
         }
       }
     }
+    const auto t_vnni1 = std::chrono::steady_clock::now();
+    profile_add_ns(vnni_ns, t_vnni0, t_vnni1);
 
+    const auto t_epi0 = std::chrono::steady_clock::now();
     for (std::size_t qi = 0; qi < nq; ++qi) {
       const __m512 vs = _mm512_set1_ps(lut_scales[qi]);
       const __m512 vb = _mm512_set1_ps(lut_biases[qi]);
@@ -400,6 +445,8 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
                        heap_sz[qi], heap_min[qi], heap_mi[qi], id_map, off, nullptr, 0, 0,
                        residual_norms, rs);
     }
+    const auto t_epi1 = std::chrono::steady_clock::now();
+    profile_add_ns(epi_ns, t_epi0, t_epi1);
   }
 }
 
@@ -719,6 +766,14 @@ void score_queries_permute_dot_multi(const QueryPermuteDot* const* pds, std::siz
 #endif  // x86_64
 
 }  // namespace
+
+void vnni_profile_begin(VnniKernelProfile* profile) {
+  g_vnni_profile.store(profile, std::memory_order_release);
+}
+
+void vnni_profile_end() {
+  g_vnni_profile.store(nullptr, std::memory_order_release);
+}
 
 QueryPermuteDot build_permute_dot(std::span<const float> q_rot_row,
                                   std::span<const float> centroids, std::size_t dim) {

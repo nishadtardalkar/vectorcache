@@ -88,6 +88,11 @@ struct SearchStageTimings {
   double fastscan_ms = 0.0;
   /// Staged only: sign-plane (1-bit) corpus scan — seed + buffered collector + rank.
   double sign_ms = 0.0;
+  /// Staged only: VNNI accumulate time inside the sign kernel (summed over OpenMP
+  /// threads — use for VNNI vs epilogue ratio, not vs wall `sign_ms`).
+  double sign_vnni_ms = 0.0;
+  /// Staged only: convert/scale + `flush_block_heap` / H99 (same summed-thread basis).
+  double sign_epilogue_ms = 0.0;
   /// Staged only: 4-bit exact rescore of the shortlist (gather + permute-dot).
   double exact_ms = 0.0;
 };

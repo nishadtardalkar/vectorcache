@@ -1280,12 +1280,21 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
 
     const auto t_sign0 = clock::now();
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
+    VnniKernelProfile sign_prof;
+    if (timings != nullptr) {
+      vnni_profile_begin(&sign_prof);
+    }
     SearchResults shortlist =
         score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
                        {}, nullptr, /*buffered=*/true);
     if (timings != nullptr) {
+      vnni_profile_end();
       timings->sign_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
+      timings->sign_vnni_ms =
+          1e-6 * static_cast<double>(sign_prof.vnni_ns.load(std::memory_order_relaxed));
+      timings->sign_epilogue_ms =
+          1e-6 * static_cast<double>(sign_prof.epilogue_ns.load(std::memory_order_relaxed));
     }
 
     // Stage 2: gather top-E (by sign) into a tiny blocked pack; same permute-dot

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -9,6 +10,16 @@
 #include "vectorcache/search/search_avx2.hpp"
 
 namespace vectorcache {
+
+/// Optional accumulators for VNNI kernel profiling (nanoseconds, all threads).
+/// Activate with `vnni_profile_begin` around a sign (or other VNNI) scan.
+struct VnniKernelProfile {
+  std::atomic<std::uint64_t> vnni_ns{0};
+  std::atomic<std::uint64_t> epilogue_ns{0};
+};
+
+void vnni_profile_begin(VnniKernelProfile* profile);
+void vnni_profile_end();
 
 /// Per-query state for the 4-bit permute-dot kernel (turbovec `QueryPermuteDot`).
 struct QueryPermuteDot {
