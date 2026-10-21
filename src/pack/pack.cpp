@@ -482,6 +482,38 @@ std::size_t planes_shortlist_len(std::size_t k, std::size_t bits) {
   return std::max<std::size_t>(384, k * 16);
 }
 
+std::size_t planes_exact_len(std::size_t k, std::size_t shortlist_len) {
+  // Without mid-plane ranking, exact the turbovec mid cut (max(256, 6k)) so we
+  // don't densify/rescan the full sign shortlist (16k). Still ≫ final k.
+  const std::size_t want = std::max<std::size_t>(256, 6 * k);
+  return std::min(shortlist_len, want);
+}
+
+std::pair<std::vector<std::uint8_t>, std::size_t> pack_flat_for_search(
+    std::span<const std::uint8_t> codes_flat, std::size_t n_vectors, std::size_t bits,
+    std::size_t n_byte_groups) {
+  if (n_vectors == 0 || n_byte_groups == 0) {
+    return {{}, 0};
+  }
+  if (codes_flat.size() < n_vectors * n_byte_groups) {
+    return {{}, 0};
+  }
+  const std::size_t n_blocks = (n_vectors + kBlock - 1) / kBlock;
+  const std::size_t blocked_len = n_blocks * n_byte_groups * kBlock;
+  std::vector<std::uint8_t> blocked;
+  if (vector_major_for(bits, n_byte_groups)) {
+    blocked = pack_blocked_sequential(n_vectors, n_blocks, n_byte_groups, blocked_len, codes_flat);
+    vector_major_chunk(blocked);
+  } else {
+#if defined(__x86_64__) || defined(_M_X64)
+    blocked = pack_blocked_perm0(n_vectors, n_blocks, n_byte_groups, blocked_len, codes_flat);
+#else
+    blocked = pack_blocked_sequential(n_vectors, n_blocks, n_byte_groups, blocked_len, codes_flat);
+#endif
+  }
+  return {std::move(blocked), n_blocks};
+}
+
 std::pair<std::vector<std::uint8_t>, std::size_t> planes_repack_sign(
     std::span<const std::uint8_t> packed_codes, std::size_t n_vectors, std::size_t bits,
     std::size_t dim) {

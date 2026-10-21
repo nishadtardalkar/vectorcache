@@ -77,4 +77,13 @@ std::pair<std::vector<std::uint8_t>, std::size_t> planes_repack_sign(
     std::span<const std::uint8_t> packed_codes, std::size_t n_vectors, std::size_t bits,
     std::size_t dim);
 
+/// Pack row-major flat codes (`n × n_byte_groups`) into the native search layout
+/// (vector-major when eligible, else PERM0). Used to densify a shortlist for exact rescore.
+std::pair<std::vector<std::uint8_t>, std::size_t> pack_flat_for_search(
+    std::span<const std::uint8_t> codes_flat, std::size_t n_vectors, std::size_t bits,
+    std::size_t n_byte_groups);
+
+/// How many sign-shortlist hits get the exact 4-bit rescore (turbovec mid/rescore floor).
+std::size_t planes_exact_len(std::size_t k, std::size_t shortlist_len);
+
 }  // namespace vectorcache

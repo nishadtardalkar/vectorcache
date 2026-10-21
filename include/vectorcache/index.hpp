@@ -58,6 +58,8 @@ class LandmarkIndex {
   std::vector<float> residual_norms_;  // ‖r‖ of (α·ŷ) orthogonal to landmarks
   std::vector<std::uint8_t> blocked_codes_;  // landmark FastScan (full 4-bit)
   std::vector<std::uint8_t> sign_codes_;     // MSB plane for staged search (empty if unused)
+  /// Row-major flat codes for densifying staged exact shortlists (planes only).
+  std::vector<std::uint8_t> codes_flat_;
   std::vector<float> scales_;                // landmark α
   /// Interleaved [α_i, ‖r_i‖] pairs for FastScan flush (size 2·n).
   std::vector<float> scale_resid_;

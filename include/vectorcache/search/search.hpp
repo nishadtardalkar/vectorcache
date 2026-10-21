@@ -130,7 +130,8 @@ PreparedQueries prepare_sign_from_rows(std::span<const float> rows, std::size_t 
 /// FWHT → 4-bit landmark project → FastScan top-k with residual-energy bound.
 /// Score = s_L + ‖q_⊥‖·‖r_i‖. No full-dim re-rank.
 /// If `timings` is non-null, fills `fastscan_ms` for the code-scan kernel only.
-/// When `sign_codes` is non-empty (planes layout), runs sign shortlist → exact on hits.
+/// When `sign_codes` is non-empty (planes layout), runs sign shortlist → densified exact.
+/// `codes_flat` is row-major `n × (scan_dim/(8/scan_bits))` for gathering the shortlist.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
                                      std::size_t k, const QuantizedLandmarks& landmarks,
                                      std::size_t scan_dim, std::span<const float> lm_centroids,
@@ -141,7 +142,8 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const float> scale_resid = {},
                                      SearchStageTimings* timings = nullptr,
                                      std::span<const std::uint8_t> sign_codes = {},
-                                     std::size_t sign_n_blocks = 0);
+                                     std::size_t sign_n_blocks = 0,
+                                     std::span<const std::uint8_t> codes_flat = {});
 
 /// Copy prepared state for a single query index (for per-query IVF probing).
 PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);

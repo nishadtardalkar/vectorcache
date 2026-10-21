@@ -1155,7 +1155,8 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const float> scale_resid,
                                      SearchStageTimings* timings,
                                      std::span<const std::uint8_t> sign_codes,
-                                     std::size_t sign_n_blocks) {
+                                     std::size_t sign_n_blocks,
+                                     std::span<const std::uint8_t> codes_flat) {
   if (timings != nullptr) {
     *timings = SearchStageTimings{};
   }
@@ -1228,8 +1229,10 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
 
   const std::size_t s_len = planes_shortlist_len(kk, scan_bits);
   const std::size_t n_byte_groups_4 = scan_dim / 2;
-  const bool use_staged = !sign_codes.empty() && sign_n_blocks > 0 && scan_bits == 4 &&
-                          s_len < n_vectors && vector_major_for(scan_bits, n_byte_groups_4);
+  const bool use_staged =
+      !sign_codes.empty() && sign_n_blocks > 0 && scan_bits == 4 && s_len < n_vectors &&
+      !codes_flat.empty() && codes_flat.size() >= n_vectors * n_byte_groups_4 &&
+      vector_major_for(scan_bits, n_byte_groups_4);
 
   SearchResults out;
   if (use_staged) {
@@ -1238,24 +1241,10 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     SearchResults shortlist =
         score_prepared(prep_sign, s_len, sign_codes, sign_n_blocks, lm_scales);
 
-    // Build per-query hit bitmaps from the shortlist.
-    const std::size_t words = bitmap_words(n_vectors);
-    std::vector<std::vector<std::uint64_t>> bitmaps(nq);
-    for (std::size_t qi = 0; qi < nq; ++qi) {
-      bitmaps[qi].assign(words, 0);
-      const std::size_t n_hit = std::min(s_len, shortlist.k);
-      for (std::size_t j = 0; j < n_hit; ++j) {
-        const std::uint64_t id = shortlist.ids[qi * shortlist.k + j];
-        if (id < n_vectors) {
-          bitmap_set(bitmaps[qi].data(), static_cast<std::size_t>(id));
-        }
-      }
-    }
-
-    // Stage 2: exact permute-dot + residual, **one query at a time**.
-    // Fusing many queries with distinct bitmaps makes the block-union nearly
-    // dense (≈full scan). Per-query bitmaps let empty blocks skip for real.
+    // Stage 2: densify top-E shortlist hits and run the same permute-dot kernel
+    // on E ≪ n vectors (not a full-corpus bitmap walk — that stays near-dense).
     auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
+    const std::size_t e_len = planes_exact_len(kk, std::min(s_len, shortlist.k));
     out.nq = nq;
     out.k = kk;
     out.scores.assign(nq * kk, 0.f);
@@ -1265,19 +1254,57 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
 #endif
     for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
       const std::size_t qis = static_cast<std::size_t>(qi);
-      PreparedQueries one = prepared_query_at(prep, qis);
-      const std::uint64_t* bm = bitmaps[qis].data();
-      const float qperp = q_perp[qis];
-      SearchResults part =
-          score_prepared(one, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms,
-                         std::span<const float>(&qperp, 1), scale_resid, &bm);
-      const std::size_t n_copy = std::min(kk, part.k);
-      for (std::size_t j = 0; j < n_copy; ++j) {
-        out.scores[qis * kk + j] = part.scores[j];
-        out.ids[qis * kk + j] = part.ids[j];
+      const std::size_t n_hit = e_len;
+      if (n_hit == 0 || prep.pds.empty()) {
+        continue;
+      }
+      std::vector<std::uint8_t> flat_s(n_hit * n_byte_groups_4);
+      std::vector<float> scales_s(n_hit);
+      std::vector<float> sr_s(2 * n_hit);
+      std::vector<std::uint64_t> id_map(n_hit);
+      for (std::size_t j = 0; j < n_hit; ++j) {
+        const std::uint64_t id = shortlist.ids[qis * shortlist.k + j];
+        const std::size_t vi = static_cast<std::size_t>(id);
+        id_map[j] = id;
+        if (vi < n_vectors) {
+          std::memcpy(flat_s.data() + j * n_byte_groups_4,
+                      codes_flat.data() + vi * n_byte_groups_4, n_byte_groups_4);
+          scales_s[j] = lm_scales[vi];
+          if (!scale_resid.empty()) {
+            sr_s[2 * j] = scale_resid[2 * vi];
+            sr_s[2 * j + 1] = scale_resid[2 * vi + 1];
+          } else {
+            sr_s[2 * j] = lm_scales[vi];
+            sr_s[2 * j + 1] = residual_norms[vi];
+          }
+        }
+      }
+      auto packed = pack_flat_for_search(flat_s, n_hit, scan_bits, n_byte_groups_4);
+      std::vector<float> heap_s(kk);
+      std::vector<std::uint64_t> heap_i(kk);
+      std::size_t heap_sz = 0;
+      float heap_min = -std::numeric_limits<float>::infinity();
+      std::size_t heap_mi = 0;
+      score_query_permute_dot(prep.pds[qis], packed.first, scales_s, n_byte_groups_4, n_hit,
+                              packed.second, kk, heap_s.data(), heap_i.data(), heap_sz, heap_min,
+                              heap_mi, id_map.data(), 0.f, nullptr, 0, 0, nullptr, q_perp[qis],
+                              sr_s.data());
+      // Heap is unordered; sort into descending output.
+      std::vector<std::size_t> order(heap_sz);
+      for (std::size_t j = 0; j < heap_sz; ++j) order[j] = j;
+      std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        if (heap_s[a] != heap_s[b]) return heap_s[a] > heap_s[b];
+        return heap_i[a] < heap_i[b];
+      });
+      for (std::size_t j = 0; j < heap_sz; ++j) {
+        out.scores[qis * kk + j] = heap_s[order[j]];
+        out.ids[qis * kk + j] = heap_i[order[j]];
       }
     }
   } else {
+    (void)sign_codes;
+    (void)sign_n_blocks;
+    (void)codes_flat;
     auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
     out = score_prepared(prep, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms,
                          q_perp, scale_resid);
