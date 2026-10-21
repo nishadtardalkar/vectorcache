@@ -233,6 +233,77 @@ void remap_ids(SearchResults& out, std::span<const std::uint64_t> id_map) {
   }
 }
 
+/// Dense VNNI sign scan (dual-block `to_rows`) + one `nth_element` top-k per query.
+/// Avoids the per-block H99 epilogue that dominates at short dim (quads≪48).
+/// Requires `prep.backend == VmVnni`. Batches up to `kNqBatch` queries sharing codes.
+SearchResults score_sign_dense_shortlist(const PreparedQueries& prep, std::size_t top_k,
+                                         std::span<const std::uint8_t> blocked_codes,
+                                         std::size_t n_blocks, std::span<const float> scales) {
+  const std::size_t nq = prep.nq;
+  const std::size_t n_vectors = scales.size();
+  const std::size_t kk = std::min(top_k, n_vectors);
+  SearchResults out;
+  out.nq = nq;
+  out.k = kk;
+  out.scores.assign(nq * kk, 0.f);
+  out.ids.assign(nq * kk, 0);
+  out.counts.assign(nq, 0);
+  if (nq == 0 || kk == 0 || n_blocks == 0) {
+    return out;
+  }
+  if (prep.backend != SearchBackendKind::VmVnni) {
+    throw std::invalid_argument("score_sign_dense_shortlist: expected VmVnni backend");
+  }
+  if (prep.split_luts.size() < nq || prep.lut_scales.size() < nq || prep.lut_biases.size() < nq) {
+    throw std::invalid_argument("score_sign_dense_shortlist: missing split LUTs");
+  }
+
+  const std::size_t n_byte_groups = prep.n_byte_groups;
+  const std::size_t n_batches = (nq + kNqBatch - 1) / kNqBatch;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+  for (int bi = 0; bi < static_cast<int>(n_batches); ++bi) {
+    const std::size_t qi0 = static_cast<std::size_t>(bi) * kNqBatch;
+    const std::size_t batch_nq = std::min(kNqBatch, nq - qi0);
+
+    std::vector<float> score_store(batch_nq * n_vectors);
+    float* row_ptrs[kNqBatch];
+    const std::uint8_t* lut_ptrs[kNqBatch];
+    float scales_batch[kNqBatch];
+    float biases_batch[kNqBatch];
+    for (std::size_t i = 0; i < batch_nq; ++i) {
+      row_ptrs[i] = score_store.data() + i * n_vectors;
+      lut_ptrs[i] = prep.split_luts[qi0 + i].data();
+      scales_batch[i] = prep.lut_scales[qi0 + i];
+      biases_batch[i] = prep.lut_biases[qi0 + i];
+    }
+    score_queries_vnni_to_rows(lut_ptrs, scales_batch, biases_batch, batch_nq, blocked_codes, scales,
+                               n_byte_groups, n_vectors, n_blocks, row_ptrs);
+
+    std::vector<std::uint32_t> order(n_vectors);
+    for (std::size_t i = 0; i < batch_nq; ++i) {
+      const float* row = row_ptrs[i];
+      std::iota(order.begin(), order.end(), 0u);
+      std::nth_element(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(kk), order.end(),
+                       [&](std::uint32_t a, std::uint32_t b) {
+                         const float sa = row[a];
+                         const float sb = row[b];
+                         if (sa != sb) return sa > sb;
+                         return a < b;
+                       });
+      const std::size_t qi = qi0 + i;
+      for (std::size_t j = 0; j < kk; ++j) {
+        const std::uint32_t id = order[j];
+        out.scores[qi * kk + j] = row[id];
+        out.ids[qi * kk + j] = id;
+      }
+      out.counts[qi] = kk;
+    }
+  }
+  return out;
+}
+
 SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effective_k,
                                 std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                                 std::span<const float> scales,
@@ -1273,16 +1344,32 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
 
   SearchResults out;
   if (use_staged) {
-    // No mid-plane: collect the exact cut E directly (capacity 2E H99), not S then
-    // re-rank to E — same sign scores either way, less collector traffic than 2S.
+    // No mid-plane: keep exact cut E from the sign pass. Prefer dense VNNI
+    // (dual-block to_rows + nth_element) so short-dim scans are not epilogue-bound;
+    // fall back to H99 buffered collector when to_rows is unavailable (MinGW).
     const std::size_t e_len = planes_exact_len(kk, s_len);
-    const std::size_t sign_cap = std::min(n_vectors, std::max<std::size_t>(2 * e_len, e_len));
 
     const auto t_sign0 = clock::now();
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
-    SearchResults shortlist =
-        score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
-                       {}, nullptr, /*buffered=*/true);
+    SearchResults shortlist;
+#if defined(__x86_64__) || defined(_M_X64)
+#if !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
+    const bool use_dense_sign = prep_sign.backend == SearchBackendKind::VmVnni;
+#else
+    const bool use_dense_sign = false;
+#endif
+#else
+    const bool use_dense_sign = false;
+#endif
+    if (use_dense_sign) {
+      shortlist =
+          score_sign_dense_shortlist(prep_sign, e_len, sign_codes, sign_n_blocks, lm_scales);
+    } else {
+      const std::size_t sign_cap = std::min(n_vectors, std::max<std::size_t>(2 * e_len, e_len));
+      shortlist =
+          score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
+                         {}, nullptr, /*buffered=*/true);
+    }
     if (timings != nullptr) {
       timings->sign_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
