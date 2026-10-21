@@ -1241,55 +1241,55 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     SearchResults shortlist =
         score_prepared(prep_sign, s_len, sign_codes, sign_n_blocks, lm_scales);
 
-    // Stage 2: densify top-E shortlist hits and run the same permute-dot kernel
-    // on E ≪ n vectors (not a full-corpus bitmap walk — that stays near-dense).
-    auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
-    const std::size_t e_len = planes_exact_len(kk, std::min(s_len, shortlist.k));
+    // Stage 2: exact score shortlist IDs from flat codes with a LUT — no densify/repack.
+    // Repacking E×n_byte_groups per query was dominating wall time.
+    const std::size_t n_hit_cap = std::min(s_len, shortlist.k);
     out.nq = nq;
     out.k = kk;
     out.scores.assign(nq * kk, 0.f);
     out.ids.assign(nq * kk, 0);
+    std::vector<PreparedQueryLut> exact_luts(nq);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+      const std::size_t qis = static_cast<std::size_t>(qi);
+      auto qrow = std::span<const float>(q_land.data() + qis * scan_dim, scan_dim);
+      exact_luts[qis] = build_query_lut(qrow, lm_centroids, scan_bits, scan_dim);
+    }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
     for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
       const std::size_t qis = static_cast<std::size_t>(qi);
-      const std::size_t n_hit = e_len;
-      if (n_hit == 0 || prep.pds.empty()) {
-        continue;
-      }
-      std::vector<std::uint8_t> flat_s(n_hit * n_byte_groups_4);
-      std::vector<float> scales_s(n_hit);
-      std::vector<float> sr_s(2 * n_hit);
-      std::vector<std::uint64_t> id_map(n_hit);
-      for (std::size_t j = 0; j < n_hit; ++j) {
-        const std::uint64_t id = shortlist.ids[qis * shortlist.k + j];
-        const std::size_t vi = static_cast<std::size_t>(id);
-        id_map[j] = id;
-        if (vi < n_vectors) {
-          std::memcpy(flat_s.data() + j * n_byte_groups_4,
-                      codes_flat.data() + vi * n_byte_groups_4, n_byte_groups_4);
-          scales_s[j] = lm_scales[vi];
-          if (!scale_resid.empty()) {
-            sr_s[2 * j] = scale_resid[2 * vi];
-            sr_s[2 * j + 1] = scale_resid[2 * vi + 1];
-          } else {
-            sr_s[2 * j] = lm_scales[vi];
-            sr_s[2 * j + 1] = residual_norms[vi];
-          }
-        }
-      }
-      auto packed = pack_flat_for_search(flat_s, n_hit, scan_bits, n_byte_groups_4);
+      const PreparedQueryLut& lut = exact_luts[qis];
+      const float qperp = q_perp[qis];
       std::vector<float> heap_s(kk);
       std::vector<std::uint64_t> heap_i(kk);
       std::size_t heap_sz = 0;
       float heap_min = -std::numeric_limits<float>::infinity();
       std::size_t heap_mi = 0;
-      score_query_permute_dot(prep.pds[qis], packed.first, scales_s, n_byte_groups_4, n_hit,
-                              packed.second, kk, heap_s.data(), heap_i.data(), heap_sz, heap_min,
-                              heap_mi, id_map.data(), 0.f, nullptr, 0, 0, nullptr, q_perp[qis],
-                              sr_s.data());
-      // Heap is unordered; sort into descending output.
+      for (std::size_t j = 0; j < n_hit_cap; ++j) {
+        const std::uint64_t id = shortlist.ids[qis * shortlist.k + j];
+        const std::size_t vi = static_cast<std::size_t>(id);
+        if (vi >= n_vectors) {
+          continue;
+        }
+        const std::uint8_t* row = codes_flat.data() + vi * n_byte_groups_4;
+        float score = lut.bias;
+        for (std::size_t g = 0; g < n_byte_groups_4; ++g) {
+          const auto byte_val = static_cast<std::size_t>(row[g]);
+          score += lut.scale * static_cast<float>(lut.uint8_luts[g * 32 + (byte_val >> 4)]);
+          score +=
+              lut.scale * static_cast<float>(lut.uint8_luts[g * 32 + 16 + (byte_val & 0x0F)]);
+        }
+        const float alpha = !scale_resid.empty() ? scale_resid[2 * vi] : lm_scales[vi];
+        const float resid =
+            !scale_resid.empty() ? scale_resid[2 * vi + 1] : residual_norms[vi];
+        score = score * alpha + qperp * resid;
+        heap_push_or_replace(heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi, kk, score,
+                             id);
+      }
       std::vector<std::size_t> order(heap_sz);
       for (std::size_t j = 0; j < heap_sz; ++j) order[j] = j;
       std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
