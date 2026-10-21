@@ -64,17 +64,21 @@ inline void topk_heapify(float* heap_s, std::uint64_t* heap_i, std::size_t k) {
 }
 
 /// turbovec `compact_half`: keep best `k/2` of a full collector; return new threshold.
+/// Uses thread_local scratch to avoid per-compact heap traffic (cap can be 2S≈2k).
 inline float compact_half(float* heap_s, std::uint64_t* heap_i, std::size_t k) {
   const std::size_t keep = std::max<std::size_t>(k / 2, 1);
-  std::vector<std::size_t> order(k);
+  thread_local std::vector<std::size_t> order;
+  thread_local std::vector<float> hs;
+  thread_local std::vector<std::uint64_t> hi;
+  order.resize(k);
+  hs.resize(keep);
+  hi.resize(keep);
   for (std::size_t i = 0; i < k; ++i) order[i] = i;
   std::nth_element(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(keep - 1), order.end(),
                    [&](std::size_t a, std::size_t b) {
                      if (heap_s[a] != heap_s[b]) return heap_s[a] > heap_s[b];
                      return heap_i[a] < heap_i[b];
                    });
-  std::vector<float> hs(keep);
-  std::vector<std::uint64_t> hi(keep);
   for (std::size_t j = 0; j < keep; ++j) {
     hs[j] = heap_s[order[j]];
     hi[j] = heap_i[order[j]];
@@ -83,8 +87,6 @@ inline float compact_half(float* heap_s, std::uint64_t* heap_i, std::size_t k) {
     heap_s[j] = hs[j];
     heap_i[j] = hi[j];
   }
-  // Threshold = worst of the kept half (order[keep-1] after nth_element is one of the
-  // keep-best; find min among kept).
   float thr = hs[0];
   for (std::size_t j = 1; j < keep; ++j) {
     if (hs[j] < thr) thr = hs[j];

@@ -277,7 +277,13 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   const std::size_t n_quads = (nq + nq_batch - 1) / nq_batch;
   std::size_t blocks_per_range = 0;
   std::size_t n_ranges = 1;
-  if (nq == 1 && n_threads > 1 && single_query_parallelizes(n_vectors)) {
+  if (buffered) {
+    // One full codes pass per query batch. Splitting into block ranges resets
+    // each tile's H99 collector, so every range re-admits ~2S and sign alone
+    // was slower than a pruned full 4-bit scan (0.19 vs ~0.16 ms/q).
+    n_ranges = 1;
+    blocks_per_range = n_blocks;
+  } else if (nq == 1 && n_threads > 1 && single_query_parallelizes(n_vectors)) {
     blocks_per_range = block_range_stride(n_blocks, n_threads);
     n_ranges = (n_blocks + blocks_per_range - 1) / blocks_per_range;
   } else {
