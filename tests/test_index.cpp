@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
 #include "vectorcache/index.hpp"
+#include "vectorcache/pack/pack.hpp"
 
 TEST(Index, AddAndSearchReturnsIds) {
   constexpr std::size_t dim = 64;
@@ -79,6 +81,39 @@ TEST(Index, MultiQueryMatchesSingle) {
       EXPECT_NEAR(batch.scores[qi * k + j], one.scores[j], 1e-4f) << "qi=" << qi << " j=" << j;
     }
   }
+}
+
+TEST(Index, StagedPlanesMatchesFullScanTop1) {
+  // Sign shortlist → exact rescore should keep the true NN when S is wide.
+  // Requires AVX-512 VNNI (planes_for); otherwise skip.
+#if defined(_WIN32)
+  _putenv_s("VECTORCACHE_PLANES_MIN", "256");
+  _putenv_s("TURBOVEC_4BIT_PLANES", "1");
+#else
+  setenv("VECTORCACHE_PLANES_MIN", "256", 1);
+  setenv("TURBOVEC_4BIT_PLANES", "1", 1);
+#endif
+  constexpr std::size_t dim = 64;
+  constexpr std::size_t n = 512;
+  constexpr std::size_t m = 64;  // % 32 == 0 for planes geometry
+  constexpr std::size_t k = 10;
+
+  if (!vectorcache::planes_wanted(4, m / 2, n)) {
+    GTEST_SKIP() << "planes layout unavailable (need AVX-512 VNNI + geometry)";
+  }
+
+  std::mt19937 rng(2026);
+  std::normal_distribution<float> dist(0.f, 1.f);
+  std::vector<float> db(n * dim);
+  for (float& x : db) x = dist(rng);
+
+  vectorcache::LandmarkIndex index(dim, 4, m);
+  index.add(db);
+  index.prepare();
+  auto res = index.search(std::span<const float>(db.data(), dim), k);
+  ASSERT_EQ(res.k, k);
+  EXPECT_EQ(res.ids[0], 0u);
+  EXPECT_GT(res.scores[0], 0.5f);
 }
 
 TEST(Index, SeparateScanAndRerankBits) {

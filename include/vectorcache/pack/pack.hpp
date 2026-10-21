@@ -59,4 +59,22 @@ std::uint8_t read_code(std::span<const std::uint8_t> blocked, std::size_t bits,
 void vector_major_chunk(std::span<std::uint8_t> buf);
 void vector_major_to_seq_chunk(std::span<std::uint8_t> buf);
 
+/// turbovec planes: 4-bit staged search (sign plane → shortlist → exact).
+/// Kill switch: `TURBOVEC_4BIT_PLANES=0`. Optional `VECTORCACHE_PLANES_MIN` (default 32768).
+bool use_planes4();
+std::size_t planes_min_vectors();
+/// Geometry gate: `bits==4`, `n_byte_groups % 16 == 0` (⇒ dim % 32 == 0), VNNI host.
+bool planes_for(std::size_t bits, std::size_t n_byte_groups);
+bool planes_wanted(std::size_t bits, std::size_t n_byte_groups, std::size_t n_vectors);
+
+/// Shortlist length after the sign-plane pass (turbovec `planes_shortlist_len`).
+std::size_t planes_shortlist_len(std::size_t k, std::size_t bits);
+
+/// Extract MSB bit-plane from packed rows and FastScan-pack it as a 2-bit-shaped
+/// sign region (`n_byte_groups = dim/8`). Same bytes/layout turbovec scans with
+/// the nibble/VNNI kernels. Returns (sign_blocked, n_blocks).
+std::pair<std::vector<std::uint8_t>, std::size_t> planes_repack_sign(
+    std::span<const std::uint8_t> packed_codes, std::size_t n_vectors, std::size_t bits,
+    std::size_t dim);
+
 }  // namespace vectorcache

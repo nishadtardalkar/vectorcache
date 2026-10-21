@@ -162,6 +162,18 @@ void LandmarkIndex::prepare() {
   auto repacked = repack(packed, n_vectors_, scan_bits_, scan_dim_);
   blocked_codes_ = std::move(repacked.first);
   n_blocks_ = repacked.second;
+
+  // Optional planes layout: keep full blocked_codes_ for exact rescore; add sign region
+  // for the staged shortlist (same bytes turbovec scans with the 2-bit-shaped VNNI path).
+  sign_codes_.clear();
+  sign_n_blocks_ = 0;
+  const std::size_t n_byte_groups = scan_dim_ / (8 / scan_bits_);
+  if (planes_wanted(scan_bits_, n_byte_groups, n_vectors_)) {
+    auto sign = planes_repack_sign(packed, n_vectors_, scan_bits_, scan_dim_);
+    sign_codes_ = std::move(sign.first);
+    sign_n_blocks_ = sign.second;
+  }
+
   // Pack α and ‖r‖ as AoS pairs so flush loads one stream.
   scale_resid_.resize(2 * n_vectors_);
   for (std::size_t i = 0; i < n_vectors_; ++i) {
@@ -185,7 +197,7 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
   const std::size_t kk = std::min(k, n_vectors_);
   return search_landmark_rerank(queries, nq, dim_, kk, landmark_basis_q4_, scan_dim_, lm_centroids_,
                                 scan_bits_, blocked_codes_, n_blocks_, scales_, residual_norms_,
-                                rotation_, scale_resid_, timings);
+                                rotation_, scale_resid_, timings, sign_codes_, sign_n_blocks_);
 }
 
 }  // namespace vectorcache

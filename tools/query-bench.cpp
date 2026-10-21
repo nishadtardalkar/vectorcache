@@ -416,11 +416,14 @@ int main(int argc, char** argv) {
     }
     const std::size_t effective_rerank_bits = rerank_bits == 0 ? bits : rerank_bits;
 
+    const std::size_t n_byte_groups = landmarks / (8 / bits);
+    const int planes_on =
+        vectorcache::planes_wanted(bits, n_byte_groups, db.rows) ? 1 : 0;
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
               << " scan_bits=" << bits << " rerank_bits=" << effective_rerank_bits
               << " landmarks=" << landmarks << " k=" << k << " collect=top-k-heap"
               << " search_backend=" << vectorcache::search_backend_name(bits, landmarks)
-              << "+rerank\n";
+              << " planes4=" << planes_on << "\n";
     std::cout << vectorcache::search_backend_diagnostics(bits, landmarks);
 
     vectorcache::SearchResults last;

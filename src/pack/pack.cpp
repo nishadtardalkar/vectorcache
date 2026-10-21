@@ -1,5 +1,6 @@
 #include "vectorcache/pack/pack.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -267,6 +268,13 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
   out << "use_vector_major()=" << (use_vector_major() ? 1 : 0) << "\n";
   out << "vector_major_for()=" << (vector_major_for(bits, n_byte_groups) ? 1 : 0) << "\n";
   out << "search_backend=" << search_backend_name(bits, dim) << "\n";
+  out << "TURBOVEC_4BIT_PLANES="
+      << (std::getenv("TURBOVEC_4BIT_PLANES") ? std::getenv("TURBOVEC_4BIT_PLANES") : "(unset)")
+      << " VECTORCACHE_PLANES_MIN="
+      << (std::getenv("VECTORCACHE_PLANES_MIN") ? std::getenv("VECTORCACHE_PLANES_MIN") : "(unset)")
+      << "\n";
+  out << "planes_for()=" << (planes_for(bits, n_byte_groups) ? 1 : 0)
+      << " planes_min_vectors=" << planes_min_vectors() << "\n";
 
 #if defined(__x86_64__) || defined(_M_X64)
   unsigned leaf7_ebx = 0, leaf7_ecx = 0;
@@ -436,6 +444,73 @@ std::uint8_t read_code(std::span<const std::uint8_t> blocked, std::size_t bits,
 #else
   return blocked[block_base + g * kBlock + lane];
 #endif
+}
+
+bool use_planes4() {
+  if (const char* v = std::getenv("TURBOVEC_4BIT_PLANES"); v && v[0] == '0' && v[1] == '\0') {
+    return false;
+  }
+  return true;
+}
+
+std::size_t planes_min_vectors() {
+  if (const char* v = std::getenv("VECTORCACHE_PLANES_MIN"); v && v[0] != '\0') {
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(v, &end, 10);
+    if (end != v && parsed > 0) {
+      return static_cast<std::size_t>(parsed);
+    }
+  }
+  return 32768;
+}
+
+bool planes_for(std::size_t bits, std::size_t n_byte_groups) {
+  // turbovec: 4-bit planes need whole VM units in the sign region (nsg % 4 == 0)
+  // and the VNNI host path. n_byte_groups = dim/2 ⇒ nsg = dim/8 ⇒ dim % 32 == 0
+  // when n_byte_groups % 16 == 0.
+  return bits == 4 && (n_byte_groups % 16 == 0) && use_planes4() && use_vector_major();
+}
+
+bool planes_wanted(std::size_t bits, std::size_t n_byte_groups, std::size_t n_vectors) {
+  return n_vectors > 0 && n_vectors >= planes_min_vectors() && planes_for(bits, n_byte_groups);
+}
+
+std::size_t planes_shortlist_len(std::size_t k, std::size_t bits) {
+  if (bits == 4) {
+    return std::max<std::size_t>(256, (k >= 64) ? (k * 16) : (k * 20));
+  }
+  return std::max<std::size_t>(384, k * 16);
+}
+
+std::pair<std::vector<std::uint8_t>, std::size_t> planes_repack_sign(
+    std::span<const std::uint8_t> packed_codes, std::size_t n_vectors, std::size_t bits,
+    std::size_t dim) {
+  if (bits < 2 || bits > 4 || dim == 0 || dim % 8 != 0 || n_vectors == 0) {
+    return {{}, 0};
+  }
+  const std::size_t nsg = dim / 8;
+  const std::size_t bytes_per_row = bits * nsg;
+  const std::size_t sign_off = (bits - 1) * nsg;
+  const std::size_t n_blocks = (n_vectors + kBlock - 1) / kBlock;
+  std::vector<std::uint8_t> sign_rows(n_vectors * nsg);
+  for (std::size_t v = 0; v < n_vectors; ++v) {
+    const std::uint8_t* row = packed_codes.data() + v * bytes_per_row + sign_off;
+    std::memcpy(sign_rows.data() + v * nsg, row, nsg);
+  }
+  const std::size_t blocked_len = n_blocks * nsg * kBlock;
+  // Sign region is scanned as a 2-bit-shaped buffer (n_byte_groups = nsg).
+  std::vector<std::uint8_t> blocked;
+  if (vector_major_for(/*bits=*/2, nsg)) {
+    blocked = pack_blocked_sequential(n_vectors, n_blocks, nsg, blocked_len, sign_rows);
+    vector_major_chunk(blocked);
+  } else {
+#if defined(__x86_64__) || defined(_M_X64)
+    blocked = pack_blocked_perm0(n_vectors, n_blocks, nsg, blocked_len, sign_rows);
+#else
+    blocked = pack_blocked_sequential(n_vectors, n_blocks, nsg, blocked_len, sign_rows);
+#endif
+  }
+  return {std::move(blocked), n_blocks};
 }
 
 }  // namespace vectorcache

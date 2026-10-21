@@ -238,7 +238,8 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
                                 std::span<const std::size_t> query_indices,
                                 const float* residual_norms = nullptr,
                                 const float* residual_scales = nullptr,
-                                const float* scale_resid = nullptr) {
+                                const float* scale_resid = nullptr,
+                                const std::uint64_t* const* hit_bitmaps = nullptr) {
   const std::size_t nq = query_indices.empty() ? prep.nq : query_indices.size();
   auto global_qi = [&](std::size_t local_i) -> std::size_t {
     return query_indices.empty() ? local_i : query_indices[local_i];
@@ -357,6 +358,15 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
         }
         rs_ptr = rs_batch.data();
       }
+      std::vector<const std::uint64_t*> bm_batch;
+      const std::uint64_t* const* bm_ptr = nullptr;
+      if (hit_bitmaps != nullptr) {
+        bm_batch.resize(batch_nq);
+        for (std::size_t i = 0; i < batch_nq; ++i) {
+          bm_batch[i] = hit_bitmaps[global_qi(tile.qi_start + i)];
+        }
+        bm_ptr = bm_batch.data();
+      }
       if (use_pd) {
         std::vector<const QueryPermuteDot*> pd_ptrs(batch_nq);
         for (std::size_t i = 0; i < batch_nq; ++i) {
@@ -365,8 +375,8 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
         score_queries_permute_dot(pd_ptrs.data(), batch_nq, codes_span, scales_span, n_byte_groups,
                                   range_n, range_blocks, effective_k, heap_s_ptrs.data(),
                                   heap_i_ptrs.data(), heap_sz.data(), heap_min.data(),
-                                  heap_mi.data(), nullptr, nullptr, nullptr, 0, 0, range_resid,
-                                  rs_ptr, range_sr);
+                                  heap_mi.data(), nullptr, nullptr, bm_ptr, vec_start, n_vectors,
+                                  range_resid, rs_ptr, range_sr);
       } else {
         std::vector<const std::uint8_t*> lut_ptrs(batch_nq);
         std::vector<float> scales_batch(batch_nq);
@@ -377,6 +387,8 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
           scales_batch[i] = prep.lut_scales[gqi];
           biases_batch[i] = prep.lut_biases[gqi];
         }
+        // Classic VNNI has no hit-bitmap path; only used for the unmasked sign pass.
+        (void)bm_ptr;
         score_queries_vnni(lut_ptrs.data(), scales_batch.data(), biases_batch.data(), batch_nq,
                            codes_span, scales_span, n_byte_groups, range_n, range_blocks, effective_k,
                            heap_s_ptrs.data(), heap_i_ptrs.data(), heap_sz.data(), heap_min.data(),
@@ -701,6 +713,114 @@ PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, 
   return prep;
 }
 
+PreparedQueryLut build_sign_lut(std::span<const float> q_rot_row, std::size_t dim) {
+  // turbovec build_sign_lut: each sign-plane byte is 8 dim signs (MSB-first).
+  // High/low nibbles are looked up as 16-entry tables of ±q pair sums.
+  const std::size_t n_groups = dim / 8;
+  PreparedQueryLut out;
+  out.uint8_luts.assign(n_groups * 32, 0);
+  std::vector<float> float_vals(n_groups * 32);
+  std::vector<float> mins(n_groups * 2);
+  float max_span = 0.f;
+  out.bias = 0.f;
+  constexpr float kM = 1.f;
+  for (std::size_t g = 0; g < n_groups; ++g) {
+    for (std::size_t half = 0; half < 2; ++half) {
+      const std::size_t d = g * 8 + half * 4;
+      const float p0 = q_rot_row[d] * kM;
+      const float p1 = q_rot_row[d + 1] * kM;
+      const float p2 = q_rot_row[d + 2] * kM;
+      const float p3 = q_rot_row[d + 3] * kM;
+      const float a[4] = {-p0 - p1, p1 - p0, p0 - p1, p0 + p1};
+      const float b[4] = {-p2 - p3, p3 - p2, p2 - p3, p2 + p3};
+      float* out16 = float_vals.data() + g * 32 + half * 16;
+      for (std::size_t pat = 0; pat < 16; ++pat) {
+        out16[pat] = a[pat >> 2] + b[pat & 3];
+      }
+      const float m01 = std::fabs(p0) + std::fabs(p1);
+      const float m23 = std::fabs(p2) + std::fabs(p3);
+      const float mn = -m01 - m23;
+      const float mx = m01 + m23;
+      mins[g * 2 + half] = mn;
+      out.bias += mn;
+      max_span = std::max(max_span, mx - mn);
+    }
+  }
+  constexpr float kMaxLut = 127.f;
+  out.scale = (max_span > 0.f) ? (max_span / kMaxLut) : 1.f;
+  float inv_scale = 1.f;
+  if (out.scale >= std::numeric_limits<float>::min()) {
+    inv_scale = 1.f / out.scale;
+  } else {
+    out.scale = 1.f;
+  }
+  for (std::size_t g = 0; g < n_groups; ++g) {
+    for (std::size_t half = 0; half < 2; ++half) {
+      const float mn = mins[g * 2 + half];
+      for (int i = 0; i < 16; ++i) {
+        const std::size_t j = g * 32 + half * 16 + static_cast<std::size_t>(i);
+        out.uint8_luts[j] = static_cast<std::uint8_t>(
+            std::clamp(std::round((float_vals[j] - mn) * inv_scale), 0.f, kMaxLut));
+      }
+    }
+  }
+  return out;
+}
+
+PreparedQueries prepare_sign_from_rows(std::span<const float> rows, std::size_t nq,
+                                       std::size_t dim) {
+  if (rows.size() < nq * dim) {
+    throw std::invalid_argument("prepare_sign_from_rows: rows too short");
+  }
+  if (dim % 8 != 0) {
+    throw std::invalid_argument("prepare_sign_from_rows: dim must be multiple of 8");
+  }
+  const std::size_t n_byte_groups = dim / 8;
+  PreparedQueries prep;
+  prep.nq = nq;
+  prep.dim = dim;
+  prep.bits = 2;  // scanned as 2-bit-shaped sign region
+  prep.n_byte_groups = n_byte_groups;
+  prep.q_rot.assign(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(nq * dim));
+  prep.bias_corrs.assign(nq, 0.f);
+
+  const bool use_vm = vector_major_for(/*bits=*/2, n_byte_groups);
+#if defined(__x86_64__) || defined(_M_X64)
+  if (use_vm) {
+    prep.backend = SearchBackendKind::VmVnni;
+    prep.split_luts.resize(nq);
+    prep.lut_scales.resize(nq);
+    prep.lut_biases.resize(nq);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+      auto qrow =
+          std::span<const float>(prep.q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
+      PreparedQueryLut lut = build_sign_lut(qrow, dim);
+      prep.split_luts[static_cast<std::size_t>(qi)] =
+          split_lut_for_vnni(lut.uint8_luts, n_byte_groups);
+      prep.lut_scales[static_cast<std::size_t>(qi)] = lut.scale;
+      prep.lut_biases[static_cast<std::size_t>(qi)] = lut.bias;
+    }
+    return prep;
+  }
+  prep.backend = cpu_has_avx2() ? SearchBackendKind::Avx2 : SearchBackendKind::Scalar;
+#else
+  (void)use_vm;
+  prep.backend = SearchBackendKind::Scalar;
+#endif
+  prep.luts.resize(nq);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+    auto qrow = std::span<const float>(prep.q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
+    prep.luts[static_cast<std::size_t>(qi)] = build_sign_lut(qrow, dim);
+  }
+  return prep;
+}
+
 PreparedQueries prepare_from_rows(std::span<const float> rows, std::size_t nq, std::size_t dim,
                                   std::span<const float> centroids, std::size_t bits) {
   if (rows.size() < nq * dim) {
@@ -806,7 +926,8 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::size_t> query_indices,
                              std::span<const float> residual_norms,
                              std::span<const float> residual_scales,
-                             std::span<const float> scale_resid) {
+                             std::span<const float> scale_resid,
+                             const std::uint64_t* const* hit_bitmaps) {
   if (!query_indices.empty()) {
     for (std::size_t qi : query_indices) {
       if (qi >= prep.nq) {
@@ -843,7 +964,7 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
   if (prep.backend == SearchBackendKind::VmPermuteDot ||
       prep.backend == SearchBackendKind::VmVnni) {
     out = score_prepared_vm(prep, effective_k, blocked_codes, n_blocks, scales, query_indices,
-                            resid_ptr, resid_sc_ptr, scale_resid_ptr);
+                            resid_ptr, resid_sc_ptr, scale_resid_ptr, hit_bitmaps);
   } else {
     out = score_prepared_perm0(prep, effective_k, blocked_codes, n_blocks, scales, query_indices);
     // AVX2/scalar heap: apply residual after (membership was s_L-only).
@@ -1032,7 +1153,9 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const float> lm_scales,
                                      std::span<const float> residual_norms, const Rotation& rotation,
                                      std::span<const float> scale_resid,
-                                     SearchStageTimings* timings) {
+                                     SearchStageTimings* timings,
+                                     std::span<const std::uint8_t> sign_codes,
+                                     std::size_t sign_n_blocks) {
   if (timings != nullptr) {
     *timings = SearchStageTimings{};
   }
@@ -1099,13 +1222,49 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     for (std::size_t j = 0; j < n_landmarks; ++j) l2 += static_cast<double>(ql[j]) * ql[j];
     q_perp[qi] = static_cast<float>(std::sqrt(std::max(0.0, q2 - l2)));
   }
-  auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
 
   using clock = std::chrono::steady_clock;
   const auto t_scan0 = clock::now();
-  SearchResults out =
-      score_prepared(prep, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms, q_perp,
-                     scale_resid);
+
+  const std::size_t s_len = planes_shortlist_len(kk, scan_bits);
+  const std::size_t n_byte_groups_4 = scan_dim / 2;
+  const bool use_staged = !sign_codes.empty() && sign_n_blocks > 0 && scan_bits == 4 &&
+                          s_len < n_vectors && vector_major_for(scan_bits, n_byte_groups_4);
+
+  SearchResults out;
+  if (use_staged) {
+    // Stage 1: sign-plane VNNI over all n (¼ of full 4-bit bytes).
+    auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
+    SearchResults shortlist =
+        score_prepared(prep_sign, s_len, sign_codes, sign_n_blocks, lm_scales);
+
+    // Build per-query hit bitmaps from the shortlist.
+    const std::size_t words = bitmap_words(n_vectors);
+    std::vector<std::vector<std::uint64_t>> bitmaps(nq);
+    std::vector<const std::uint64_t*> bm_ptrs(nq);
+    for (std::size_t qi = 0; qi < nq; ++qi) {
+      bitmaps[qi].assign(words, 0);
+      const std::size_t n_hit = std::min(s_len, shortlist.k);
+      for (std::size_t j = 0; j < n_hit; ++j) {
+        const std::uint64_t id = shortlist.ids[qi * shortlist.k + j];
+        if (id < n_vectors) {
+          bitmap_set(bitmaps[qi].data(), static_cast<std::size_t>(id));
+        }
+      }
+      bm_ptrs[qi] = bitmaps[qi].data();
+    }
+
+    // Stage 2: exact permute-dot + residual on shortlist hits only.
+    // Same kernel as the full scan (BLK=8 / GFNI / AoS flush); empty blocks skip.
+    auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
+    out = score_prepared(prep, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms,
+                         q_perp, scale_resid, bm_ptrs.data());
+  } else {
+    auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
+    out = score_prepared(prep, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms,
+                         q_perp, scale_resid);
+  }
+
   if (timings != nullptr) {
     timings->fastscan_ms =
         std::chrono::duration<double, std::milli>(clock::now() - t_scan0).count();

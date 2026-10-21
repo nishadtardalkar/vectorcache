@@ -56,11 +56,13 @@ class LandmarkIndex {
   std::vector<float> db_unit_;              // n * dim (scratch until prepare)
   std::vector<float> landmark_rows_;   // n * scan_dim (row-major before prepare)
   std::vector<float> residual_norms_;  // ‖r‖ of (α·ŷ) orthogonal to landmarks
-  std::vector<std::uint8_t> blocked_codes_;  // landmark FastScan
+  std::vector<std::uint8_t> blocked_codes_;  // landmark FastScan (full 4-bit)
+  std::vector<std::uint8_t> sign_codes_;     // MSB plane for staged search (empty if unused)
   std::vector<float> scales_;                // landmark α
   /// Interleaved [α_i, ‖r_i‖] pairs for FastScan flush (size 2·n).
   std::vector<float> scale_resid_;
   mutable std::size_t n_blocks_ = 0;
+  mutable std::size_t sign_n_blocks_ = 0;
   std::size_t n_vectors_ = 0;
   mutable bool prepared_ = false;
   mutable std::vector<float> rotate_scratch_;

@@ -123,9 +123,14 @@ PreparedQueries prepare_queries(std::span<const float> queries, std::size_t nq, 
 PreparedQueries prepare_from_rows(std::span<const float> rows, std::size_t nq, std::size_t dim,
                                   std::span<const float> centroids, std::size_t bits);
 
+/// Sign-plane LUTs for staged 4-bit search (turbovec `build_sign_lut`).
+/// Scanned as a 2-bit-shaped buffer with `n_byte_groups = dim/8`.
+PreparedQueries prepare_sign_from_rows(std::span<const float> rows, std::size_t nq, std::size_t dim);
+
 /// FWHT → 4-bit landmark project → FastScan top-k with residual-energy bound.
 /// Score = s_L + ‖q_⊥‖·‖r_i‖. No full-dim re-rank.
 /// If `timings` is non-null, fills `fastscan_ms` for the code-scan kernel only.
+/// When `sign_codes` is non-empty (planes layout), runs sign shortlist → exact on hits.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
                                      std::size_t k, const QuantizedLandmarks& landmarks,
                                      std::size_t scan_dim, std::span<const float> lm_centroids,
@@ -134,7 +139,9 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const float> lm_scales,
                                      std::span<const float> residual_norms, const Rotation& rotation,
                                      std::span<const float> scale_resid = {},
-                                     SearchStageTimings* timings = nullptr);
+                                     SearchStageTimings* timings = nullptr,
+                                     std::span<const std::uint8_t> sign_codes = {},
+                                     std::size_t sign_n_blocks = 0);
 
 /// Copy prepared state for a single query index (for per-query IVF probing).
 PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
@@ -144,6 +151,9 @@ PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
 /// If `query_indices` is non-empty, only those prepared queries are scored (output nq =
 /// query_indices.size()); otherwise all `prep.nq` queries are scored.
 /// Optional residual bound: score += residual_scales[qi] * residual_norms[vi].
+/// If `hit_bitmaps` is non-null it must have length `prep.nq` (or `query_indices.size()`
+/// when that is non-empty); each entry masks which vectors may enter that query's heap.
+/// Empty blocks are skipped inside the existing permute-dot / VNNI kernels.
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                              std::span<const float> scales,
@@ -151,7 +161,8 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::size_t> query_indices = {},
                              std::span<const float> residual_norms = {},
                              std::span<const float> residual_scales = {},
-                             std::span<const float> scale_resid = {});
+                             std::span<const float> scale_resid = {},
+                             const std::uint64_t* const* hit_bitmaps = nullptr);
 
 /// Continue scoring into existing per-query top-k heaps (length `prep.nq`, indexed by global qi).
 /// Only `query_indices` are updated. Heaps may already be partially filled.
