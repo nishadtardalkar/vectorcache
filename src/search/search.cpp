@@ -1233,7 +1233,7 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
 
   SearchResults out;
   if (use_staged) {
-    // Stage 1: sign-plane VNNI over all n (¼ of full 4-bit bytes).
+    // Stage 1: sign-plane VNNI over all n (¼ of full 4-bit bytes) → shortlist S.
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
     SearchResults shortlist =
         score_prepared(prep_sign, s_len, sign_codes, sign_n_blocks, lm_scales);
@@ -1241,7 +1241,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     // Build per-query hit bitmaps from the shortlist.
     const std::size_t words = bitmap_words(n_vectors);
     std::vector<std::vector<std::uint64_t>> bitmaps(nq);
-    std::vector<const std::uint64_t*> bm_ptrs(nq);
     for (std::size_t qi = 0; qi < nq; ++qi) {
       bitmaps[qi].assign(words, 0);
       const std::size_t n_hit = std::min(s_len, shortlist.k);
@@ -1251,14 +1250,33 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
           bitmap_set(bitmaps[qi].data(), static_cast<std::size_t>(id));
         }
       }
-      bm_ptrs[qi] = bitmaps[qi].data();
     }
 
-    // Stage 2: exact permute-dot + residual on shortlist hits only.
-    // Same kernel as the full scan (BLK=8 / GFNI / AoS flush); empty blocks skip.
+    // Stage 2: exact permute-dot + residual, **one query at a time**.
+    // Fusing many queries with distinct bitmaps makes the block-union nearly
+    // dense (≈full scan). Per-query bitmaps let empty blocks skip for real.
     auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
-    out = score_prepared(prep, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms,
-                         q_perp, scale_resid, bm_ptrs.data());
+    out.nq = nq;
+    out.k = kk;
+    out.scores.assign(nq * kk, 0.f);
+    out.ids.assign(nq * kk, 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic)
+#endif
+    for (int qi = 0; qi < static_cast<int>(nq); ++qi) {
+      const std::size_t qis = static_cast<std::size_t>(qi);
+      PreparedQueries one = prepared_query_at(prep, qis);
+      const std::uint64_t* bm = bitmaps[qis].data();
+      const float qperp = q_perp[qis];
+      SearchResults part =
+          score_prepared(one, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms,
+                         std::span<const float>(&qperp, 1), scale_resid, &bm);
+      const std::size_t n_copy = std::min(kk, part.k);
+      for (std::size_t j = 0; j < n_copy; ++j) {
+        out.scores[qis * kk + j] = part.scores[j];
+        out.ids[qis * kk + j] = part.ids[j];
+      }
+    }
   } else {
     auto prep = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
     out = score_prepared(prep, kk, blocked_codes, n_blocks, lm_scales, {}, {}, residual_norms,

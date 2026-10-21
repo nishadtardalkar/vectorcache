@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 namespace vectorcache {
 
@@ -25,13 +27,63 @@ inline void rescan_min(const float* heap_s, const std::uint64_t* heap_i, std::si
   heap_mi = mi;
 }
 
-/// Flat top-k with O(k) rescan (turbovec), not a binary heap.
+inline void topk_sift_down(float* heap_s, std::uint64_t* heap_i, std::size_t k, std::size_t i) {
+  while (true) {
+    const std::size_t l = 2 * i + 1;
+    const std::size_t r = 2 * i + 2;
+    std::size_t worst = i;
+    if (l < k && topk_worse(heap_s[l], heap_i[l], heap_s[worst], heap_i[worst])) {
+      worst = l;
+    }
+    if (r < k && topk_worse(heap_s[r], heap_i[r], heap_s[worst], heap_i[worst])) {
+      worst = r;
+    }
+    if (worst == i) {
+      break;
+    }
+    std::swap(heap_s[i], heap_s[worst]);
+    std::swap(heap_i[i], heap_i[worst]);
+    i = worst;
+  }
+}
+
+inline void topk_heapify(float* heap_s, std::uint64_t* heap_i, std::size_t k) {
+  if (k < 2) {
+    return;
+  }
+  for (std::size_t i = k / 2; i-- > 0;) {
+    topk_sift_down(heap_s, heap_i, k, i);
+  }
+}
+
+/// Flat top-k. For small `k` (≤64) uses turbovec O(k) rescan; for larger shortlists
+/// (staged sign plane, S≈16k) uses a binary min-heap so replaces are O(log k).
 /// `heap_min` starts as `-infinity` or a cross-range prune seed. While filling,
 /// only scores strictly above `heap_min` are kept (unseeded -inf → accept all
-/// finite scores). Once full, replaces at `heap_mi` when `score > heap_min`.
+/// finite scores). Once full, replaces the worst when `score > heap_min`.
 inline void heap_push_or_replace(float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                                  float& heap_min, std::size_t& heap_mi, std::size_t k, float score,
                                  std::uint64_t id) {
+  constexpr std::size_t kBinaryHeapMinK = 128;
+  if (k < kBinaryHeapMinK) {
+    if (heap_sz < k) {
+      if (!(score > heap_min)) {
+        return;
+      }
+      heap_s[heap_sz] = score;
+      heap_i[heap_sz] = id;
+      ++heap_sz;
+      if (heap_sz == k) {
+        rescan_min(heap_s, heap_i, k, heap_min, heap_mi);
+      }
+    } else if (score > heap_min) {
+      heap_s[heap_mi] = score;
+      heap_i[heap_mi] = id;
+      rescan_min(heap_s, heap_i, k, heap_min, heap_mi);
+    }
+    return;
+  }
+
   if (heap_sz < k) {
     if (!(score > heap_min)) {
       return;
@@ -40,12 +92,16 @@ inline void heap_push_or_replace(float* heap_s, std::uint64_t* heap_i, std::size
     heap_i[heap_sz] = id;
     ++heap_sz;
     if (heap_sz == k) {
-      rescan_min(heap_s, heap_i, k, heap_min, heap_mi);
+      topk_heapify(heap_s, heap_i, k);
+      heap_min = heap_s[0];
+      heap_mi = 0;
     }
   } else if (score > heap_min) {
-    heap_s[heap_mi] = score;
-    heap_i[heap_mi] = id;
-    rescan_min(heap_s, heap_i, k, heap_min, heap_mi);
+    heap_s[0] = score;
+    heap_i[0] = id;
+    topk_sift_down(heap_s, heap_i, k, 0);
+    heap_min = heap_s[0];
+    heap_mi = 0;
   }
 }
 

@@ -48,3 +48,37 @@ TEST(TopkHeap, ExactTopKWithTies) {
   std::sort(want.begin(), want.end());
   EXPECT_EQ(got, want);
 }
+
+TEST(TopkHeap, LargeKBinaryHeapMatchesPartialSort) {
+  constexpr std::size_t k = 1024;
+  constexpr std::size_t n = 8000;
+
+  std::vector<float> heap_s(k);
+  std::vector<std::uint64_t> heap_i(k);
+  std::size_t heap_sz = 0;
+  float heap_min = -std::numeric_limits<float>::infinity();
+  std::size_t heap_mi = 0;
+
+  std::vector<float> scores(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    scores[i] = static_cast<float>((i * 2654435761u) & 0xffffu) * 1e-3f;
+    vectorcache::heap_push_or_replace(heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi, k,
+                                      scores[i], static_cast<std::uint64_t>(i));
+  }
+  ASSERT_EQ(heap_sz, k);
+
+  std::vector<std::uint64_t> got(heap_i.begin(), heap_i.begin() + static_cast<std::ptrdiff_t>(k));
+  std::sort(got.begin(), got.end());
+
+  std::vector<std::size_t> order(n);
+  std::iota(order.begin(), order.end(), 0);
+  std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k), order.end(),
+                    [&](std::size_t a, std::size_t b) {
+                      if (scores[a] != scores[b]) return scores[a] > scores[b];
+                      return a < b;
+                    });
+  std::vector<std::uint64_t> want(k);
+  for (std::size_t i = 0; i < k; ++i) want[i] = static_cast<std::uint64_t>(order[i]);
+  std::sort(want.begin(), want.end());
+  EXPECT_EQ(got, want);
+}
