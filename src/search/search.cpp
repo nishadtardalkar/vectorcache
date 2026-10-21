@@ -1268,6 +1268,7 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
   if (use_staged) {
     // Stage 1: turbovec H99 buffered collector on the sign plane.
     // Capacity 2S, returns S. Not a top-S heap — that was the regression.
+    const auto t_sign0 = clock::now();
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
     const std::size_t cap = 2 * s_len;
     // Seed from a strided sample of the whole index (not a prefix — that
@@ -1361,9 +1362,14 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
         ids[j] = id_tmp[j];
       }
     }
+    if (timings != nullptr) {
+      timings->sign_ms =
+          std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
+    }
 
     // Stage 2: gather top-E (by sign) into a tiny blocked pack; same permute-dot
     // kernel as the full scan (SIMD), not a scalar LUT walk over S.
+    const auto t_exact0 = clock::now();
     auto prep_exact = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
     out.nq = nq;
     out.k = kk;
@@ -1406,6 +1412,10 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
         out.scores[qis * kk + j] = one.scores[j];
         out.ids[qis * kk + j] = one.ids[j];
       }
+    }
+    if (timings != nullptr) {
+      timings->exact_ms =
+          std::chrono::duration<double, std::milli>(clock::now() - t_exact0).count();
     }
   } else {
     (void)sign_codes;

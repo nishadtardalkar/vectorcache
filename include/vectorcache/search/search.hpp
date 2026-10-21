@@ -84,8 +84,12 @@ struct SearchResults {
 
 /// Optional wall-clock breakdown for one search call (milliseconds).
 struct SearchStageTimings {
-  /// Blocked FastScan / permute-dot over codes (`score_prepared`) — turbovec-comparable kernel.
+  /// Total codes path (sign+exact when staged; full 4-bit scan otherwise).
   double fastscan_ms = 0.0;
+  /// Staged only: sign-plane (1-bit) corpus scan — seed + buffered collector + rank.
+  double sign_ms = 0.0;
+  /// Staged only: 4-bit exact rescore of the shortlist (gather + permute-dot).
+  double exact_ms = 0.0;
 };
 
 struct PreparedQueryLut {
@@ -129,7 +133,7 @@ PreparedQueries prepare_sign_from_rows(std::span<const float> rows, std::size_t 
 
 /// FWHT → 4-bit landmark project → FastScan top-k with residual-energy bound.
 /// Score = s_L + ‖q_⊥‖·‖r_i‖. No full-dim re-rank.
-/// If `timings` is non-null, fills `fastscan_ms` for the code-scan kernel only.
+/// If `timings` is non-null, fills `fastscan_ms` (and `sign_ms`/`exact_ms` when staged).
 /// When `sign_codes` is non-empty (planes layout), runs sign shortlist → densified exact.
 /// `codes_flat` is row-major `n × (scan_dim/(8/scan_bits))` for gathering the shortlist.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,

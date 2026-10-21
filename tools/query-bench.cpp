@@ -429,6 +429,8 @@ int main(int argc, char** argv) {
     vectorcache::SearchResults last;
     std::vector<double> run_ms;
     std::vector<double> fastscan_ms;
+    std::vector<double> sign_ms;
+    std::vector<double> exact_ms;
 
     vectorcache::LandmarkIndex index(db.cols, bits, landmarks, /*landmark_seed=*/0,
                                      effective_rerank_bits);
@@ -450,19 +452,32 @@ int main(int argc, char** argv) {
       const auto b = std::chrono::steady_clock::now();
       run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
       fastscan_ms.push_back(stages.fastscan_ms);
+      sign_ms.push_back(stages.sign_ms);
+      exact_ms.push_back(stages.exact_ms);
     }
 
     std::sort(run_ms.begin(), run_ms.end());
     std::sort(fastscan_ms.begin(), fastscan_ms.end());
+    std::sort(sign_ms.begin(), sign_ms.end());
+    std::sort(exact_ms.begin(), exact_ms.end());
     const double median_ms = run_ms[run_ms.size() / 2];
     const double median_fastscan_ms = fastscan_ms[fastscan_ms.size() / 2];
+    const double median_sign_ms = sign_ms[sign_ms.size() / 2];
+    const double median_exact_ms = exact_ms[exact_ms.size() / 2];
     const double nq = static_cast<double>(queries.rows);
     const double ms_per_query = median_ms / nq;
     const double fastscan_ms_per_query = median_fastscan_ms / nq;
     std::cout << "search_median_ms=" << median_ms << " ms_per_query=" << ms_per_query << "\n";
-    // Codes scan only (score_prepared) — comparable to turbovec FastScan kernel.
+    // Codes scan only — comparable to turbovec FastScan kernel.
     std::cout << "fastscan_median_ms=" << median_fastscan_ms
               << " fastscan_ms_per_query=" << fastscan_ms_per_query << "\n";
+    if (planes_on) {
+      // Staged breakdown: 1-bit sign corpus scan vs 4-bit exact on shortlist.
+      std::cout << "sign_median_ms=" << median_sign_ms
+                << " sign_ms_per_query=" << (median_sign_ms / nq) << "\n";
+      std::cout << "exact_median_ms=" << median_exact_ms
+                << " exact_ms_per_query=" << (median_exact_ms / nq) << "\n";
+    }
 
     if (recall) {
       ExactTopkCacheKey cache_key;
