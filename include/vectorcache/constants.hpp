@@ -4,7 +4,11 @@
 
 namespace vectorcache {
 
-inline constexpr std::size_t kBlock = 32;
+/// FastScan block width: 192 vectors × 1 byte-group tiles (not turbovec 32×4).
+inline constexpr std::size_t kBlock = 192;
+/// SIMD accumulate/flush chunk inside a block (2×16 AVX-512 lanes).
+inline constexpr std::size_t kFlushChunk = 32;
+inline constexpr std::size_t kChunksPerBlock = kBlock / kFlushChunk;  // 6
 inline constexpr std::size_t kMaxDim = 16384;
 /// One FWHT round (perm + signs + block WH) before 4-bit quant — SRHT stand-in.
 inline constexpr std::size_t kRotationRounds = 1;

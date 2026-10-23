@@ -44,39 +44,30 @@ void quantized_rerank_from_bitmap(std::span<const std::uint8_t> lut_bytes, float
 
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t base = b * kBlock;
-    const std::size_t end = std::min(base + kBlock, n_vectors);
-    // 32-bit window into the bitmap (kBlock == 32).
-    const std::size_t word = base >> 6;
-    const std::size_t bit = base & 63u;
-    std::uint32_t mask;
-    if (bit <= 32) {
-      mask = static_cast<std::uint32_t>((hit_bitmap[word] >> bit) & 0xFFFFFFFFu);
-    } else {
-      // Spans two u64 words (shouldn't happen for base multiples of 32).
-      mask = static_cast<std::uint32_t>(hit_bitmap[word] >> bit);
-      mask |= static_cast<std::uint32_t>(hit_bitmap[word + 1] << (64u - bit));
-    }
-    // Clear bits past end of corpus.
-    if (end - base < kBlock) {
-      mask &= (std::uint32_t{1} << (end - base)) - 1u;
-    }
-    if (mask == 0) {
+    if (!block_any_hit(hit_bitmap, base, n_vectors)) {
       continue;
     }
-    while (mask != 0) {
-      const unsigned lane = static_cast<unsigned>(std::countr_zero(mask));
-      mask &= mask - 1u;
-      const std::size_t vi = base + lane;
-      const std::uint8_t* row = codes_flat.data() + vi * n_byte_groups;
-      float score = lut_bias;
-      for (std::size_t g = 0; g < n_byte_groups; ++g) {
-        const auto byte_val = static_cast<std::size_t>(row[g]);
-        score += lut_scale * static_cast<float>(lut_bytes[g * 32 + (byte_val >> 4)]);
-        score += lut_scale * static_cast<float>(lut_bytes[g * 32 + 16 + (byte_val & 0x0F)]);
+    for (std::size_t c = 0; c < kChunksPerBlock; ++c) {
+      const std::size_t chunk_base = base + c * kFlushChunk;
+      std::uint32_t mask = block_hit_mask(hit_bitmap, chunk_base, n_vectors);
+      if (mask == 0) {
+        continue;
       }
-      score *= scales[vi];
-      heap_push_or_replace(heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi, kk, score,
-                           static_cast<std::uint64_t>(vi));
+      while (mask != 0) {
+        const unsigned lane = static_cast<unsigned>(std::countr_zero(mask));
+        mask &= mask - 1u;
+        const std::size_t vi = chunk_base + lane;
+        const std::uint8_t* row = codes_flat.data() + vi * n_byte_groups;
+        float score = lut_bias;
+        for (std::size_t g = 0; g < n_byte_groups; ++g) {
+          const auto byte_val = static_cast<std::size_t>(row[g]);
+          score += lut_scale * static_cast<float>(lut_bytes[g * 32 + (byte_val >> 4)]);
+          score += lut_scale * static_cast<float>(lut_bytes[g * 32 + 16 + (byte_val & 0x0F)]);
+        }
+        score *= scales[vi];
+        heap_push_or_replace(heap_s.data(), heap_i.data(), heap_sz, heap_min, heap_mi, kk, score,
+                             static_cast<std::uint64_t>(vi));
+      }
     }
   }
 

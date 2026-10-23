@@ -95,7 +95,7 @@ TEST(Index, StagedPlanesMatchesFullScanTop1) {
 #endif
   constexpr std::size_t dim = 64;
   constexpr std::size_t n = 512;
-  constexpr std::size_t m = 64;  // % 32 == 0 for planes geometry
+  constexpr std::size_t m = 64;  // multiple of 8 for byte packing / planes
   constexpr std::size_t k = 10;
 
   if (!vectorcache::planes_wanted(4, m / 2, n)) {

@@ -68,6 +68,7 @@ void score_query_avx2_perm0_impl(QueryLutView lut, std::span<const std::uint8_t>
   heap_mi = hmi[0];
 }
 
+/// 192×1 AVX2 PERM0: each kFlushChunk (32) sub-tile uses the classic PERM0 path.
 void score_queries_avx2_perm0_impl(const QueryLutView* luts, std::size_t nq,
                                    std::span<const std::uint8_t> blocked_codes,
                                    std::span<const float> vec_scales, std::size_t n_byte_groups,
@@ -76,10 +77,10 @@ void score_queries_avx2_perm0_impl(const QueryLutView* luts, std::size_t nq,
                                    std::size_t* heap_sz, float* heap_min, std::size_t* heap_mi,
                                    const float* bias_corrs, const std::uint64_t* id_map,
                                    const float* score_offsets) {
+  static_assert(kBlock == 192 && kChunksPerBlock == 6);
   const __m256i nibble_mask = _mm256_set1_epi8(static_cast<char>(0x0F));
   const std::uint8_t* codes_base = blocked_codes.data();
 
-  // Caller pads `luts` to kAvx2NqBatch (turbovec always scores 4 lanes).
   assert(nq >= 1 && nq <= kAvx2NqBatch);
   __m256 v_scale[kAvx2NqBatch];
   float bias[kAvx2NqBatch];
@@ -93,122 +94,131 @@ void score_queries_avx2_perm0_impl(const QueryLutView* luts, std::size_t nq,
 
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t base_vec = b * kBlock;
-    const std::size_t end = std::min(base_vec + kBlock, n_vectors);
+    for (std::size_t chunk = 0; chunk < kChunksPerBlock; ++chunk) {
+      const std::size_t chunk_base = base_vec + chunk * kFlushChunk;
+      if (chunk_base >= n_vectors) {
+        break;
+      }
+      const std::size_t end = std::min(chunk_base + kFlushChunk, n_vectors);
+      const std::size_t end_lane = end - chunk_base;
 
-    __m256 fa[kAvx2NqBatch][4];
-    for (std::size_t qi = 0; qi < kAvx2NqBatch; ++qi) {
-      fa[qi][0] = _mm256_set1_ps(bias[qi]);
-      fa[qi][1] = _mm256_set1_ps(bias[qi]);
-      fa[qi][2] = _mm256_set1_ps(bias[qi]);
-      fa[qi][3] = _mm256_set1_ps(bias[qi]);
-    }
-
-    const std::size_t n_batches = (n_byte_groups + kFlushEvery - 1) / kFlushEvery;
-    for (std::size_t batch = 0; batch < n_batches; ++batch) {
-      const std::size_t g_start = batch * kFlushEvery;
-      const std::size_t g_end = std::min(g_start + kFlushEvery, n_byte_groups);
-      __m256i accus[kAvx2NqBatch][4];
+      __m256 fa[kAvx2NqBatch][4];
       for (std::size_t qi = 0; qi < kAvx2NqBatch; ++qi) {
-        accus[qi][0] = _mm256_setzero_si256();
-        accus[qi][1] = _mm256_setzero_si256();
-        accus[qi][2] = _mm256_setzero_si256();
-        accus[qi][3] = _mm256_setzero_si256();
+        fa[qi][0] = _mm256_set1_ps(bias[qi]);
+        fa[qi][1] = _mm256_set1_ps(bias[qi]);
+        fa[qi][2] = _mm256_set1_ps(bias[qi]);
+        fa[qi][3] = _mm256_set1_ps(bias[qi]);
       }
 
-      for (std::size_t g = g_start; g < g_end; ++g) {
-        const std::uint8_t* cp = codes_base + (b * n_byte_groups + g) * kBlock;
-        const __m256i codes_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cp));
-        const __m256i clo = _mm256_and_si256(codes_v, nibble_mask);
-        const __m256i chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), nibble_mask);
-
+      const std::size_t n_batches = (n_byte_groups + kFlushEvery - 1) / kFlushEvery;
+      for (std::size_t batch = 0; batch < n_batches; ++batch) {
+        const std::size_t g_start = batch * kFlushEvery;
+        const std::size_t g_end = std::min(g_start + kFlushEvery, n_byte_groups);
+        __m256i accus[kAvx2NqBatch][4];
         for (std::size_t qi = 0; qi < kAvx2NqBatch; ++qi) {
-          const __m256i lut_v =
-              _mm256_loadu_si256(reinterpret_cast<const __m256i*>(luts[qi].uint8_luts + g * 32));
-          const __m256i res0 = _mm256_shuffle_epi8(lut_v, clo);
-          const __m256i res1 = _mm256_shuffle_epi8(lut_v, chi);
-          accus[qi][0] = _mm256_add_epi16(accus[qi][0], res0);
-          accus[qi][1] = _mm256_add_epi16(accus[qi][1], _mm256_srli_epi16(res0, 8));
-          accus[qi][2] = _mm256_add_epi16(accus[qi][2], res1);
-          accus[qi][3] = _mm256_add_epi16(accus[qi][3], _mm256_srli_epi16(res1, 8));
+          accus[qi][0] = _mm256_setzero_si256();
+          accus[qi][1] = _mm256_setzero_si256();
+          accus[qi][2] = _mm256_setzero_si256();
+          accus[qi][3] = _mm256_setzero_si256();
         }
-      }
-      for (std::size_t qi = 0; qi < kAvx2NqBatch; ++qi) {
-        flush_batch_to_fa(accus[qi], v_scale[qi], fa[qi]);
-      }
-    }
 
-    for (std::size_t qi = 0; qi < nq; ++qi) {
-      const std::size_t end_lane = end - base_vec;
-      const float* scales_ptr = vec_scales.data() + base_vec;
-      // turbovec avx2_post_flush_heap_update: early-out when heap full and no lane beats min.
-      if (heap_sz[qi] >= k && end_lane == kBlock) {
-        __m256 s0 = _mm256_mul_ps(fa[qi][0], _mm256_loadu_ps(scales_ptr));
-        __m256 s1 = _mm256_mul_ps(fa[qi][1], _mm256_loadu_ps(scales_ptr + 8));
-        __m256 s2 = _mm256_mul_ps(fa[qi][2], _mm256_loadu_ps(scales_ptr + 16));
-        __m256 s3 = _mm256_mul_ps(fa[qi][3], _mm256_loadu_ps(scales_ptr + 24));
-        if (score_off[qi] != 0.f) {
-          const __m256 off = _mm256_set1_ps(score_off[qi]);
-          s0 = _mm256_add_ps(s0, off);
-          s1 = _mm256_add_ps(s1, off);
-          s2 = _mm256_add_ps(s2, off);
-          s3 = _mm256_add_ps(s3, off);
-        }
-        const __m256 thr = _mm256_set1_ps(heap_min[qi]);
-        const std::uint32_t m0 =
-            static_cast<std::uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(s0, thr, _CMP_GT_OQ)));
-        const std::uint32_t m1 =
-            static_cast<std::uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(s1, thr, _CMP_GT_OQ)));
-        const std::uint32_t m2 =
-            static_cast<std::uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(s2, thr, _CMP_GT_OQ)));
-        const std::uint32_t m3 =
-            static_cast<std::uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(s3, thr, _CMP_GT_OQ)));
-        if ((m0 | m1 | m2 | m3) == 0) {
-          continue;
-        }
-        alignas(32) float block_out[kBlock];
-        if (m0 != 0) _mm256_storeu_ps(block_out, s0);
-        if (m1 != 0) _mm256_storeu_ps(block_out + 8, s1);
-        if (m2 != 0) _mm256_storeu_ps(block_out + 16, s2);
-        if (m3 != 0) _mm256_storeu_ps(block_out + 24, s3);
-        const std::uint32_t masks[4] = {m0, m1, m2, m3};
-        for (std::size_t chunk = 0; chunk < 4; ++chunk) {
-          std::uint32_t m = masks[chunk];
-          while (m != 0) {
-            const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
-            m &= m - 1;
-            const std::size_t lane = chunk * 8 + bit;
-            const float score = block_out[lane];
-            if (score > heap_min[qi]) {
-              heap_push_or_replace(heap_s[qi], heap_i[qi], heap_sz[qi], heap_min[qi], heap_mi[qi],
-                                   k, score, topk_map_id(id_map, base_vec + lane));
-            }
+        for (std::size_t g = g_start; g < g_end; ++g) {
+          // PERM0 sub-tile at offset chunk*32 within the 192-wide group.
+          const std::uint8_t* cp =
+              codes_base + (b * n_byte_groups + g) * kBlock + chunk * kFlushChunk;
+          const __m256i codes_v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cp));
+          const __m256i clo = _mm256_and_si256(codes_v, nibble_mask);
+          const __m256i chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), nibble_mask);
+
+          for (std::size_t qi = 0; qi < kAvx2NqBatch; ++qi) {
+            const __m256i lut_v =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(luts[qi].uint8_luts + g * 32));
+            const __m256i res0 = _mm256_shuffle_epi8(lut_v, clo);
+            const __m256i res1 = _mm256_shuffle_epi8(lut_v, chi);
+            accus[qi][0] = _mm256_add_epi16(accus[qi][0], res0);
+            accus[qi][1] = _mm256_add_epi16(accus[qi][1], _mm256_srli_epi16(res0, 8));
+            accus[qi][2] = _mm256_add_epi16(accus[qi][2], res1);
+            accus[qi][3] = _mm256_add_epi16(accus[qi][3], _mm256_srli_epi16(res1, 8));
           }
         }
-        continue;
-      }
-
-      alignas(32) float block_out[kBlock];
-      if (end_lane == kBlock) {
-        _mm256_storeu_ps(block_out, _mm256_mul_ps(fa[qi][0], _mm256_loadu_ps(scales_ptr)));
-        _mm256_storeu_ps(block_out + 8, _mm256_mul_ps(fa[qi][1], _mm256_loadu_ps(scales_ptr + 8)));
-        _mm256_storeu_ps(block_out + 16,
-                         _mm256_mul_ps(fa[qi][2], _mm256_loadu_ps(scales_ptr + 16)));
-        _mm256_storeu_ps(block_out + 24,
-                         _mm256_mul_ps(fa[qi][3], _mm256_loadu_ps(scales_ptr + 24)));
-      } else {
-        _mm256_storeu_ps(block_out, fa[qi][0]);
-        _mm256_storeu_ps(block_out + 8, fa[qi][1]);
-        _mm256_storeu_ps(block_out + 16, fa[qi][2]);
-        _mm256_storeu_ps(block_out + 24, fa[qi][3]);
-        for (std::size_t lane = 0; lane < end_lane; ++lane) {
-          block_out[lane] *= scales_ptr[lane];
+        for (std::size_t qi = 0; qi < kAvx2NqBatch; ++qi) {
+          flush_batch_to_fa(accus[qi], v_scale[qi], fa[qi]);
         }
       }
 
-      for (std::size_t lane = 0; lane < end_lane; ++lane) {
-        heap_push_or_replace(heap_s[qi], heap_i[qi], heap_sz[qi], heap_min[qi], heap_mi[qi], k,
-                             block_out[lane] + score_off[qi],
-                             topk_map_id(id_map, base_vec + lane));
+      for (std::size_t qi = 0; qi < nq; ++qi) {
+        const float* scales_ptr = vec_scales.data() + chunk_base;
+        if (heap_sz[qi] >= k && end_lane == kFlushChunk) {
+          __m256 s0 = _mm256_mul_ps(fa[qi][0], _mm256_loadu_ps(scales_ptr));
+          __m256 s1 = _mm256_mul_ps(fa[qi][1], _mm256_loadu_ps(scales_ptr + 8));
+          __m256 s2 = _mm256_mul_ps(fa[qi][2], _mm256_loadu_ps(scales_ptr + 16));
+          __m256 s3 = _mm256_mul_ps(fa[qi][3], _mm256_loadu_ps(scales_ptr + 24));
+          if (score_off[qi] != 0.f) {
+            const __m256 off = _mm256_set1_ps(score_off[qi]);
+            s0 = _mm256_add_ps(s0, off);
+            s1 = _mm256_add_ps(s1, off);
+            s2 = _mm256_add_ps(s2, off);
+            s3 = _mm256_add_ps(s3, off);
+          }
+          const __m256 thr = _mm256_set1_ps(heap_min[qi]);
+          const std::uint32_t m0 =
+              static_cast<std::uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(s0, thr, _CMP_GT_OQ)));
+          const std::uint32_t m1 =
+              static_cast<std::uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(s1, thr, _CMP_GT_OQ)));
+          const std::uint32_t m2 =
+              static_cast<std::uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(s2, thr, _CMP_GT_OQ)));
+          const std::uint32_t m3 =
+              static_cast<std::uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(s3, thr, _CMP_GT_OQ)));
+          if ((m0 | m1 | m2 | m3) == 0) {
+            continue;
+          }
+          alignas(32) float block_out[kFlushChunk];
+          if (m0 != 0) _mm256_storeu_ps(block_out, s0);
+          if (m1 != 0) _mm256_storeu_ps(block_out + 8, s1);
+          if (m2 != 0) _mm256_storeu_ps(block_out + 16, s2);
+          if (m3 != 0) _mm256_storeu_ps(block_out + 24, s3);
+          const std::uint32_t masks[4] = {m0, m1, m2, m3};
+          for (std::size_t half = 0; half < 4; ++half) {
+            std::uint32_t m = masks[half];
+            while (m != 0) {
+              const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
+              m &= m - 1;
+              const std::size_t lane = half * 8 + bit;
+              const float score = block_out[lane];
+              if (score > heap_min[qi]) {
+                heap_push_or_replace(heap_s[qi], heap_i[qi], heap_sz[qi], heap_min[qi],
+                                     heap_mi[qi], k, score,
+                                     topk_map_id(id_map, chunk_base + lane));
+              }
+            }
+          }
+          continue;
+        }
+
+        alignas(32) float block_out[kFlushChunk];
+        if (end_lane == kFlushChunk) {
+          _mm256_storeu_ps(block_out, _mm256_mul_ps(fa[qi][0], _mm256_loadu_ps(scales_ptr)));
+          _mm256_storeu_ps(block_out + 8,
+                           _mm256_mul_ps(fa[qi][1], _mm256_loadu_ps(scales_ptr + 8)));
+          _mm256_storeu_ps(block_out + 16,
+                           _mm256_mul_ps(fa[qi][2], _mm256_loadu_ps(scales_ptr + 16)));
+          _mm256_storeu_ps(block_out + 24,
+                           _mm256_mul_ps(fa[qi][3], _mm256_loadu_ps(scales_ptr + 24)));
+        } else {
+          _mm256_storeu_ps(block_out, fa[qi][0]);
+          _mm256_storeu_ps(block_out + 8, fa[qi][1]);
+          _mm256_storeu_ps(block_out + 16, fa[qi][2]);
+          _mm256_storeu_ps(block_out + 24, fa[qi][3]);
+          for (std::size_t lane = 0; lane < end_lane; ++lane) {
+            block_out[lane] *= scales_ptr[lane];
+          }
+        }
+
+        for (std::size_t lane = 0; lane < end_lane; ++lane) {
+          heap_push_or_replace(heap_s[qi], heap_i[qi], heap_sz[qi], heap_min[qi], heap_mi[qi], k,
+                               block_out[lane] + score_off[qi],
+                               topk_map_id(id_map, chunk_base + lane));
+        }
       }
     }
   }
@@ -262,7 +272,6 @@ void score_queries_avx2_perm0(const QueryLutView* luts, std::size_t nq,
     throw std::invalid_argument("score_queries_avx2_perm0: nq > kAvx2NqBatch");
   }
 #if defined(__x86_64__) || defined(_M_X64)
-  // Pad to kAvx2NqBatch so the accumulate loop is compile-time 4 (turbovec).
   QueryLutView pad_luts[kAvx2NqBatch];
   float* pad_heap_s[kAvx2NqBatch];
   std::uint64_t* pad_heap_i[kAvx2NqBatch];

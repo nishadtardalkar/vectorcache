@@ -149,19 +149,24 @@ std::vector<std::uint8_t> pack_blocked_sequential(std::size_t n, std::size_t n_b
 std::vector<std::uint8_t> pack_blocked_perm0(std::size_t n, std::size_t n_blocks,
                                              std::size_t n_byte_groups, std::size_t blocked_size,
                                              std::span<const std::uint8_t> codes_flat) {
+  // 192×1: PERM0 only defined on 32-lane tiles — pack each kFlushChunk sub-tile.
   std::vector<std::uint8_t> blocked(blocked_size, 0);
   for (std::size_t block_idx = 0; block_idx < n_blocks; ++block_idx) {
     const std::size_t base_vec = block_idx * kBlock;
     for (std::size_t g = 0; g < n_byte_groups; ++g) {
       const std::size_t out_offset = (block_idx * n_byte_groups + g) * kBlock;
-      for (std::size_t j = 0; j < 16; ++j) {
-        const std::size_t va = base_vec + kPerm0[j];
-        const std::size_t vb = base_vec + kPerm0[j] + 16;
-        const std::uint8_t ba = (va < n) ? codes_flat[va * n_byte_groups + g] : 0;
-        const std::uint8_t bb = (vb < n) ? codes_flat[vb * n_byte_groups + g] : 0;
-        blocked[out_offset + j] = static_cast<std::uint8_t>((ba >> 4) | ((bb >> 4) << 4));
-        blocked[out_offset + 16 + j] =
-            static_cast<std::uint8_t>((ba & 0x0F) | ((bb & 0x0F) << 4));
+      for (std::size_t chunk = 0; chunk < kChunksPerBlock; ++chunk) {
+        const std::size_t chunk_base = base_vec + chunk * kFlushChunk;
+        const std::size_t chunk_out = out_offset + chunk * kFlushChunk;
+        for (std::size_t j = 0; j < 16; ++j) {
+          const std::size_t va = chunk_base + kPerm0[j];
+          const std::size_t vb = chunk_base + kPerm0[j] + 16;
+          const std::uint8_t ba = (va < n) ? codes_flat[va * n_byte_groups + g] : 0;
+          const std::uint8_t bb = (vb < n) ? codes_flat[vb * n_byte_groups + g] : 0;
+          blocked[chunk_out + j] = static_cast<std::uint8_t>((ba >> 4) | ((bb >> 4) << 4));
+          blocked[chunk_out + 16 + j] =
+              static_cast<std::uint8_t>((ba & 0x0F) | ((bb & 0x0F) << 4));
+        }
       }
     }
   }
@@ -216,12 +221,14 @@ bool use_vector_major() {
 }
 
 bool vector_major_for([[maybe_unused]] std::size_t bits, std::size_t n_byte_groups) {
+  // 192×1 layout: no %4 quad constraint (depth-1 byte-groups).
+  (void)n_byte_groups;
 #if defined(__x86_64__) || defined(_M_X64)
   const bool kernel_exists = true;
 #else
   const bool kernel_exists = (bits == 4);
 #endif
-  return kernel_exists && use_vector_major() && (n_byte_groups % 4 == 0);
+  return kernel_exists && use_vector_major();
 }
 
 std::string search_backend_name(std::size_t bits, std::size_t dim) {
@@ -262,7 +269,7 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
 
   out << "=== search_backend_diagnostics ===\n";
   out << "bits=" << bits << " dim=" << dim << " codes_per_byte=" << codes_per_byte
-      << " n_byte_groups=" << n_byte_groups << " n_byte_groups%4=" << (n_byte_groups % 4) << "\n";
+      << " n_byte_groups=" << n_byte_groups << " kBlock=" << kBlock << " layout=192x1\n";
   out << "TURBOVEC_NO_VECTOR_MAJOR=" << (env_no_vm ? env_no_vm : "(unset)") << "\n";
   out << "TURBOVEC_NO_VNNI=" << (env_no_vnni ? env_no_vnni : "(unset)") << "\n";
   out << "use_vector_major()=" << (use_vector_major() ? 1 : 0) << "\n";
@@ -360,29 +367,12 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
 }
 
 void vector_major_chunk(std::span<std::uint8_t> buf) {
-  std::array<std::uint8_t, kVmUnit> tmp{};
-  for (std::size_t off = 0; off + kVmUnit <= buf.size(); off += kVmUnit) {
-    std::memcpy(tmp.data(), buf.data() + off, kVmUnit);
-    auto* unit = buf.data() + off;
-    for (std::size_t j = 0; j < 4; ++j) {
-      for (std::size_t v = 0; v < kBlock; ++v) {
-        unit[(v / 16) * 64 + (v % 16) * 4 + j] = tmp[j * kBlock + v];
-      }
-    }
-  }
+  // 192×1: sequential blocked layout already matches the kernel tile — no shuffle.
+  (void)buf;
 }
 
 void vector_major_to_seq_chunk(std::span<std::uint8_t> buf) {
-  std::array<std::uint8_t, kVmUnit> tmp{};
-  for (std::size_t off = 0; off + kVmUnit <= buf.size(); off += kVmUnit) {
-    std::memcpy(tmp.data(), buf.data() + off, kVmUnit);
-    auto* unit = buf.data() + off;
-    for (std::size_t j = 0; j < 4; ++j) {
-      for (std::size_t v = 0; v < kBlock; ++v) {
-        unit[j * kBlock + v] = tmp[(v / 16) * 64 + (v % 16) * 4 + j];
-      }
-    }
-  }
+  (void)buf;
 }
 
 std::vector<std::uint8_t> codes_flat_from_packed(std::span<const std::uint8_t> packed_codes,
@@ -440,15 +430,18 @@ std::uint8_t read_code(std::span<const std::uint8_t> blocked, std::size_t bits,
                        std::size_t n_byte_groups, std::size_t block_idx, std::size_t g,
                        std::size_t lane) {
   const std::size_t block_base = block_idx * n_byte_groups * kBlock;
+  const std::size_t group_off = block_base + g * kBlock;
   if (vector_major_for(bits, n_byte_groups)) {
-    const std::size_t idx =
-        block_base + (g / 4) * 128 + (lane / 16) * 64 + (lane % 16) * 4 + (g % 4);
-    return blocked[idx];
+    // 192×1 sequential: one byte-group is kBlock contiguous vector bytes.
+    return blocked[group_off + lane];
   }
 #if defined(__x86_64__) || defined(_M_X64)
-  return deinterleave_x86_code_byte(blocked, block_base + g * kBlock, lane);
+  // PERM0 is defined on kFlushChunk tiles within the 192-wide group.
+  const std::size_t chunk = lane / kFlushChunk;
+  const std::size_t lane_in_chunk = lane % kFlushChunk;
+  return deinterleave_x86_code_byte(blocked, group_off + chunk * kFlushChunk, lane_in_chunk);
 #else
-  return blocked[block_base + g * kBlock + lane];
+  return blocked[group_off + lane];
 #endif
 }
 
@@ -471,10 +464,10 @@ std::size_t planes_min_vectors() {
 }
 
 bool planes_for(std::size_t bits, std::size_t n_byte_groups) {
-  // turbovec: 4-bit planes need whole VM units in the sign region (nsg % 4 == 0)
-  // and the VNNI host path. n_byte_groups = dim/2 ⇒ nsg = dim/8 ⇒ dim % 32 == 0
-  // when n_byte_groups % 16 == 0.
-  return bits == 4 && (n_byte_groups % 16 == 0) && use_planes4() && use_vector_major();
+  // 4-bit staged: sign region nsg = dim/8; keep dim % 8 == 0 via byte packing.
+  // Former %16 (32×4) gate dropped for 192×1.
+  (void)n_byte_groups;
+  return bits == 4 && use_planes4() && use_vector_major();
 }
 
 bool planes_wanted(std::size_t bits, std::size_t n_byte_groups, std::size_t n_vectors) {

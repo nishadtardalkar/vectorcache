@@ -34,14 +34,12 @@ struct QueryPermuteDot {
 QueryPermuteDot build_permute_dot(std::span<const float> q_rot_row,
                                   std::span<const float> centroids, std::size_t dim);
 
-/// Rearrange per-group `[hi_16 | lo_16]` LUTs into vector-major VNNI order:
-/// per quad of groups, `[lo0|lo1|lo2|lo3][hi0|hi1|hi2|hi3]` (128 bytes).
+/// Identity copy of per-group `[hi_16 | lo_16]` LUTs (192×1; no quad reshape).
 std::vector<std::uint8_t> split_lut_for_vnni(std::span<const std::uint8_t> uint8_luts,
                                             std::size_t n_byte_groups);
 
-/// Score one query over vector-major blocked codes with AVX-512 VNNI
-/// (`vpermb` + `vpdpbusd`). `lut.uint8_luts` must already be split via
-/// `split_lut_for_vnni`. Requires `n_byte_groups % 4 == 0`.
+/// Score one query over 192×1 blocked codes with AVX-512 VNNI-LUT
+/// (`vpshufb` + u32 accumulate). `lut.uint8_luts` from `split_lut_for_vnni`.
 void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
                       std::span<const float> vec_scales, std::size_t n_byte_groups,
                       std::size_t n_vectors, std::size_t n_blocks, std::size_t k, float* heap_s,
@@ -50,8 +48,8 @@ void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_co
                       const std::uint64_t* id_map = nullptr, float score_offset = 0.f,
                       const float* residual_norms = nullptr, float residual_scale = 0.f);
 
-/// Score up to 10 queries sharing one codes stream (classic VNNI / split LUT).
-/// `nq` must be in [1, 10]. For `nq==1` prefers the dual-block kernel.
+/// Score up to 2 queries sharing one codes stream (192×1 VNNI-LUT).
+/// `nq` must be in [1, 2]; larger batches are multiple passes at the caller.
 /// `split_luts[qi]` already split; `lut_biases[qi]` should include any TQ+ bias.
 /// If `score_offsets` is non-null (length `nq`), adds `score_offsets[qi]` after α·LUT.
 void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_scales,

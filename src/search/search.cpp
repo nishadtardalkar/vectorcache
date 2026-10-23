@@ -32,20 +32,24 @@
 namespace vectorcache {
 namespace {
 
-constexpr std::size_t kNqBatch = 8;
-/// turbovec ST permute-dot widen: fewer passes when a single thread owns the scan.
-constexpr std::size_t kNqBatchWide = 10;
+/// 192×1 VNNI fused width (register-limited). Permute-dot may use a wider batch.
+constexpr std::size_t kNqBatchVnni = 2;
+constexpr std::size_t kNqBatchPermute = 8;
+constexpr std::size_t kNqBatchPermuteWide = 10;
 constexpr std::size_t kTilesPerThread = 32;
-constexpr std::size_t kMinTileBlocks = 1024;
+constexpr std::size_t kMinTileBlocks = 256;  // fewer, larger 192-wide blocks
 constexpr std::size_t kMinTileBlocksX86 = kMinTileBlocks * 3;
-constexpr std::size_t kSingleQueryParallelMinBlocks = 1024;
+constexpr std::size_t kSingleQueryParallelMinBlocks = 256;
 
 std::size_t nq_batch_for(bool use_permute_dot, std::size_t n_threads, std::size_t nq) {
-  if (use_permute_dot && n_threads <= 1 && (nq + kNqBatchWide - 1) / kNqBatchWide <
-                                               (nq + kNqBatch - 1) / kNqBatch) {
-    return kNqBatchWide;
+  if (!use_permute_dot) {
+    return kNqBatchVnni;
   }
-  return kNqBatch;
+  if (n_threads <= 1 && (nq + kNqBatchPermuteWide - 1) / kNqBatchPermuteWide <
+                            (nq + kNqBatchPermute - 1) / kNqBatchPermute) {
+    return kNqBatchPermuteWide;
+  }
+  return kNqBatchPermute;
 }
 
 PreparedQueryLut build_query_lut(std::span<const float> q_rot_row, std::span<const float> centroids,
@@ -270,10 +274,8 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   n_threads = static_cast<std::size_t>(std::max(1, omp_get_max_threads()));
 #endif
 
-  // turbovec: VM units align to block boundaries (block_bytes % 128 == 0 when
-  // n_byte_groups % 4 == 0), so block-range subspans are valid — same as their
-  // `blocked_codes[block_start * block_bytes ..]`.
-  // nq=1 uses turbovec `block_range_stride`; multi-query uses TILES_PER_THREAD tiling.
+  // 192×1: block_bytes = n_byte_groups * kBlock; block-range subspans are
+  // valid at any n_byte_groups. nq=1 uses block_range_stride; multi-query tiles.
   const std::size_t nq_batch = nq_batch_for(use_pd, n_threads, nq);
   const std::size_t n_quads = (nq + nq_batch - 1) / nq_batch;
   std::size_t blocks_per_range = 0;
@@ -1059,22 +1061,25 @@ void score_prepared_into(const PreparedQueries& prep, std::size_t k,
   const std::uint64_t* id_ptr = id_map.empty() ? nullptr : id_map.data();
   const std::size_t nqi = query_indices.size();
 
-  // Batch VNNI / permute-dot over the shared codes stream (up to kNqBatch queries).
+  // Batch VNNI (×2) / permute-dot over the shared codes stream.
   if (prep.backend == SearchBackendKind::VmVnni ||
       prep.backend == SearchBackendKind::VmPermuteDot) {
-    const std::size_t n_batches = (nqi + kNqBatch - 1) / kNqBatch;
+    const bool use_pd = prep.backend == SearchBackendKind::VmPermuteDot;
+    const std::size_t nq_batch = nq_batch_for(use_pd, /*n_threads=*/1, nqi);
+    constexpr std::size_t kMaxBatch = 10;
+    const std::size_t n_batches = (nqi + nq_batch - 1) / nq_batch;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
     for (int bi = 0; bi < static_cast<int>(n_batches); ++bi) {
-      const std::size_t start = static_cast<std::size_t>(bi) * kNqBatch;
-      const std::size_t batch_nq = std::min(kNqBatch, nqi - start);
-      float* hs_ptrs[kNqBatch];
-      std::uint64_t* hi_ptrs[kNqBatch];
-      std::size_t hsz_local[kNqBatch];
-      float hmin_local[kNqBatch];
-      std::size_t hmi_local[kNqBatch];
-      float offs_local[kNqBatch];
+      const std::size_t start = static_cast<std::size_t>(bi) * nq_batch;
+      const std::size_t batch_nq = std::min(nq_batch, nqi - start);
+      float* hs_ptrs[kMaxBatch];
+      std::uint64_t* hi_ptrs[kMaxBatch];
+      std::size_t hsz_local[kMaxBatch];
+      float hmin_local[kMaxBatch];
+      std::size_t hmi_local[kMaxBatch];
+      float offs_local[kMaxBatch];
 
       for (std::size_t i = 0; i < batch_nq; ++i) {
         const std::size_t gqi = query_indices[start + i];
@@ -1087,9 +1092,9 @@ void score_prepared_into(const PreparedQueries& prep, std::size_t k,
       }
 
       if (prep.backend == SearchBackendKind::VmVnni) {
-        const std::uint8_t* lut_ptrs[kNqBatch];
-        float scales_batch[kNqBatch];
-        float biases_batch[kNqBatch];
+        const std::uint8_t* lut_ptrs[kMaxBatch];
+        float scales_batch[kMaxBatch];
+        float biases_batch[kMaxBatch];
         for (std::size_t i = 0; i < batch_nq; ++i) {
           const std::size_t gqi = query_indices[start + i];
           lut_ptrs[i] = prep.split_luts[gqi].data();
@@ -1100,7 +1105,7 @@ void score_prepared_into(const PreparedQueries& prep, std::size_t k,
                            prep.n_byte_groups, n_vectors, n_blocks, k, hs_ptrs, hi_ptrs, hsz_local,
                            hmin_local, hmi_local, id_ptr, offs_local);
       } else {
-        const QueryPermuteDot* pd_ptrs[kNqBatch];
+        const QueryPermuteDot* pd_ptrs[kMaxBatch];
         for (std::size_t i = 0; i < batch_nq; ++i) {
           pd_ptrs[i] = &prep.pds[query_indices[start + i]];
         }

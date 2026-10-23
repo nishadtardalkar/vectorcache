@@ -13,7 +13,8 @@ namespace vectorcache {
 
 inline constexpr std::size_t kPerm0[16] = {0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15};
 inline constexpr std::size_t kInvPerm0[16] = {0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15};
-inline constexpr std::size_t kVmUnit = 4 * kBlock;
+/// One VM tile: 192 vectors × 1 byte-group = 192 bytes (identity vs sequential blocked).
+inline constexpr std::size_t kVmUnit = kBlock;
 
 struct BlockedGeometry {
   std::size_t n_blocks;
@@ -63,7 +64,7 @@ void vector_major_to_seq_chunk(std::span<std::uint8_t> buf);
 /// Kill switch: `TURBOVEC_4BIT_PLANES=0`. Optional `VECTORCACHE_PLANES_MIN` (default 32768).
 bool use_planes4();
 std::size_t planes_min_vectors();
-/// Geometry gate: `bits==4`, `n_byte_groups % 16 == 0` (⇒ dim % 32 == 0), VNNI host.
+/// Geometry gate: `bits==4`, VNNI host (192×1; dim multiple of 8 from packing).
 bool planes_for(std::size_t bits, std::size_t n_byte_groups);
 bool planes_wanted(std::size_t bits, std::size_t n_byte_groups, std::size_t n_vectors);
 
