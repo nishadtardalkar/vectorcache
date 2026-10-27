@@ -278,10 +278,10 @@ inline void add_u8x64_to_acc12(__m512i acc[12], std::size_t base_chunk, __m512i 
       _mm512_add_epi32(acc[base_chunk + 3], _mm512_cvtepu8_epi32(_mm512_extracti32x4_epi32(v8, 3)));
 }
 
-/// Sign-stage H99 flush: no residual. Conservative int prune with α_max, then
-/// float cmp; only survivor lanes pay heap_push.
+/// Sign H99 flush from one u16×32 accumulator (no residual). Float threshold prune;
+/// only survivor lanes hit the heap.
 VECTORCACHE_AVX512_FN
-void flush_sign_h99(__m512i acc0, __m512i acc1, std::size_t base_vec, std::size_t n_vectors,
+void flush_sign_u16(__m512i acc_u16, std::size_t base_vec, std::size_t n_vectors,
                     const float* vec_scales, std::size_t k, float* heap_s, std::uint64_t* heap_i,
                     std::size_t& heap_sz, float& heap_min, std::size_t& heap_mi, float lut_scale,
                     float lut_bias, const std::uint64_t* id_map) {
@@ -291,199 +291,187 @@ void flush_sign_h99(__m512i acc0, __m512i acc1, std::size_t base_vec, std::size_
   const std::size_t end = std::min(base_vec + kFlushChunk, n_vectors);
   const std::size_t end_lane = end - base_vec;
   const float* scales_ptr = vec_scales + base_vec;
+  const __m512 vs = _mm512_set1_ps(lut_scale);
+  const __m512 vb = _mm512_set1_ps(lut_bias);
+  const __m512i a0_i = _mm512_cvtepu16_epi32(_mm512_castsi512_si256(acc_u16));
+  const __m512i a1_i = _mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(acc_u16, 1));
+  __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a0_i), vs), vb);
+  __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a1_i), vs), vb);
 
-  if (!(heap_sz >= k || heap_mi == kHeapBuffered) || end_lane != kFlushChunk) {
-    // Sparse / filling path: convert all live lanes.
-    alignas(64) std::int32_t ai[kFlushChunk];
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(ai), acc0);
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(ai + 16), acc1);
-    for (std::size_t lane = 0; lane < end_lane; ++lane) {
-      const float f =
-          static_cast<float>(ai[lane]) * lut_scale + lut_bias;
-      const float score = f * scales_ptr[lane];
-      heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, score,
-                           topk_map_id(id_map, base_vec + lane));
+  if ((heap_sz >= k || heap_mi == kHeapBuffered) && end_lane == kFlushChunk) {
+    f0 = _mm512_mul_ps(f0, _mm512_loadu_ps(scales_ptr));
+    f1 = _mm512_mul_ps(f1, _mm512_loadu_ps(scales_ptr + 16));
+    const __m512 thr = _mm512_set1_ps(heap_min);
+    std::uint32_t m0 =
+        static_cast<std::uint32_t>(_mm512_cmp_ps_mask(f0, thr, _CMP_GT_OQ));
+    std::uint32_t m1 =
+        static_cast<std::uint32_t>(_mm512_cmp_ps_mask(f1, thr, _CMP_GT_OQ));
+    if ((m0 | m1) == 0) {
+      return;
     }
-    return;
-  }
-
-  const __m512 a0 = _mm512_loadu_ps(scales_ptr);
-  const __m512 a1 = _mm512_loadu_ps(scales_ptr + 16);
-  const float alpha_max =
-      std::max(_mm512_reduce_max_ps(a0), _mm512_reduce_max_ps(a1));
-
-  // Conservative int reject: α_max * (s·acc + b) <= heap_min ⇒ cannot beat threshold.
-  if (std::isfinite(heap_min) && alpha_max > 0.f && lut_scale > 0.f) {
-    const float thr_f = (heap_min / alpha_max - lut_bias) / lut_scale;
-    if (std::isfinite(thr_f)) {
-      // Acc sums ≤ 32 groups × 255; anything above that rejects the whole chunk.
-      if (thr_f >= 8192.f) {
-        return;
-      }
-      if (thr_f > -2147483648.f) {
-        const int thr_i = static_cast<int>(std::floor(thr_f));
-        const __m512i thr = _mm512_set1_epi32(thr_i);
-        const __mmask16 m0 = _mm512_cmpgt_epi32_mask(acc0, thr);
-        const __mmask16 m1 = _mm512_cmpgt_epi32_mask(acc1, thr);
-        if ((m0 | m1) == 0) {
-          return;
+    alignas(64) float scores[kFlushChunk];
+    if (m0 != 0) {
+      _mm512_storeu_ps(scores, f0);
+    }
+    if (m1 != 0) {
+      _mm512_storeu_ps(scores + 16, f1);
+    }
+    for (std::size_t half = 0; half < 2; ++half) {
+      std::uint32_t m = (half == 0) ? m0 : m1;
+      while (m != 0) {
+        const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
+        m &= m - 1;
+        const std::size_t lane = half * 16 + bit;
+        const float score = scores[lane];
+        if (score > heap_min) {
+          heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, score,
+                               topk_map_id(id_map, base_vec + lane));
         }
       }
     }
-  }
-
-  const __m512 vs = _mm512_set1_ps(lut_scale);
-  const __m512 vb = _mm512_set1_ps(lut_bias);
-  const __m512 f0 =
-      _mm512_mul_ps(_mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc0), vs), vb), a0);
-  const __m512 f1 =
-      _mm512_mul_ps(_mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc1), vs), vb), a1);
-  const __m512 thr_ps = _mm512_set1_ps(heap_min);
-  std::uint32_t m0 =
-      static_cast<std::uint32_t>(_mm512_cmp_ps_mask(f0, thr_ps, _CMP_GT_OQ));
-  std::uint32_t m1 =
-      static_cast<std::uint32_t>(_mm512_cmp_ps_mask(f1, thr_ps, _CMP_GT_OQ));
-  if ((m0 | m1) == 0) {
     return;
   }
-  // Survivor-only: compress-store hit lanes, then push.
-  alignas(64) float scores[kFlushChunk];
-  if (m0 != 0) {
-    _mm512_storeu_ps(scores, f0);
-  }
-  if (m1 != 0) {
-    _mm512_storeu_ps(scores + 16, f1);
-  }
-  for (std::size_t half = 0; half < 2; ++half) {
-    std::uint32_t m = (half == 0) ? m0 : m1;
-    while (m != 0) {
-      const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
-      m &= m - 1;
-      const std::size_t lane = half * 16 + bit;
-      const float score = scores[lane];
-      if (score > heap_min) {
-        heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, score,
-                             topk_map_id(id_map, base_vec + lane));
-      }
-    }
+
+  alignas(64) float lut_scores[kFlushChunk];
+  _mm512_storeu_ps(lut_scores, f0);
+  _mm512_storeu_ps(lut_scores + 16, f1);
+  for (std::size_t lane = 0; lane < end_lane; ++lane) {
+    heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k,
+                         lut_scores[lane] * scales_ptr[lane],
+                         topk_map_id(id_map, base_vec + lane));
   }
 }
 
+/// Group-outer m=256 sign: stream 192 contiguous code bytes/group (bandwidth-friendly),
+/// u16×6 accums/query, fuse NQ≤4 on one codes stream.
+template <std::size_t NQ>
 VECTORCACHE_AVX512_FN
-inline void sign_acc_one_group(__m512i acc[12], const std::uint8_t* lut32, const std::uint8_t* cp,
-                               __m512i m0f) {
-  const __m512i tbl_hi =
-      _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(lut32)));
-  const __m512i tbl_lo =
-      _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(lut32 + 16)));
-  for (std::size_t s = 0; s < 3; ++s) {
-    const __m512i c = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(cp + s * 64));
-    const __m512i ilo = _mm512_and_si512(c, m0f);
-    const __m512i ihi = _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f);
-    const __m512i v =
-        _mm512_add_epi8(_mm512_shuffle_epi8(tbl_lo, ilo), _mm512_shuffle_epi8(tbl_hi, ihi));
-    add_u8x64_to_acc12(acc, s * 4, v);
-  }
-}
-
-VECTORCACHE_AVX512_FN
-inline void sign_acc_block_32(__m512i acc[12], const std::uint8_t* lut, const std::uint8_t* block,
-                              __m512i m0f) {
-  // Fixed 32 groups (m=256); compilers typically fully unroll this tight body.
-  for (std::size_t g = 0; g < 32; ++g) {
-    sign_acc_one_group(acc, lut + g * 32, block + g * kBlock, m0f);
-  }
-}
-
-VECTORCACHE_AVX512_FN
-inline void prefetch_sign_block(const std::uint8_t* codes, std::size_t block_base,
-                                std::size_t codes_size) {
-  // Touch first ~4 groups of the next 192-block while epilogue runs.
-  for (std::size_t g = 0; g < 4; ++g) {
-    const std::size_t pf = block_base + g * kBlock;
-    if (pf + 64 <= codes_size) {
-      prefetch_t0(codes + pf);
-    }
-  }
-}
-
-/// m=256 sign corpus scan: 32 groups unrolled, int-first H99, next-block prefetch under flush.
-VECTORCACHE_AVX512_FN
-void score_sign_lut_m256_impl(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
-                              std::span<const float> vec_scales, std::size_t n_vectors,
-                              std::size_t n_blocks, std::size_t k, float* heap_s,
-                              std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min,
-                              std::size_t& heap_mi, const std::uint64_t* id_map) {
-  assert(lut.uint8_luts != nullptr);
+void score_sign_lut_m256_nq(const std::uint8_t* const* split_luts, const float* lut_scales,
+                            const float* lut_biases, std::size_t nq,
+                            std::span<const std::uint8_t> blocked_codes,
+                            std::span<const float> vec_scales, std::size_t n_vectors,
+                            std::size_t n_blocks, std::size_t k, float* const* heap_s,
+                            std::uint64_t* const* heap_i, std::size_t* heap_sz, float* heap_min,
+                            std::size_t* heap_mi, const std::uint64_t* id_map) {
+  static_assert(NQ >= 1 && NQ <= 4);
+  assert(nq >= 1 && nq <= NQ);
   static_assert(kBlock == 192 && kChunksPerBlock == 6);
   constexpr std::size_t kSignGroups = 32;
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const std::size_t block_bytes = kSignGroups * kBlock;
-  const float bias = lut.bias;
-  const float scale = lut.scale;
 
   VnniKernelProfile* const prof = active_vnni_profile();
   std::atomic<std::uint64_t>* const vnni_ns = prof ? &prof->vnni_ns : nullptr;
   std::atomic<std::uint64_t>* const epi_ns = prof ? &prof->epilogue_ns : nullptr;
 
-  if (n_blocks == 0) {
-    return;
-  }
-
-  auto accumulate = [&](__m512i acc[12], std::size_t b) {
-    for (std::size_t i = 0; i < 12; ++i) {
-      acc[i] = _mm512_setzero_si512();
-    }
-    sign_acc_block_32(acc, lut.uint8_luts, blocked_codes.data() + b * block_bytes, m0f);
-  };
-
-  auto epilogue = [&](__m512i acc[12], std::size_t b) {
+  for (std::size_t b = 0; b < n_blocks; ++b) {
+    const std::size_t block_base = b * block_bytes;
     const std::size_t base_vec = b * kBlock;
+    const std::uint8_t* block = blocked_codes.data() + block_base;
     if (b + 1 < n_blocks) {
-      prefetch_sign_block(blocked_codes.data(), (b + 1) * block_bytes, blocked_codes.size());
+      prefetch_t0(blocked_codes.data() + (b + 1) * block_bytes);
+    }
+    // Sample 1/8 blocks so QPC does not dominate wall time under --timing.
+    const bool sample_prof = (vnni_ns || epi_ns) && ((b & 7u) == 0u);
+    constexpr std::uint64_t kProfScale = 8;
+
+    __m512i acc16[NQ][6];
+    for (std::size_t qi = 0; qi < NQ; ++qi) {
+      for (std::size_t c = 0; c < 6; ++c) {
+        acc16[qi][c] = _mm512_setzero_si512();
+      }
+    }
+
+    std::chrono::steady_clock::time_point t_vnni0;
+    if (sample_prof) {
+      t_vnni0 = std::chrono::steady_clock::now();
+    }
+    for (std::size_t g = 0; g < kSignGroups; ++g) {
+      if (g + 1 < kSignGroups) {
+        prefetch_t0(block + (g + 1) * kBlock);
+      }
+      const std::uint8_t* cp = block + g * kBlock;
+      __m512i ilo[3];
+      __m512i ihi[3];
+      for (std::size_t s = 0; s < 3; ++s) {
+        const __m512i c = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(cp + s * 64));
+        ilo[s] = _mm512_and_si512(c, m0f);
+        ihi[s] = _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f);
+      }
+      for (std::size_t qi = 0; qi < nq; ++qi) {
+        const std::uint8_t* lut32 = split_luts[qi] + g * 32;
+        const __m512i tbl_hi = _mm512_broadcast_i32x4(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut32)));
+        const __m512i tbl_lo = _mm512_broadcast_i32x4(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut32 + 16)));
+        for (std::size_t s = 0; s < 3; ++s) {
+          const __m512i v = _mm512_add_epi8(_mm512_shuffle_epi8(tbl_lo, ilo[s]),
+                                            _mm512_shuffle_epi8(tbl_hi, ihi[s]));
+          const __m256i lo32 = _mm512_castsi512_si256(v);
+          const __m256i hi32 = _mm512_extracti64x4_epi64(v, 1);
+          acc16[qi][s * 2] =
+              _mm512_add_epi16(acc16[qi][s * 2], _mm512_cvtepu8_epi16(lo32));
+          acc16[qi][s * 2 + 1] =
+              _mm512_add_epi16(acc16[qi][s * 2 + 1], _mm512_cvtepu8_epi16(hi32));
+        }
+      }
+    }
+    if (sample_prof && vnni_ns) {
+      const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t_vnni0)
+                          .count();
+      if (ns > 0) {
+        vnni_ns->fetch_add(static_cast<std::uint64_t>(ns) * kProfScale,
+                           std::memory_order_relaxed);
+      }
+    }
+
+    std::chrono::steady_clock::time_point t_epi0;
+    if (sample_prof) {
+      t_epi0 = std::chrono::steady_clock::now();
     }
     for (std::size_t c = 0; c < kChunksPerBlock; ++c) {
       const std::size_t chunk_base = base_vec + c * kFlushChunk;
       if (chunk_base >= n_vectors) {
         break;
       }
-      flush_sign_h99(acc[c * 2], acc[c * 2 + 1], chunk_base, n_vectors, vec_scales.data(), k,
-                     heap_s, heap_i, heap_sz, heap_min, heap_mi, scale, bias, id_map);
+      for (std::size_t qi = 0; qi < nq; ++qi) {
+        flush_sign_u16(acc16[qi][c], chunk_base, n_vectors, vec_scales.data(), k, heap_s[qi],
+                       heap_i[qi], heap_sz[qi], heap_min[qi], heap_mi[qi], lut_scales[qi],
+                       lut_biases[qi], id_map);
+      }
     }
-  };
+    if (sample_prof && epi_ns) {
+      const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - t_epi0)
+                          .count();
+      if (ns > 0) {
+        epi_ns->fetch_add(static_cast<std::uint64_t>(ns) * kProfScale,
+                          std::memory_order_relaxed);
+      }
+    }
+  }
+}
 
-  // Software pipeline: accumulate b, prefetch b+1 during epi, then accumulate b+1.
-  __m512i acc[12];
-  {
-    const auto t0 = std::chrono::steady_clock::now();
-    accumulate(acc, 0);
-    const auto t1 = std::chrono::steady_clock::now();
-    profile_add_ns(vnni_ns, t0, t1);
-  }
-  for (std::size_t b = 0; b + 1 < n_blocks; ++b) {
-    __m512i acc_next[12];
-    {
-      const auto t_epi0 = std::chrono::steady_clock::now();
-      epilogue(acc, b);
-      const auto t_epi1 = std::chrono::steady_clock::now();
-      profile_add_ns(epi_ns, t_epi0, t_epi1);
-    }
-    {
-      const auto t0 = std::chrono::steady_clock::now();
-      accumulate(acc_next, b + 1);
-      const auto t1 = std::chrono::steady_clock::now();
-      profile_add_ns(vnni_ns, t0, t1);
-    }
-    for (std::size_t i = 0; i < 12; ++i) {
-      acc[i] = acc_next[i];
-    }
-  }
-  {
-    const auto t_epi0 = std::chrono::steady_clock::now();
-    epilogue(acc, n_blocks - 1);
-    const auto t_epi1 = std::chrono::steady_clock::now();
-    profile_add_ns(epi_ns, t_epi0, t_epi1);
-  }
+VECTORCACHE_AVX512_FN
+void score_sign_lut_m256_impl(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
+                              std::span<const float> vec_scales, std::size_t n_vectors,
+                              std::size_t n_blocks, std::size_t k, float* heap_s,
+                              std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min,
+                              std::size_t& heap_mi, const std::uint64_t* id_map) {
+  const std::uint8_t* luts[1] = {lut.uint8_luts};
+  const float scales[1] = {lut.scale};
+  const float biases[1] = {lut.bias};
+  float* hs[1] = {heap_s};
+  std::uint64_t* hi[1] = {heap_i};
+  std::size_t sz[1] = {heap_sz};
+  float mins[1] = {heap_min};
+  std::size_t mis[1] = {heap_mi};
+  score_sign_lut_m256_nq<1>(luts, scales, biases, 1, blocked_codes, vec_scales, n_vectors, n_blocks,
+                            k, hs, hi, sz, mins, mis, id_map);
+  heap_sz = sz[0];
+  heap_min = mins[0];
+  heap_mi = mis[0];
 }
 
 /// 192×1 VNNI-LUT: one byte-group at a time; epilogue once per 192 vectors (6×32 flushes).
@@ -514,7 +502,10 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
     __m512i acc[12];
     for (std::size_t i = 0; i < 12; ++i) acc[i] = _mm512_setzero_si512();
 
-    const auto t_vnni0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point t_vnni0;
+    if (vnni_ns) {
+      t_vnni0 = std::chrono::steady_clock::now();
+    }
     for (std::size_t g = 0; g < n_byte_groups; ++g) {
       // uint8_luts: half0 (hi nibble) at +0, half1 (lo nibble) at +16.
       const __m512i tbl_hi =
@@ -527,11 +518,7 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
       if (g + 1 < n_byte_groups) {
         const std::size_t pf = block_base + (g + 1) * kBlock;
         if (pf + 64 <= blocked_codes.size()) {
-#if defined(_MSC_VER)
-          _mm_prefetch(reinterpret_cast<const char*>(blocked_codes.data() + pf), _MM_HINT_T0);
-#else
-          __builtin_prefetch(blocked_codes.data() + pf, 0, 3);
-#endif
+          prefetch_t0(blocked_codes.data() + pf);
         }
       }
       for (std::size_t s = 0; s < 3; ++s) {
@@ -544,10 +531,14 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
         add_u8x64_to_acc12(acc, s * 4, v);
       }
     }
-    const auto t_vnni1 = std::chrono::steady_clock::now();
-    profile_add_ns(vnni_ns, t_vnni0, t_vnni1);
+    if (vnni_ns) {
+      profile_add_ns(vnni_ns, t_vnni0, std::chrono::steady_clock::now());
+    }
 
-    const auto t_epi0 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point t_epi0;
+    if (epi_ns) {
+      t_epi0 = std::chrono::steady_clock::now();
+    }
     for (std::size_t c = 0; c < kChunksPerBlock; ++c) {
       const std::size_t chunk_base = base_vec + c * kFlushChunk;
       if (chunk_base >= n_vectors) {
@@ -561,8 +552,9 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
                        heap_min, heap_mi, id_map, score_offset, nullptr, 0, 0, residual_norms,
                        residual_scale);
     }
-    const auto t_epi1 = std::chrono::steady_clock::now();
-    profile_add_ns(epi_ns, t_epi0, t_epi1);
+    if (epi_ns) {
+      profile_add_ns(epi_ns, t_epi0, std::chrono::steady_clock::now());
+    }
   }
 }
 
@@ -1190,15 +1182,47 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
                         const float* score_offsets, const float* residual_norms,
                         const float* residual_scales) {
 #if defined(__x86_64__) || defined(_M_X64)
-  // Sign corpus path: no residual / offset, m=256 → specialized kernel.
+  // Sign corpus path: no residual / offset, m=256 → u16 + fused NQ kernel.
   const bool use_sign_m256 = n_byte_groups == 32 && residual_norms == nullptr &&
                              (residual_scales == nullptr) && (score_offsets == nullptr);
   if (use_sign_m256) {
+#if defined(_WIN32) && defined(__GNUC__) && !defined(__clang__)
     for (std::size_t i = 0; i < nq; ++i) {
       QueryLutView view{split_luts[i], lut_scales[i], lut_biases[i]};
       score_sign_lut_m256(view, blocked_codes, vec_scales, n_byte_groups, n_vectors, n_blocks, k,
                           heap_s[i], heap_i[i], heap_sz[i], heap_min[i], heap_mi[i], id_map);
     }
+#else
+    // Fuse up to 4 queries on one codes stream (bandwidth-bound at 32 B/vec).
+    auto run_sign_batch = [&](std::size_t base, std::size_t batch) {
+      if (batch == 1) {
+        score_sign_lut_m256_nq<1>(split_luts + base, lut_scales + base, lut_biases + base, 1,
+                                  blocked_codes, vec_scales, n_vectors, n_blocks, k, heap_s + base,
+                                  heap_i + base, heap_sz + base, heap_min + base, heap_mi + base,
+                                  id_map);
+      } else if (batch == 2) {
+        score_sign_lut_m256_nq<2>(split_luts + base, lut_scales + base, lut_biases + base, 2,
+                                  blocked_codes, vec_scales, n_vectors, n_blocks, k, heap_s + base,
+                                  heap_i + base, heap_sz + base, heap_min + base, heap_mi + base,
+                                  id_map);
+      } else if (batch == 3) {
+        score_sign_lut_m256_nq<3>(split_luts + base, lut_scales + base, lut_biases + base, 3,
+                                  blocked_codes, vec_scales, n_vectors, n_blocks, k, heap_s + base,
+                                  heap_i + base, heap_sz + base, heap_min + base, heap_mi + base,
+                                  id_map);
+      } else {
+        score_sign_lut_m256_nq<4>(split_luts + base, lut_scales + base, lut_biases + base, 4,
+                                  blocked_codes, vec_scales, n_vectors, n_blocks, k, heap_s + base,
+                                  heap_i + base, heap_sz + base, heap_min + base, heap_mi + base,
+                                  id_map);
+      }
+    };
+    for (std::size_t base = 0; base < nq;) {
+      const std::size_t batch = std::min<std::size_t>(4, nq - base);
+      run_sign_batch(base, batch);
+      base += batch;
+    }
+#endif
     return;
   }
   if (nq == 1) {

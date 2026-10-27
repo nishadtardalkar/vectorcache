@@ -32,8 +32,9 @@
 namespace vectorcache {
 namespace {
 
-/// 192×1 VNNI fused width (register-limited). Permute-dot may use a wider batch.
+/// 192×1 VNNI fused width (register-limited). Sign m=256 uses a wider fuse.
 constexpr std::size_t kNqBatchVnni = 2;
+constexpr std::size_t kNqBatchSignM256 = 4;
 constexpr std::size_t kNqBatchPermute = 8;
 constexpr std::size_t kNqBatchPermuteWide = 10;
 constexpr std::size_t kTilesPerThread = 32;
@@ -276,7 +277,10 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
 
   // 192×1: block_bytes = n_byte_groups * kBlock; block-range subspans are
   // valid at any n_byte_groups. nq=1 uses block_range_stride; multi-query tiles.
-  const std::size_t nq_batch = nq_batch_for(use_pd, n_threads, nq);
+  // Sign m=256 (32 byte-groups) fuses 4 queries to amortize code bandwidth.
+  const std::size_t nq_batch =
+      (!use_pd && n_byte_groups == 32 && buffered) ? kNqBatchSignM256
+                                                   : nq_batch_for(use_pd, n_threads, nq);
   const std::size_t n_quads = (nq + nq_batch - 1) / nq_batch;
   std::size_t blocks_per_range = 0;
   std::size_t n_ranges = 1;

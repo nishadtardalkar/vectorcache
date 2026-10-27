@@ -59,8 +59,8 @@ void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_co
                       const float* residual_norms = nullptr, float residual_scale = 0.f);
 
 /// Sign-plane corpus scan specialized for `n_byte_groups == 32` (m=256 landmarks).
-/// Weighted ±q nibble LUT (same math as `build_sign_lut`); int-first H99 epilogue
-/// (no residual); software-pipelines the next 192-block under the flush.
+/// Weighted ±q nibble LUT; u16 accumulate (32 groups fit); H99 flush without residual.
+/// `score_queries_vnni` fuses up to 2 queries on one codes stream.
 /// Falls back to `score_query_vnni` when `n_byte_groups != 32`.
 void score_sign_lut_m256(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
                          std::span<const float> vec_scales, std::size_t n_byte_groups,
