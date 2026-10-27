@@ -33,9 +33,7 @@ class LandmarkIndex {
   void add(std::span<const float> vectors);
   void prepare();
 
-  /// If `timings` is non-null, records FastScan-kernel ms (codes scan only).
-  SearchResults search(std::span<const float> queries, std::size_t k,
-                       SearchStageTimings* timings = nullptr) const;
+  SearchResults search(std::span<const float> queries, std::size_t k) const;
 
  private:
   void encode_row(const float* src, float* unit_out, float* landmark_row_out, float* residual_out);

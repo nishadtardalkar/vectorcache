@@ -143,14 +143,10 @@ TEST(Index, StagedPlanesM256SelfQuery) {
   index.add(db);
   index.prepare();
 
-  vectorcache::SearchStageTimings stages;
-  auto res = index.search(std::span<const float>(db.data(), dim), k, &stages);
+  auto res = index.search(std::span<const float>(db.data(), dim), k);
   ASSERT_EQ(res.k, k);
   EXPECT_EQ(res.ids[0], 0u);
   EXPECT_GT(res.scores[0], 0.5f);
-  // Staged path should have recorded both stages.
-  EXPECT_GT(stages.sign_ms, 0.0);
-  EXPECT_GT(stages.exact_ms, 0.0);
 }
 
 TEST(Index, SeparateScanAndRerankBits) {

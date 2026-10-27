@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -340,8 +339,7 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
                                 const float* residual_scales = nullptr,
                                 const float* scale_resid = nullptr,
                                 const std::uint64_t* const* hit_bitmaps = nullptr,
-                                bool buffered = false, const float* seed_mins = nullptr,
-                                double* kernel_ms = nullptr, double* select_ms = nullptr) {
+                                bool buffered = false, const float* seed_mins = nullptr) {
   const std::size_t nq = query_indices.empty() ? prep.nq : query_indices.size();
   auto global_qi = [&](std::size_t local_i) -> std::size_t {
     return query_indices.empty() ? local_i : query_indices[local_i];
@@ -425,8 +423,6 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   // Buffered sign uses n_ranges=1: each qi is owned by exactly one query-batch
   // tile, so threads can write `all_cands[qi]` directly (no critical merge).
   const bool exclusive_qi = buffered && n_ranges == 1;
-  using clock = std::chrono::steady_clock;
-  const auto t_kernel0 = clock::now();
   // MinGW Win64 miscompiles concurrent AVX-512 VNNI under OpenMP; keep the VM
   // tile loop serial there. MSVC / Linux keep query×block tiling.
 #if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
@@ -571,11 +567,6 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       }
     }
   }
-  if (kernel_ms != nullptr) {
-    *kernel_ms = std::chrono::duration<double, std::milli>(clock::now() - t_kernel0).count();
-  }
-
-  const auto t_select0 = clock::now();
   for (std::size_t qi = 0; qi < nq; ++qi) {
     auto& cands = all_cands[qi];
     const std::size_t kk = std::min(out_k, cands.size());
@@ -602,9 +593,6 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
     if (buffered) {
       out.counts[qi] = kk;
     }
-  }
-  if (select_ms != nullptr) {
-    *select_ms = std::chrono::duration<double, std::milli>(clock::now() - t_select0).count();
   }
   return out;
 }
@@ -1089,7 +1077,7 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const float> residual_scales,
                              std::span<const float> scale_resid,
                              const std::uint64_t* const* hit_bitmaps, bool buffered,
-                             const float* seed_mins, double* kernel_ms, double* select_ms) {
+                             const float* seed_mins) {
   if (!query_indices.empty()) {
     for (std::size_t qi : query_indices) {
       if (qi >= prep.nq) {
@@ -1127,12 +1115,10 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
       prep.backend == SearchBackendKind::VmVnni) {
     out = score_prepared_vm(prep, effective_k, blocked_codes, n_blocks, scales, query_indices,
                             resid_ptr, resid_sc_ptr, scale_resid_ptr, hit_bitmaps, buffered,
-                            seed_mins, kernel_ms, select_ms);
+                            seed_mins);
   } else {
     (void)buffered;
     (void)seed_mins;
-    if (kernel_ms) *kernel_ms = 0;
-    if (select_ms) *select_ms = 0;
     out = score_prepared_perm0(prep, effective_k, blocked_codes, n_blocks, scales, query_indices);
     // AVX2/scalar heap: apply residual after (membership was s_L-only).
     if (resid_ptr != nullptr && resid_sc_ptr != nullptr) {
@@ -1323,13 +1309,9 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const float> lm_scales,
                                      std::span<const float> residual_norms, const Rotation& rotation,
                                      std::span<const float> scale_resid,
-                                     SearchStageTimings* timings,
                                      std::span<const std::uint8_t> sign_codes,
                                      std::size_t sign_n_blocks,
                                      std::span<const std::uint8_t> codes_flat) {
-  if (timings != nullptr) {
-    *timings = SearchStageTimings{};
-  }
   if (nq == 0 || lm_scales.empty() || k == 0) {
     SearchResults out;
     out.nq = nq;
@@ -1394,9 +1376,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     q_perp[qi] = static_cast<float>(std::sqrt(std::max(0.0, q2 - l2)));
   }
 
-  using clock = std::chrono::steady_clock;
-  const auto t_scan0 = clock::now();
-
   const std::size_t s_len = planes_shortlist_len(kk, scan_bits);
   const std::size_t n_byte_groups_4 = scan_dim / 2;
   const bool use_staged =
@@ -1412,59 +1391,24 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     const std::size_t e_len = planes_exact_len(kk, s_len);
     const std::size_t sign_cap = sign_heap_capacity(e_len, n_vectors);
 
-    const auto t_prep0 = clock::now();
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
-    if (timings != nullptr) {
-      timings->sign_prepare_ms =
-          std::chrono::duration<double, std::milli>(clock::now() - t_prep0).count();
-    }
     // VECTORCACHE_SIGN_SEED=0 disables sample seeding. α: VECTORCACHE_SIGN_ALPHA=1.
     const bool do_seed = env_flag_on("VECTORCACHE_SIGN_SEED", /*default_on=*/true);
-    const auto t_sign0 = clock::now();
 
     std::vector<float> sign_seeds;
     const float* seed_ptr = nullptr;
-    const auto t_seed0 = clock::now();
     if (do_seed) {
       // Calibrate to E (exact cut), not turbovec S — our collector keeps E.
       sign_seeds =
           sign_sample_seeds(prep_sign, sign_codes, sign_n_blocks, lm_scales, e_len, n_vectors);
       seed_ptr = sign_seeds.data();
     }
-    if (timings != nullptr) {
-      timings->sign_seed_ms =
-          std::chrono::duration<double, std::milli>(clock::now() - t_seed0).count();
-    }
 
-    // Profile VNNI vs epilogue on the main scan only (not the seed sample).
-    VnniKernelProfile sign_prof;
-    const bool profile_sign = timings != nullptr;
-    if (profile_sign) {
-      vnni_profile_begin(&sign_prof);
-    }
-    const auto t_sign_scan0 = clock::now();
-    double scan_kernel_ms = 0.0;
-    double scan_select_ms = 0.0;
     SearchResults shortlist =
         score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
-                       {}, nullptr, /*buffered=*/true, seed_ptr, &scan_kernel_ms, &scan_select_ms);
-    if (timings != nullptr) {
-      timings->sign_scan_ms =
-          std::chrono::duration<double, std::milli>(clock::now() - t_sign_scan0).count();
-      timings->sign_scan_kernel_ms = scan_kernel_ms;
-      timings->sign_scan_select_ms = scan_select_ms;
-      if (profile_sign) {
-        vnni_profile_end();
-        timings->sign_vnni_ms =
-            1e-6 * static_cast<double>(sign_prof.vnni_ns.load(std::memory_order_relaxed));
-        timings->sign_epilogue_ms =
-            1e-6 * static_cast<double>(sign_prof.epilogue_ns.load(std::memory_order_relaxed));
-      }
-    }
+                       {}, nullptr, /*buffered=*/true, seed_ptr);
 
     // Seed too aggressive → short collector; rescan those queries unseeded.
-    const auto t_rescan0 = clock::now();
-    std::size_t n_short = 0;
     if (do_seed) {
       std::vector<std::size_t> short_q;
       short_q.reserve(nq);
@@ -1475,7 +1419,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
           short_q.push_back(qi);
         }
       }
-      n_short = short_q.size();
       if (!short_q.empty()) {
         SearchResults redo = score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks,
                                             lm_scales, {}, short_q, {}, {}, {}, nullptr,
@@ -1496,16 +1439,8 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
         }
       }
     }
-    if (timings != nullptr) {
-      timings->sign_rescan_ms =
-          std::chrono::duration<double, std::milli>(clock::now() - t_rescan0).count();
-      timings->sign_short_queries = n_short;
-      timings->sign_ms =
-          std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
-    }
 
     // Stage 2: shortlist permute-dot over codes_flat (W=32/64 SoA tiles — no 192 densify).
-    const auto t_exact0 = clock::now();
     auto prep_exact = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
     out.nq = nq;
     out.k = kk;
@@ -1525,10 +1460,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       scale_resid_ptr = scale_resid_scratch.data();
     }
 
-    ShortlistKernelProfile exact_prof;
-    if (timings != nullptr) {
-      shortlist_profile_begin(&exact_prof);
-    }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
@@ -1602,17 +1533,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
         out.ids[qis * kk + j] = heap_i[order[j]];
       }
     }
-    if (timings != nullptr) {
-      shortlist_profile_end();
-      timings->exact_ms =
-          std::chrono::duration<double, std::milli>(clock::now() - t_exact0).count();
-      timings->exact_gather_ms =
-          1e-6 * static_cast<double>(exact_prof.gather_ns.load(std::memory_order_relaxed));
-      timings->exact_alu_ms =
-          1e-6 * static_cast<double>(exact_prof.alu_ns.load(std::memory_order_relaxed));
-      timings->exact_epi_ms =
-          1e-6 * static_cast<double>(exact_prof.epilogue_ns.load(std::memory_order_relaxed));
-    }
   } else {
     (void)sign_codes;
     (void)sign_n_blocks;
@@ -1622,10 +1542,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                          q_perp, scale_resid);
   }
 
-  if (timings != nullptr) {
-    timings->fastscan_ms =
-        std::chrono::duration<double, std::milli>(clock::now() - t_scan0).count();
-  }
   return out;
 }
 

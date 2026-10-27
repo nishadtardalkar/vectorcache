@@ -450,21 +450,6 @@ int main(int argc, char** argv) {
 
     vectorcache::SearchResults last;
     std::vector<double> run_ms;
-    std::vector<double> fastscan_ms;
-    std::vector<double> sign_prepare_ms;
-    std::vector<double> sign_ms;
-    std::vector<double> sign_seed_ms;
-    std::vector<double> sign_scan_ms;
-    std::vector<double> sign_scan_kernel_ms;
-    std::vector<double> sign_scan_select_ms;
-    std::vector<double> sign_rescan_ms;
-    std::vector<std::size_t> sign_short_q;
-    std::vector<double> sign_vnni_ms;
-    std::vector<double> sign_epilogue_ms;
-    std::vector<double> exact_ms;
-    std::vector<double> exact_gather_ms;
-    std::vector<double> exact_alu_ms;
-    std::vector<double> exact_epi_ms;
 
     vectorcache::LandmarkIndex index(db.cols, bits, landmarks, /*landmark_seed=*/0,
                                      effective_rerank_bits);
@@ -480,109 +465,17 @@ int main(int argc, char** argv) {
     }
 
     for (std::size_t r = 0; r < timing_runs; ++r) {
-      vectorcache::SearchStageTimings stages;
       const auto a = std::chrono::steady_clock::now();
-      last = index.search(queries.data, k, &stages);
+      last = index.search(queries.data, k);
       const auto b = std::chrono::steady_clock::now();
       run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
-      fastscan_ms.push_back(stages.fastscan_ms);
-      sign_prepare_ms.push_back(stages.sign_prepare_ms);
-      sign_ms.push_back(stages.sign_ms);
-      sign_seed_ms.push_back(stages.sign_seed_ms);
-      sign_scan_ms.push_back(stages.sign_scan_ms);
-      sign_scan_kernel_ms.push_back(stages.sign_scan_kernel_ms);
-      sign_scan_select_ms.push_back(stages.sign_scan_select_ms);
-      sign_rescan_ms.push_back(stages.sign_rescan_ms);
-      sign_short_q.push_back(stages.sign_short_queries);
-      sign_vnni_ms.push_back(stages.sign_vnni_ms);
-      sign_epilogue_ms.push_back(stages.sign_epilogue_ms);
-      exact_ms.push_back(stages.exact_ms);
-      exact_gather_ms.push_back(stages.exact_gather_ms);
-      exact_alu_ms.push_back(stages.exact_alu_ms);
-      exact_epi_ms.push_back(stages.exact_epi_ms);
     }
 
     std::sort(run_ms.begin(), run_ms.end());
-    std::sort(fastscan_ms.begin(), fastscan_ms.end());
-    std::sort(sign_prepare_ms.begin(), sign_prepare_ms.end());
-    std::sort(sign_ms.begin(), sign_ms.end());
-    std::sort(sign_seed_ms.begin(), sign_seed_ms.end());
-    std::sort(sign_scan_ms.begin(), sign_scan_ms.end());
-    std::sort(sign_scan_kernel_ms.begin(), sign_scan_kernel_ms.end());
-    std::sort(sign_scan_select_ms.begin(), sign_scan_select_ms.end());
-    std::sort(sign_rescan_ms.begin(), sign_rescan_ms.end());
-    std::sort(sign_short_q.begin(), sign_short_q.end());
-    std::sort(sign_vnni_ms.begin(), sign_vnni_ms.end());
-    std::sort(sign_epilogue_ms.begin(), sign_epilogue_ms.end());
-    std::sort(exact_ms.begin(), exact_ms.end());
-    std::sort(exact_gather_ms.begin(), exact_gather_ms.end());
-    std::sort(exact_alu_ms.begin(), exact_alu_ms.end());
-    std::sort(exact_epi_ms.begin(), exact_epi_ms.end());
     const double median_ms = run_ms[run_ms.size() / 2];
-    const double median_fastscan_ms = fastscan_ms[fastscan_ms.size() / 2];
-    const double median_sign_prepare_ms = sign_prepare_ms[sign_prepare_ms.size() / 2];
-    const double median_sign_ms = sign_ms[sign_ms.size() / 2];
-    const double median_sign_seed_ms = sign_seed_ms[sign_seed_ms.size() / 2];
-    const double median_sign_scan_ms = sign_scan_ms[sign_scan_ms.size() / 2];
-    const double median_sign_scan_kernel_ms = sign_scan_kernel_ms[sign_scan_kernel_ms.size() / 2];
-    const double median_sign_scan_select_ms = sign_scan_select_ms[sign_scan_select_ms.size() / 2];
-    const double median_sign_rescan_ms = sign_rescan_ms[sign_rescan_ms.size() / 2];
-    const std::size_t median_sign_short_q = sign_short_q[sign_short_q.size() / 2];
-    const double median_sign_vnni_ms = sign_vnni_ms[sign_vnni_ms.size() / 2];
-    const double median_sign_epilogue_ms = sign_epilogue_ms[sign_epilogue_ms.size() / 2];
-    const double median_exact_ms = exact_ms[exact_ms.size() / 2];
-    const double median_exact_gather_ms = exact_gather_ms[exact_gather_ms.size() / 2];
-    const double median_exact_alu_ms = exact_alu_ms[exact_alu_ms.size() / 2];
-    const double median_exact_epi_ms = exact_epi_ms[exact_epi_ms.size() / 2];
     const double nq = static_cast<double>(queries.rows);
     const double ms_per_query = median_ms / nq;
-    const double fastscan_ms_per_query = median_fastscan_ms / nq;
     std::cout << "search_median_ms=" << median_ms << " ms_per_query=" << ms_per_query << "\n";
-    // Codes scan only — comparable to turbovec FastScan kernel.
-    std::cout << "fastscan_median_ms=" << median_fastscan_ms
-              << " fastscan_ms_per_query=" << fastscan_ms_per_query << "\n";
-    if (planes_on) {
-      // Staged breakdown: LUT prep (separate) + seed/scan/rescan vs 4-bit exact.
-      std::cout << "sign_prepare_median_ms=" << median_sign_prepare_ms
-                << " sign_prepare_ms_per_query=" << (median_sign_prepare_ms / nq) << "\n";
-      std::cout << "sign_median_ms=" << median_sign_ms
-                << " sign_ms_per_query=" << (median_sign_ms / nq) << "\n";
-      std::cout << "sign_seed_median_ms=" << median_sign_seed_ms
-                << " sign_scan_median_ms=" << median_sign_scan_ms
-                << " sign_rescan_median_ms=" << median_sign_rescan_ms
-                << " sign_short_queries=" << median_sign_short_q << "\n";
-      // sign_scan wall split: OpenMP tile kernel vs post-tile select.
-      if (median_sign_scan_ms > 0.0) {
-        const double setup =
-            std::max(0.0, median_sign_scan_ms - median_sign_scan_kernel_ms -
-                              median_sign_scan_select_ms);
-        std::cout << "sign_scan_kernel_ms=" << median_sign_scan_kernel_ms
-                  << " frac=" << (median_sign_scan_kernel_ms / median_sign_scan_ms)
-                  << " sign_scan_select_ms=" << median_sign_scan_select_ms
-                  << " frac=" << (median_sign_scan_select_ms / median_sign_scan_ms)
-                  << " sign_scan_setup_ms=" << setup
-                  << " frac=" << (setup / median_sign_scan_ms) << "\n";
-      }
-      // Inside kernel: VNNI vs flush (summed-thread CPU; fractions of that sum).
-      if (median_sign_vnni_ms + median_sign_epilogue_ms > 0.0) {
-        const double kernel_cpu = median_sign_vnni_ms + median_sign_epilogue_ms;
-        std::cout << "sign_vnni_cpu_ms=" << median_sign_vnni_ms
-                  << " frac=" << (median_sign_vnni_ms / kernel_cpu)
-                  << " sign_epilogue_cpu_ms=" << median_sign_epilogue_ms
-                  << " frac=" << (median_sign_epilogue_ms / kernel_cpu) << "\n";
-      }
-      std::cout << "exact_median_ms=" << median_exact_ms
-                << " exact_ms_per_query=" << (median_exact_ms / nq) << "\n";
-      const double exact_kernel_cpu =
-          median_exact_gather_ms + median_exact_alu_ms + median_exact_epi_ms;
-      if (exact_kernel_cpu > 0.0) {
-        std::cout << "exact_gather_cpu_ms=" << median_exact_gather_ms
-                  << " exact_alu_cpu_ms=" << median_exact_alu_ms
-                  << " exact_epi_cpu_ms=" << median_exact_epi_ms
-                  << " exact_alu_frac=" << (median_exact_alu_ms / exact_kernel_cpu)
-                  << " exact_epi_frac=" << (median_exact_epi_ms / exact_kernel_cpu) << "\n";
-      }
-    }
 
     if (recall) {
       ExactTopkCacheKey cache_key;

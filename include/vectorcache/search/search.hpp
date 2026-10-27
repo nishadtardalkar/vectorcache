@@ -83,40 +83,6 @@ struct SearchResults {
   std::vector<std::size_t> counts;
 };
 
-/// Optional wall-clock breakdown for one search call (milliseconds).
-struct SearchStageTimings {
-  /// Total codes path (sign+exact when staged; full 4-bit scan otherwise).
-  double fastscan_ms = 0.0;
-  /// Staged only: sign LUT build (`prepare_sign_from_rows`) — not in `sign_ms`.
-  double sign_prepare_ms = 0.0;
-  /// Staged only: wall = seed + scan + rescan (no LUT prep).
-  double sign_ms = 0.0;
-  /// Staged only: strided sample → collector seed thresholds.
-  double sign_seed_ms = 0.0;
-  /// Staged only: main buffered sign corpus scan.
-  double sign_scan_ms = 0.0;
-  /// Staged only: wall of OpenMP tile loop (VNNI + flush + cand copy).
-  double sign_scan_kernel_ms = 0.0;
-  /// Staged only: wall of post-tile nth_element / write shortlist.
-  double sign_scan_select_ms = 0.0;
-  /// Staged only: unseeded rescan for queries whose seed left the collector short.
-  double sign_rescan_ms = 0.0;
-  /// Staged only: how many queries needed an unseeded rescan (last call).
-  std::size_t sign_short_queries = 0;
-  /// Staged only: VNNI accumulate inside sign kernel (summed-thread CPU ms).
-  double sign_vnni_ms = 0.0;
-  /// Staged only: convert/thr/H99 flush (summed-thread CPU ms).
-  double sign_epilogue_ms = 0.0;
-  /// Staged only: 4-bit exact rescore of the shortlist (gather + permute-dot).
-  double exact_ms = 0.0;
-  /// Staged only: gather codes_flat → SoA tile (summed-thread CPU ms).
-  double exact_gather_ms = 0.0;
-  /// Staged only: permute-dot ALU inside shortlist kernel (summed-thread CPU ms).
-  double exact_alu_ms = 0.0;
-  /// Staged only: residual flush / heap inside shortlist kernel (summed-thread CPU ms).
-  double exact_epi_ms = 0.0;
-};
-
 struct PreparedQueryLut {
   std::vector<std::uint8_t> uint8_luts;
   float scale = 1.f;
@@ -160,7 +126,6 @@ PreparedQueries prepare_sign_from_rows(std::span<const float> rows, std::size_t 
 
 /// FWHT → 4-bit landmark project → FastScan top-k with residual-energy bound.
 /// Score = s_L + ‖q_⊥‖·‖r_i‖. No full-dim re-rank.
-/// If `timings` is non-null, fills `fastscan_ms` (and `sign_ms`/`exact_ms` when staged).
 /// When `sign_codes` is non-empty (planes layout), runs sign shortlist → shortlist 4-bit exact.
 /// `codes_flat` is row-major `n × (scan_dim/(8/scan_bits))` for gathering the shortlist.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
@@ -171,7 +136,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
                                      std::span<const float> lm_scales,
                                      std::span<const float> residual_norms, const Rotation& rotation,
                                      std::span<const float> scale_resid = {},
-                                     SearchStageTimings* timings = nullptr,
                                      std::span<const std::uint8_t> sign_codes = {},
                                      std::size_t sign_n_blocks = 0,
                                      std::span<const std::uint8_t> codes_flat = {});
@@ -189,8 +153,6 @@ PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
 /// Empty blocks are skipped inside the existing permute-dot / VNNI kernels.
 /// If `buffered`, uses turbovec H99 collector (capacity `k`, returns top `k/2`).
 /// Optional `seed_mins` (length `prep.nq`) seeds each query's admit threshold.
-/// Optional `kernel_ms` / `select_ms` receive wall-clock ms for the tile loop vs
-/// post-tile select (staged sign breakdown).
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                              std::span<const float> scales,
@@ -200,8 +162,7 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const float> residual_scales = {},
                              std::span<const float> scale_resid = {},
                              const std::uint64_t* const* hit_bitmaps = nullptr,
-                             bool buffered = false, const float* seed_mins = nullptr,
-                             double* kernel_ms = nullptr, double* select_ms = nullptr);
+                             bool buffered = false, const float* seed_mins = nullptr);
 
 /// Continue scoring into existing per-query top-k heaps (length `prep.nq`, indexed by global qi).
 /// Only `query_indices` are updated. Heaps may already be partially filled.

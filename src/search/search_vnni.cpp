@@ -1,10 +1,8 @@
 #include "vectorcache/search/search_vnni.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <bit>
 #include <cassert>
-#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -27,30 +25,6 @@
 
 namespace vectorcache {
 namespace {
-
-std::atomic<VnniKernelProfile*> g_vnni_profile{nullptr};
-std::atomic<ShortlistKernelProfile*> g_shortlist_profile{nullptr};
-
-inline void profile_add_ns(std::atomic<std::uint64_t>* bucket,
-                           std::chrono::steady_clock::time_point t0,
-                           std::chrono::steady_clock::time_point t1) {
-  if (bucket == nullptr) {
-    return;
-  }
-  const auto ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-  if (ns > 0) {
-    bucket->fetch_add(static_cast<std::uint64_t>(ns), std::memory_order_relaxed);
-  }
-}
-
-inline VnniKernelProfile* active_vnni_profile() {
-  return g_vnni_profile.load(std::memory_order_relaxed);
-}
-
-inline ShortlistKernelProfile* active_shortlist_profile() {
-  return g_shortlist_profile.load(std::memory_order_relaxed);
-}
 
 #if defined(__x86_64__) || defined(_M_X64)
 
@@ -551,18 +525,12 @@ void score_sign_vnni_vm32_nq(const std::uint8_t* const* split_luts, const float*
   const std::size_t quads = n_byte_groups / 4;
   const std::size_t block_bytes = n_byte_groups * kSignBlock;
 
-  VnniKernelProfile* const prof = active_vnni_profile();
-  std::atomic<std::uint64_t>* const vnni_ns = prof ? &prof->vnni_ns : nullptr;
-  std::atomic<std::uint64_t>* const epi_ns = prof ? &prof->epilogue_ns : nullptr;
-
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t block_base = b * block_bytes;
     const std::size_t base_vec = b * kSignBlock;
     if (b + 1 < n_blocks) {
       prefetch_t0(blocked_codes.data() + (b + 1) * block_bytes);
     }
-    const bool sample_prof = (vnni_ns || epi_ns) && ((b & 7u) == 0u);
-    constexpr std::uint64_t kProfScale = 8;
 
     // acc[qi][h]: 16 u32 lanes = 16 vectors; h=0 → vec 0-15, h=1 → 16-31.
     __m512i acc[NQ][2];
@@ -571,10 +539,6 @@ void score_sign_vnni_vm32_nq(const std::uint8_t* const* split_luts, const float*
       acc[qi][1] = _mm512_setzero_si512();
     }
 
-    std::chrono::steady_clock::time_point t_vnni0;
-    if (sample_prof) {
-      t_vnni0 = std::chrono::steady_clock::now();
-    }
     for (std::size_t q4 = 0; q4 < quads; ++q4) {
       // NQ≤4: hoist LUT pairs across the two halves (~24 ZMM, no spill).
       // NQ=5..8: reload per half — hoist would need +2*NQ ZMMs on top of 2*NQ accs.
@@ -622,33 +586,10 @@ void score_sign_vnni_vm32_nq(const std::uint8_t* const* split_luts, const float*
         }
       }
     }
-    if (sample_prof && vnni_ns) {
-      const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          std::chrono::steady_clock::now() - t_vnni0)
-                          .count();
-      if (ns > 0) {
-        vnni_ns->fetch_add(static_cast<std::uint64_t>(ns) * kProfScale,
-                           std::memory_order_relaxed);
-      }
-    }
-
-    std::chrono::steady_clock::time_point t_epi0;
-    if (sample_prof) {
-      t_epi0 = std::chrono::steady_clock::now();
-    }
     for (std::size_t qi = 0; qi < nq; ++qi) {
       flush_sign_i32(acc[qi][0], acc[qi][1], base_vec, n_vectors, k, heap_s[qi], heap_i[qi],
                      heap_sz[qi], heap_min[qi], heap_mi[qi], lut_scales[qi], lut_biases[qi], id_map,
                      vec_scales);
-    }
-    if (sample_prof && epi_ns) {
-      const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          std::chrono::steady_clock::now() - t_epi0)
-                          .count();
-      if (ns > 0) {
-        epi_ns->fetch_add(static_cast<std::uint64_t>(ns) * kProfScale,
-                          std::memory_order_relaxed);
-      }
     }
   }
 }
@@ -875,20 +816,12 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
   const __m512 vs = _mm512_set1_ps(lut.scale);
   const __m512 vb = _mm512_set1_ps(bias);
 
-  VnniKernelProfile* const prof = active_vnni_profile();
-  std::atomic<std::uint64_t>* const vnni_ns = prof ? &prof->vnni_ns : nullptr;
-  std::atomic<std::uint64_t>* const epi_ns = prof ? &prof->epilogue_ns : nullptr;
-
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t block_base = b * block_bytes;
     const std::size_t base_vec = b * kBlock;
     __m512i acc[12];
     for (std::size_t i = 0; i < 12; ++i) acc[i] = _mm512_setzero_si512();
 
-    std::chrono::steady_clock::time_point t_vnni0;
-    if (vnni_ns) {
-      t_vnni0 = std::chrono::steady_clock::now();
-    }
     for (std::size_t g = 0; g < n_byte_groups; ++g) {
       // uint8_luts: half0 (hi nibble) at +0, half1 (lo nibble) at +16.
       const __m512i tbl_hi =
@@ -914,14 +847,7 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
         add_u8x64_to_acc12(acc, s * 4, v);
       }
     }
-    if (vnni_ns) {
-      profile_add_ns(vnni_ns, t_vnni0, std::chrono::steady_clock::now());
-    }
 
-    std::chrono::steady_clock::time_point t_epi0;
-    if (epi_ns) {
-      t_epi0 = std::chrono::steady_clock::now();
-    }
     for (std::size_t c = 0; c < kChunksPerBlock; ++c) {
       const std::size_t chunk_base = base_vec + c * kFlushChunk;
       if (chunk_base >= n_vectors) {
@@ -934,9 +860,6 @@ void score_query_vnni_impl(QueryLutView lut, std::span<const std::uint8_t> block
       flush_block_heap(f0, f1, chunk_base, n_vectors, vec_scales.data(), k, heap_s, heap_i, heap_sz,
                        heap_min, heap_mi, id_map, score_offset, nullptr, 0, 0, residual_norms,
                        residual_scale);
-    }
-    if (epi_ns) {
-      profile_add_ns(epi_ns, t_epi0, std::chrono::steady_clock::now());
     }
   }
 }
@@ -960,9 +883,6 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
 
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const std::size_t block_bytes = n_byte_groups * kBlock;
-  VnniKernelProfile* const prof = active_vnni_profile();
-  std::atomic<std::uint64_t>* const vnni_ns = prof ? &prof->vnni_ns : nullptr;
-  std::atomic<std::uint64_t>* const epi_ns = prof ? &prof->epilogue_ns : nullptr;
 
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t base_vec = b * kBlock;
@@ -972,7 +892,6 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
       for (std::size_t i = 0; i < 12; ++i) acc[qi][i] = _mm512_setzero_si512();
     }
 
-    const auto t_vnni0 = std::chrono::steady_clock::now();
     for (std::size_t g = 0; g < n_byte_groups; ++g) {
       __m512i tbl_hi[NQ];
       __m512i tbl_lo[NQ];
@@ -995,10 +914,6 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
         }
       }
     }
-    const auto t_vnni1 = std::chrono::steady_clock::now();
-    profile_add_ns(vnni_ns, t_vnni0, t_vnni1);
-
-    const auto t_epi0 = std::chrono::steady_clock::now();
     for (std::size_t qi = 0; qi < nq; ++qi) {
       const __m512 vs = _mm512_set1_ps(lut_scales[qi]);
       const __m512 vb = _mm512_set1_ps(lut_biases[qi]);
@@ -1018,8 +933,6 @@ void score_queries_vnni_multi(const std::uint8_t* const* split_luts, const float
                          0, 0, residual_norms, rs);
       }
     }
-    const auto t_epi1 = std::chrono::steady_clock::now();
-    profile_add_ns(epi_ns, t_epi0, t_epi1);
   }
 }
 
@@ -1319,11 +1232,6 @@ void score_shortlist_permute_dot_impl(const QueryPermuteDot& pd,
     return;
   }
 
-  ShortlistKernelProfile* const prof = active_shortlist_profile();
-  std::atomic<std::uint64_t>* const gather_ns = prof ? &prof->gather_ns : nullptr;
-  std::atomic<std::uint64_t>* const alu_ns = prof ? &prof->alu_ns : nullptr;
-  std::atomic<std::uint64_t>* const epi_ns = prof ? &prof->epilogue_ns : nullptr;
-
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const __m512i levels = _mm512_xor_si512(
       _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(pd.levels.data()))),
@@ -1339,34 +1247,28 @@ void score_shortlist_permute_dot_impl(const QueryPermuteDot& pd,
   for (std::size_t tile_start = 0; tile_start < n_cand; tile_start += W) {
     const std::size_t tw = std::min(W, n_cand - tile_start);
 
-    {
-      const auto t0 = std::chrono::steady_clock::now();
-      std::memset(aos.data(), 0, aos.size());
-      std::memset(tile.data(), 0, tile.size());
+    std::memset(aos.data(), 0, aos.size());
+    std::memset(tile.data(), 0, tile.size());
+    for (std::size_t c = 0; c < tw; ++c) {
+      const std::uint64_t id = cand_ids[tile_start + c];
+      if (id >= n_corpus) {
+        continue;
+      }
+      if (c + 1 < tw) {
+        const std::uint64_t nid = cand_ids[tile_start + c + 1];
+        if (nid < n_corpus) {
+          prefetch_t0(codes_flat.data() + static_cast<std::size_t>(nid) * n_byte_groups);
+        }
+      }
+      std::memcpy(aos.data() + c * n_byte_groups,
+                  codes_flat.data() + static_cast<std::size_t>(id) * n_byte_groups, n_byte_groups);
+    }
+    // Transpose: for each group, pack W candidate bytes contiguously.
+    for (std::size_t g = 0; g < n_byte_groups; ++g) {
+      std::uint8_t* dst = tile.data() + g * W;
       for (std::size_t c = 0; c < tw; ++c) {
-        const std::uint64_t id = cand_ids[tile_start + c];
-        if (id >= n_corpus) {
-          continue;
-        }
-        if (c + 1 < tw) {
-          const std::uint64_t nid = cand_ids[tile_start + c + 1];
-          if (nid < n_corpus) {
-            prefetch_t0(codes_flat.data() + static_cast<std::size_t>(nid) * n_byte_groups);
-          }
-        }
-        std::memcpy(aos.data() + c * n_byte_groups,
-                    codes_flat.data() + static_cast<std::size_t>(id) * n_byte_groups,
-                    n_byte_groups);
+        dst[c] = aos[c * n_byte_groups + g];
       }
-      // Transpose: for each group, pack W candidate bytes contiguously.
-      for (std::size_t g = 0; g < n_byte_groups; ++g) {
-        std::uint8_t* dst = tile.data() + g * W;
-        for (std::size_t c = 0; c < tw; ++c) {
-          dst[c] = aos[c * n_byte_groups + g];
-        }
-      }
-      const auto t1 = std::chrono::steady_clock::now();
-      profile_add_ns(gather_ns, t0, t1);
     }
 
     constexpr std::size_t kChunks = W / kFlushChunk;  // 1 or 2
@@ -1375,44 +1277,34 @@ void score_shortlist_permute_dot_impl(const QueryPermuteDot& pd,
       acc[i] = z;
     }
 
-    {
-      const auto t0 = std::chrono::steady_clock::now();
-      for (std::size_t g = 0; g < n_byte_groups; ++g) {
-        const std::int32_t wlo = static_cast<std::int32_t>(pd.weights[2 * g]);
-        const std::int32_t whi = static_cast<std::int32_t>(pd.weights[2 * g + 1]);
-        const std::uint8_t* cp = tile.data() + g * W;
-        for (std::size_t s = 0; s < kChunks; ++s) {
-          // Load 32 code bytes (one flush chunk); high 32B of ZMM unused.
-          const __m256i c32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cp + s * 32));
-          const __m512i c512 = _mm512_castsi256_si512(c32);
-          const __m512i vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c512, m0f));
-          const __m512i vhi = _mm512_shuffle_epi8(levels, hi_nibbles<kGfni>(c512, m0f));
-          const std::size_t a0 = s * 2;
-          madd_level_w16(acc[a0 + 0], _mm512_castsi512_si128(vlo), wlo);
-          madd_level_w16(acc[a0 + 1], _mm512_extracti32x4_epi32(vlo, 1), wlo);
-          madd_level_w16(acc[a0 + 0], _mm512_castsi512_si128(vhi), whi);
-          madd_level_w16(acc[a0 + 1], _mm512_extracti32x4_epi32(vhi, 1), whi);
-        }
+    for (std::size_t g = 0; g < n_byte_groups; ++g) {
+      const std::int32_t wlo = static_cast<std::int32_t>(pd.weights[2 * g]);
+      const std::int32_t whi = static_cast<std::int32_t>(pd.weights[2 * g + 1]);
+      const std::uint8_t* cp = tile.data() + g * W;
+      for (std::size_t s = 0; s < kChunks; ++s) {
+        // Load 32 code bytes (one flush chunk); high 32B of ZMM unused.
+        const __m256i c32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(cp + s * 32));
+        const __m512i c512 = _mm512_castsi256_si512(c32);
+        const __m512i vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c512, m0f));
+        const __m512i vhi = _mm512_shuffle_epi8(levels, hi_nibbles<kGfni>(c512, m0f));
+        const std::size_t a0 = s * 2;
+        madd_level_w16(acc[a0 + 0], _mm512_castsi512_si128(vlo), wlo);
+        madd_level_w16(acc[a0 + 1], _mm512_extracti32x4_epi32(vlo, 1), wlo);
+        madd_level_w16(acc[a0 + 0], _mm512_castsi512_si128(vhi), whi);
+        madd_level_w16(acc[a0 + 1], _mm512_extracti32x4_epi32(vhi, 1), whi);
       }
-      const auto t1 = std::chrono::steady_clock::now();
-      profile_add_ns(alu_ns, t0, t1);
     }
 
-    {
-      const auto t0 = std::chrono::steady_clock::now();
-      for (std::size_t s = 0; s < kChunks; ++s) {
-        const std::size_t chunk_base = tile_start + s * kFlushChunk;
-        if (chunk_base >= tile_start + tw) {
-          break;
-        }
-        const std::size_t chunk_n = std::min(kFlushChunk, tile_start + tw - chunk_base);
-        const __m512 f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[s * 2]), vs, vb);
-        const __m512 f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[s * 2 + 1]), vs, vb);
-        flush_shortlist_chunk(f0, f1, chunk_base, chunk_n, cand_ids.data(), scale_resid, vec_scales,
-                              k, heap_s, heap_i, heap_sz, heap_min, heap_mi, residual_scale);
+    for (std::size_t s = 0; s < kChunks; ++s) {
+      const std::size_t chunk_base = tile_start + s * kFlushChunk;
+      if (chunk_base >= tile_start + tw) {
+        break;
       }
-      const auto t1 = std::chrono::steady_clock::now();
-      profile_add_ns(epi_ns, t0, t1);
+      const std::size_t chunk_n = std::min(kFlushChunk, tile_start + tw - chunk_base);
+      const __m512 f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[s * 2]), vs, vb);
+      const __m512 f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[s * 2 + 1]), vs, vb);
+      flush_shortlist_chunk(f0, f1, chunk_base, chunk_n, cand_ids.data(), scale_resid, vec_scales,
+                            k, heap_s, heap_i, heap_sz, heap_min, heap_mi, residual_scale);
     }
   }
 }
@@ -1422,22 +1314,6 @@ void score_shortlist_permute_dot_impl(const QueryPermuteDot& pd,
 #endif  // x86_64
 
 }  // namespace
-
-void vnni_profile_begin(VnniKernelProfile* profile) {
-  g_vnni_profile.store(profile, std::memory_order_release);
-}
-
-void vnni_profile_end() {
-  g_vnni_profile.store(nullptr, std::memory_order_release);
-}
-
-void shortlist_profile_begin(ShortlistKernelProfile* profile) {
-  g_shortlist_profile.store(profile, std::memory_order_release);
-}
-
-void shortlist_profile_end() {
-  g_shortlist_profile.store(nullptr, std::memory_order_release);
-}
 
 QueryPermuteDot build_permute_dot(std::span<const float> q_rot_row,
                                   std::span<const float> centroids, std::size_t dim) {
