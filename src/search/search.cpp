@@ -35,7 +35,8 @@ namespace {
 
 /// 192×1 VNNI fused width (register-limited). Sign m=256 uses a wider fuse.
 constexpr std::size_t kNqBatchVnni = 2;
-constexpr std::size_t kNqBatchSignM256 = 4;
+/// True-VNNI sign fuses up to 8 queries (turbovec search_multi_query_vnni width).
+constexpr std::size_t kNqBatchSignM256 = 8;
 constexpr std::size_t kNqBatchPermute = 8;
 constexpr std::size_t kNqBatchPermuteWide = 10;
 constexpr std::size_t kTilesPerThread = 32;
@@ -276,12 +277,12 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   n_threads = static_cast<std::size_t>(std::max(1, omp_get_max_threads()));
 #endif
 
-  // 192×1: block_bytes = n_byte_groups * kBlock; block-range subspans are
-  // valid at any n_byte_groups. nq=1 uses block_range_stride; multi-query tiles.
-  // Sign m=256 (32 byte-groups) fuses 4 queries to amortize code bandwidth.
+  // block_bytes = n_byte_groups * block_width. Sign VM32 fuses 8 queries.
+  const std::size_t block_width = prep.block_width == 0 ? kBlock : prep.block_width;
   const std::size_t nq_batch =
-      (!use_pd && n_byte_groups == 32 && buffered) ? kNqBatchSignM256
-                                                   : nq_batch_for(use_pd, n_threads, nq);
+      (!use_pd && buffered && block_width == kSignBlock && n_byte_groups % 4 == 0)
+          ? kNqBatchSignM256
+          : nq_batch_for(use_pd, n_threads, nq);
   const std::size_t n_quads = (nq + nq_batch - 1) / nq_batch;
   std::size_t blocks_per_range = 0;
   std::size_t n_ranges = 1;
@@ -346,10 +347,10 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       const std::size_t range_blocks = block_end - tile.block_start;
       if (range_blocks == 0 || batch_nq == 0) continue;
 
-      const std::size_t vec_start = tile.block_start * kBlock;
-      const std::size_t vec_end = std::min(block_end * kBlock, n_vectors);
+      const std::size_t vec_start = tile.block_start * block_width;
+      const std::size_t vec_end = std::min(block_end * block_width, n_vectors);
       const std::size_t range_n = vec_end - vec_start;
-      const std::size_t block_bytes = n_byte_groups * kBlock;
+      const std::size_t block_bytes = n_byte_groups * block_width;
       const std::size_t code_off = tile.block_start * block_bytes;
       const std::size_t code_len = range_blocks * block_bytes;
 
@@ -417,7 +418,7 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
         score_queries_vnni(lut_ptrs.data(), scales_batch.data(), biases_batch.data(), batch_nq,
                            codes_span, scales_span, n_byte_groups, range_n, range_blocks, effective_k,
                            heap_s_ptrs.data(), heap_i_ptrs.data(), heap_sz.data(), heap_min.data(),
-                           heap_mi.data(), nullptr, nullptr, range_resid, rs_ptr);
+                           heap_mi.data(), nullptr, nullptr, range_resid, rs_ptr, block_width);
       }
       for (std::size_t i = 0; i < batch_nq; ++i) {
         const std::size_t qi = tile.qi_start + i;
@@ -825,6 +826,8 @@ PreparedQueries prepare_sign_from_rows(std::span<const float> rows, std::size_t 
   prep.bias_corrs.assign(nq, 0.f);
 
   const bool use_vm = vector_major_for(/*bits=*/2, n_byte_groups);
+  const bool use_vm32 = use_vm && (n_byte_groups % 4 == 0);
+  prep.block_width = use_vm32 ? kSignBlock : kBlock;
 #if defined(__x86_64__) || defined(_M_X64)
   if (use_vm) {
     prep.backend = SearchBackendKind::VmVnni;
@@ -839,7 +842,8 @@ PreparedQueries prepare_sign_from_rows(std::span<const float> rows, std::size_t 
           std::span<const float>(prep.q_rot.data() + static_cast<std::size_t>(qi) * dim, dim);
       PreparedQueryLut lut = build_sign_lut(qrow, dim);
       prep.split_luts[static_cast<std::size_t>(qi)] =
-          split_lut_for_vnni(lut.uint8_luts, n_byte_groups);
+          use_vm32 ? split_lut_for_vnni_vm(lut.uint8_luts, n_byte_groups)
+                   : split_lut_for_vnni(lut.uint8_luts, n_byte_groups);
       prep.lut_scales[static_cast<std::size_t>(qi)] = lut.scale;
       prep.lut_biases[static_cast<std::size_t>(qi)] = lut.bias;
     }

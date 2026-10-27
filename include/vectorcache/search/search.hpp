@@ -8,6 +8,7 @@
 #include <utility>
 #include <vector>
 
+#include "vectorcache/constants.hpp"
 #include "vectorcache/search/search_vnni.hpp"
 #include "vectorcache/transform/landmarks.hpp"
 #include "vectorcache/transform/rotation.hpp"
@@ -117,6 +118,8 @@ struct PreparedQueries {
   std::size_t dim = 0;
   std::size_t bits = 0;
   std::size_t n_byte_groups = 0;
+  /// Vectors per FastScan block in the matching codes buffer (`kBlock` or `kSignBlock`).
+  std::size_t block_width = kBlock;
   SearchBackendKind backend = SearchBackendKind::Scalar;
 
   std::vector<float> q_rot;

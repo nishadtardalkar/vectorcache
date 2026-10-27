@@ -13,7 +13,7 @@ namespace vectorcache {
 
 inline constexpr std::size_t kPerm0[16] = {0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15};
 inline constexpr std::size_t kInvPerm0[16] = {0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15};
-/// One VM tile: 192 vectors × 1 byte-group = 192 bytes (identity vs sequential blocked).
+/// Full 4-bit codes stay 192×1 (identity). Sign plane uses `kSignVmUnit` (32×4).
 inline constexpr std::size_t kVmUnit = kBlock;
 
 struct BlockedGeometry {
@@ -72,8 +72,9 @@ bool planes_wanted(std::size_t bits, std::size_t n_byte_groups, std::size_t n_ve
 std::size_t planes_shortlist_len(std::size_t k, std::size_t bits);
 
 /// Extract MSB bit-plane from packed rows and FastScan-pack it as a 2-bit-shaped
-/// sign region (`n_byte_groups = dim/8`). Same bytes/layout turbovec scans with
-/// the nibble/VNNI kernels. Returns (sign_blocked, n_blocks).
+/// sign region (`n_byte_groups = dim/8`). On VNNI hosts with `nsg % 4 == 0`, packs
+/// turbovec 32×4 vector-major for `vpermb`+`vpdpbusd`; else 192×1. Returns
+/// (sign_blocked, n_blocks) with block width matching the layout.
 std::pair<std::vector<std::uint8_t>, std::size_t> planes_repack_sign(
     std::span<const std::uint8_t> packed_codes, std::size_t n_vectors, std::size_t bits,
     std::size_t dim);

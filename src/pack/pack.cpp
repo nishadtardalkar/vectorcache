@@ -367,12 +367,28 @@ std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
 }
 
 void vector_major_chunk(std::span<std::uint8_t> buf) {
-  // 192×1: sequential blocked layout already matches the kernel tile — no shuffle.
+  // Full 4-bit codes stay 192×1 (identity). Sign-plane 32×4 uses vector_major_sign_chunk.
   (void)buf;
 }
 
 void vector_major_to_seq_chunk(std::span<std::uint8_t> buf) {
   (void)buf;
+}
+
+/// Sequential blocked (BLOCK=32) → turbovec vector-major: 4 groups × 32 vectors per unit.
+void vector_major_sign_chunk(std::span<std::uint8_t> buf) {
+  if (buf.size() % kSignVmUnit != 0) {
+    return;
+  }
+  alignas(64) std::uint8_t tmp[kSignVmUnit];
+  for (std::size_t off = 0; off < buf.size(); off += kSignVmUnit) {
+    std::memcpy(tmp, buf.data() + off, kSignVmUnit);
+    for (std::size_t j = 0; j < 4; ++j) {
+      for (std::size_t v = 0; v < kSignBlock; ++v) {
+        buf[off + (v / 16) * 64 + (v % 16) * 4 + j] = tmp[j * kSignBlock + v];
+      }
+    }
+  }
 }
 
 std::vector<std::uint8_t> codes_flat_from_packed(std::span<const std::uint8_t> packed_codes,
@@ -522,18 +538,38 @@ std::pair<std::vector<std::uint8_t>, std::size_t> planes_repack_sign(
   const std::size_t nsg = dim / 8;
   const std::size_t bytes_per_row = bits * nsg;
   const std::size_t sign_off = (bits - 1) * nsg;
-  const std::size_t n_blocks = (n_vectors + kBlock - 1) / kBlock;
   std::vector<std::uint8_t> sign_rows(n_vectors * nsg);
   for (std::size_t v = 0; v < n_vectors; ++v) {
     const std::uint8_t* row = packed_codes.data() + v * bytes_per_row + sign_off;
     std::memcpy(sign_rows.data() + v * nsg, row, nsg);
   }
+  // True VNNI (32×4 VM) when groups are a multiple of 4 — same gate as turbovec.
+  const bool use_vm32 = vector_major_for(/*bits=*/2, nsg) && (nsg % 4 == 0);
+  if (use_vm32) {
+    const std::size_t n_blocks = (n_vectors + kSignBlock - 1) / kSignBlock;
+    const std::size_t blocked_len = n_blocks * nsg * kSignBlock;
+    std::vector<std::uint8_t> blocked(blocked_len, 0);
+    for (std::size_t block_idx = 0; block_idx < n_blocks; ++block_idx) {
+      const std::size_t base_vec = block_idx * kSignBlock;
+      for (std::size_t g = 0; g < nsg; ++g) {
+        const std::size_t out_offset = (block_idx * nsg + g) * kSignBlock;
+        for (std::size_t lane = 0; lane < kSignBlock; ++lane) {
+          const std::size_t vi = base_vec + lane;
+          if (vi < n_vectors) {
+            blocked[out_offset + lane] = sign_rows[vi * nsg + g];
+          }
+        }
+      }
+    }
+    vector_major_sign_chunk(blocked);
+    return {std::move(blocked), n_blocks};
+  }
+  // Fallback: 192×1 (shuffle LUT / AVX2 PERM0).
+  const std::size_t n_blocks = (n_vectors + kBlock - 1) / kBlock;
   const std::size_t blocked_len = n_blocks * nsg * kBlock;
-  // Sign region is scanned as a 2-bit-shaped buffer (n_byte_groups = nsg).
   std::vector<std::uint8_t> blocked;
   if (vector_major_for(/*bits=*/2, nsg)) {
     blocked = pack_blocked_sequential(n_vectors, n_blocks, nsg, blocked_len, sign_rows);
-    vector_major_chunk(blocked);
   } else {
 #if defined(__x86_64__) || defined(_M_X64)
     blocked = pack_blocked_perm0(n_vectors, n_blocks, nsg, blocked_len, sign_rows);

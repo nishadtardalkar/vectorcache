@@ -48,6 +48,11 @@ QueryPermuteDot build_permute_dot(std::span<const float> q_rot_row,
 std::vector<std::uint8_t> split_lut_for_vnni(std::span<const std::uint8_t> uint8_luts,
                                             std::size_t n_byte_groups);
 
+/// turbovec reshape: per 4 groups, pack lo-nibbles then hi-nibbles for `vpermb` (128 B/quad).
+/// Requires `n_byte_groups % 4 == 0`. Used by the sign-plane 32×4 VNNI kernel.
+std::vector<std::uint8_t> split_lut_for_vnni_vm(std::span<const std::uint8_t> uint8_luts,
+                                               std::size_t n_byte_groups);
+
 /// Score one query over 192×1 blocked codes with AVX-512 VNNI-LUT
 /// (`vpshufb` + u32 accumulate). `lut.uint8_luts` from `split_lut_for_vnni`.
 void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
@@ -58,19 +63,17 @@ void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_co
                       const std::uint64_t* id_map = nullptr, float score_offset = 0.f,
                       const float* residual_norms = nullptr, float residual_scale = 0.f);
 
-/// Sign-plane corpus scan specialized for `n_byte_groups == 32` (m=256 landmarks).
-/// Weighted ±q nibble LUT; u16 accumulate (32 groups fit); H99 flush without residual.
-/// `score_queries_vnni` fuses up to 2 queries on one codes stream.
-/// Falls back to `score_query_vnni` when `n_byte_groups != 32`.
+/// Sign-plane corpus scan. With 32×4 VM codes + `split_lut_for_vnni_vm`, uses true
+/// `vpermb`+`vpdpbusd` (NQ≤8). Falls back to 192×1 shuffle LUT when `block_width != kSignBlock`.
 void score_sign_lut_m256(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
                          std::span<const float> vec_scales, std::size_t n_byte_groups,
                          std::size_t n_vectors, std::size_t n_blocks, std::size_t k, float* heap_s,
                          std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min,
                          std::size_t& heap_mi, const std::uint64_t* id_map = nullptr);
 
-/// Score up to 2 queries sharing one codes stream (192×1 VNNI-LUT).
-/// `nq` must be in [1, 2]; larger batches are multiple passes at the caller.
-/// `split_luts[qi]` already split; `lut_biases[qi]` should include any TQ+ bias.
+/// Score queries sharing one codes stream. Sign path (`residual_norms == nullptr`,
+/// `n_byte_groups % 4 == 0`, `block_width == kSignBlock`) fuses up to 8 queries with
+/// true VNNI. Classic 192×1 path: `nq` in [1, 2].
 /// If `score_offsets` is non-null (length `nq`), adds `score_offsets[qi]` after α·LUT.
 void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_scales,
                         const float* lut_biases, std::size_t nq,
@@ -82,7 +85,8 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
                         const std::uint64_t* id_map = nullptr,
                         const float* score_offsets = nullptr,
                         const float* residual_norms = nullptr,
-                        const float* residual_scales = nullptr);
+                        const float* residual_scales = nullptr,
+                        std::size_t block_width = kBlock);
 
 /// Same VNNI accumulate as `score_queries_vnni`, but writes `α · lut` into dense
 /// `score_rows[qi][0..n_vectors)` (no top-k / collector). Dual-block + LUT hoist.
