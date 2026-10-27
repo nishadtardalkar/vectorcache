@@ -10,6 +10,8 @@ inline constexpr std::size_t kBlock = 192;
 inline constexpr std::size_t kSignBlock = 32;
 /// Bytes per vector-major unit: 4 byte-groups × 32 vectors.
 inline constexpr std::size_t kSignVmUnit = 4 * kSignBlock;
+/// Sign corpus fuse width (NQ=5..8 reloads LUTs; no hoist — 16 ZMM accs).
+inline constexpr std::size_t kNqBatchSign = 8;
 /// SIMD accumulate/flush chunk inside a block (2×16 AVX-512 lanes).
 inline constexpr std::size_t kFlushChunk = 32;
 inline constexpr std::size_t kChunksPerBlock = kBlock / kFlushChunk;  // 6

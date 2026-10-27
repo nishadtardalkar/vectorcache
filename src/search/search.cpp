@@ -35,9 +35,6 @@ namespace {
 
 /// 192×1 VNNI fused width (register-limited). Sign m=256 uses a wider fuse.
 constexpr std::size_t kNqBatchVnni = 2;
-/// True-VNNI sign: NQ=8 without LUT hoist (reload tlo/thi per half). Accumulators
-/// take 16 ZMMs; hoist would need another 16 and spill. NQ≤4 still hoists in-kernel.
-constexpr std::size_t kNqBatchSignM256 = 8;
 constexpr std::size_t kNqBatchPermute = 8;
 constexpr std::size_t kNqBatchPermuteWide = 10;
 constexpr std::size_t kTilesPerThread = 32;
@@ -282,7 +279,7 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   const std::size_t block_width = prep.block_width == 0 ? kBlock : prep.block_width;
   const std::size_t nq_batch =
       (!use_pd && buffered && block_width == kSignBlock && n_byte_groups % 4 == 0)
-          ? kNqBatchSignM256
+          ? kNqBatchSign
           : nq_batch_for(use_pd, n_threads, nq);
   const std::size_t n_quads = (nq + nq_batch - 1) / nq_batch;
   std::size_t blocks_per_range = 0;

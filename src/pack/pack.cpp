@@ -260,109 +260,55 @@ std::string search_backend_name(std::size_t bits, std::size_t dim) {
   return "scalar";
 }
 
-std::string search_backend_diagnostics(std::size_t bits, std::size_t dim) {
+std::string search_backend_diagnostics(std::size_t bits, std::size_t dim, std::size_t n_vectors) {
   std::ostringstream out;
   const std::size_t codes_per_byte = (bits == 0) ? 0 : (8 / bits);
-  const std::size_t n_byte_groups = (codes_per_byte == 0) ? 0 : (dim / codes_per_byte);
-  const char* env_no_vm = std::getenv("TURBOVEC_NO_VECTOR_MAJOR");
-  const char* env_no_vnni = std::getenv("TURBOVEC_NO_VNNI");
+  const std::size_t n_byte_groups_4 = (codes_per_byte == 0) ? 0 : (dim / codes_per_byte);
+  const std::size_t n_byte_groups_sign = (dim % 8 == 0) ? (dim / 8) : 0;
+  const bool vm = use_vector_major();
+  const bool planes_cap = planes_for(bits, n_byte_groups_4);
+  const bool planes_on =
+      n_vectors > 0 ? planes_wanted(bits, n_byte_groups_4, n_vectors) : planes_cap;
+  const bool sign_vm32 = planes_cap && n_byte_groups_sign > 0 && (n_byte_groups_sign % 4 == 0);
 
-  out << "=== search_backend_diagnostics ===\n";
-  out << "bits=" << bits << " dim=" << dim << " codes_per_byte=" << codes_per_byte
-      << " n_byte_groups=" << n_byte_groups << " kBlock=" << kBlock << " layout=192x1\n";
-  out << "TURBOVEC_NO_VECTOR_MAJOR=" << (env_no_vm ? env_no_vm : "(unset)") << "\n";
-  out << "TURBOVEC_NO_VNNI=" << (env_no_vnni ? env_no_vnni : "(unset)") << "\n";
-  out << "use_vector_major()=" << (use_vector_major() ? 1 : 0) << "\n";
-  out << "vector_major_for()=" << (vector_major_for(bits, n_byte_groups) ? 1 : 0) << "\n";
-  out << "search_backend=" << search_backend_name(bits, dim) << "\n";
-  out << "TURBOVEC_4BIT_PLANES="
-      << (std::getenv("TURBOVEC_4BIT_PLANES") ? std::getenv("TURBOVEC_4BIT_PLANES") : "(unset)")
-      << " VECTORCACHE_PLANES_MIN="
-      << (std::getenv("VECTORCACHE_PLANES_MIN") ? std::getenv("VECTORCACHE_PLANES_MIN") : "(unset)")
-      << "\n";
-  out << "use_planes4()=" << (use_planes4() ? 1 : 0)
-      << " planes_for()=" << (planes_for(bits, n_byte_groups) ? 1 : 0)
-      << " planes_min_vectors=" << planes_min_vectors() << "\n";
-  // Sign shortlist uses classic VNNI (vpermb LUT), not permute-dot — same split
-  // as turbovec's 2-bit kernel. Full 4-bit scan is permute-dot when VM.
-  if (planes_for(bits, n_byte_groups)) {
-    out << "sign_kernel=avx512_vnni_lut (vpermb)  exact_kernel=avx512_permute_dot\n";
+  out << "scan bits=" << bits << " dim=" << dim << " backend=" << search_backend_name(bits, dim)
+      << " vm=" << (vm ? 1 : 0) << " planes=" << (planes_on ? 1 : 0)
+      << " planes_min=" << planes_min_vectors() << "\n";
+  out << "4bit groups=" << n_byte_groups_4 << " block=" << kBlock << " layout=192x1"
+      << " kernel=" << (vm ? "permute_dot" : search_backend_name(bits, dim)) << "\n";
+  if (planes_cap) {
+    out << "sign groups=" << n_byte_groups_sign << " block=" << kSignBlock
+        << " layout=" << (sign_vm32 ? "32x4" : "192x1")
+        << " kernel=" << (sign_vm32 ? "vnni_vpermb" : "vnni_shuffle")
+        << " nq=" << kNqBatchSign;
+    if (n_vectors > 0 && !planes_on) {
+      out << " (inactive: n < planes_min)";
+    }
+    out << "\n";
+  }
+
+  // Only print kill switches when they disable a path.
+  if (const char* v = std::getenv("TURBOVEC_4BIT_PLANES"); v != nullptr && v[0] == '0') {
+    out << "TURBOVEC_4BIT_PLANES=0 (planes off)\n";
+  }
+  if (const char* v = std::getenv("TURBOVEC_NO_VECTOR_MAJOR"); v != nullptr && v[0] != '\0' &&
+                                                              v[0] != '0') {
+    out << "TURBOVEC_NO_VECTOR_MAJOR=" << v << "\n";
+  }
+  if (const char* v = std::getenv("TURBOVEC_NO_VNNI"); v != nullptr && v[0] != '\0' && v[0] != '0') {
+    out << "TURBOVEC_NO_VNNI=" << v << "\n";
   }
 
 #if defined(__x86_64__) || defined(_M_X64)
-  unsigned leaf7_ebx = 0, leaf7_ecx = 0;
-  unsigned long long xcr0 = 0;
-  bool osxsave = false;
-  bool leaf7_ok = false;
-  unsigned max_leaf = 0;
-#if defined(_MSC_VER)
-  int info[4] = {};
-  __cpuid(info, 0);
-  max_leaf = static_cast<unsigned>(info[0]);
-  out << "cpuid_max_leaf=" << max_leaf << "\n";
-  if (max_leaf >= 1) {
-    __cpuidex(info, 1, 0);
-    osxsave = (info[2] & (1 << 27)) != 0;
+  const bool isa_ok = cpu_has_avx512_vnni_vbmi();
+  out << "isa avx512_vbmi_vnni=" << (isa_ok ? 1 : 0);
+  if (!isa_ok && !vm) {
+    out << " (fallback " << search_backend_name(bits, dim) << ")";
   }
-  if (osxsave) {
-    xcr0 = _xgetbv(0);
-  }
-  if (max_leaf >= 7) {
-    __cpuidex(info, 7, 0);
-    leaf7_ebx = static_cast<unsigned>(info[1]);
-    leaf7_ecx = static_cast<unsigned>(info[2]);
-    leaf7_ok = true;
-  }
+  out << "\n";
 #else
-  unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
-  if (__get_cpuid(0, &eax, &ebx, &ecx, &edx)) {
-    max_leaf = eax;
-  }
-  out << "cpuid_max_leaf=" << max_leaf << "\n";
-  if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-    osxsave = (ecx & (1u << 27)) != 0;
-  }
-  if (osxsave) {
-    xcr0 = _xgetbv(0);
-  }
-  if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-    leaf7_ebx = ebx;
-    leaf7_ecx = ecx;
-    leaf7_ok = true;
-  }
+  out << "isa=non-x86_64\n";
 #endif
-  out << "osxsave=" << (osxsave ? 1 : 0) << " xcr0=0x" << std::hex << xcr0 << std::dec << "\n";
-  out << "xcr0_xmm_ymm=" << (((xcr0 & 0x6ull) == 0x6ull) ? 1 : 0)
-      << " xcr0_opmask_zmm=" << (((xcr0 & 0xe0ull) == 0xe0ull) ? 1 : 0)
-      << " xcr0_avx512_ok=" << (((xcr0 & 0xe6ull) == 0xe6ull) ? 1 : 0) << "\n";
-  if (leaf7_ok) {
-    const int avx512f = (leaf7_ebx & (1u << 16)) != 0;
-    const int avx512bw = (leaf7_ebx & (1u << 30)) != 0;
-    const int avx512vbmi = (leaf7_ecx & (1u << 1)) != 0;
-    const int avx512vnni = (leaf7_ecx & (1u << 11)) != 0;
-    const int avx2 = (leaf7_ebx & (1u << 5)) != 0;
-    out << "leaf7_ebx=0x" << std::hex << leaf7_ebx << " leaf7_ecx=0x" << leaf7_ecx << std::dec
-        << "\n";
-    out << "cpuid_avx2=" << avx2 << " cpuid_avx512f=" << avx512f << " cpuid_avx512bw=" << avx512bw
-        << " cpuid_avx512vbmi=" << avx512vbmi << " cpuid_avx512vnni=" << avx512vnni << "\n";
-    if (avx512vnni && !avx512vbmi) {
-      out << "vnni_note=AVX512VNNI present but AVX512VBMI missing; "
-             "vector-major VNNI path requires VBMI (vpermb). Using AVX2 PERM0 SIMD.\n";
-    }
-  } else {
-    out << "leaf7_ok=0 (CPUID leaf 7 unavailable)\n";
-  }
-#if defined(__GNUC__) || defined(__clang__)
-  out << "builtin_avx2=" << (__builtin_cpu_supports("avx2") ? 1 : 0)
-      << " builtin_avx512f=" << (__builtin_cpu_supports("avx512f") ? 1 : 0)
-      << " builtin_avx512bw=" << (__builtin_cpu_supports("avx512bw") ? 1 : 0)
-      << " builtin_avx512vbmi=" << (__builtin_cpu_supports("avx512vbmi") ? 1 : 0)
-      << " builtin_avx512vnni=" << (__builtin_cpu_supports("avx512vnni") ? 1 : 0) << "\n";
-#endif
-#else
-  out << "arch=non-x86_64\n";
-#endif
-  out << "=== end diagnostics ===\n";
   return out.str();
 }
 

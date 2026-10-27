@@ -31,8 +31,10 @@ bool vector_major_for(std::size_t bits, std::size_t n_byte_groups);
 /// "avx2_perm0", or "scalar".
 std::string search_backend_name(std::size_t bits, std::size_t dim);
 
-/// Multi-line dump of why a backend was chosen (CPUID, XCR0, env, geometry).
-std::string search_backend_diagnostics(std::size_t bits, std::size_t dim);
+/// Compact dump: scan geometry, sign vs 4-bit layouts, planes, ISA.
+/// Pass `n_vectors` so `planes_active` reflects the size gate (not just ISA).
+std::string search_backend_diagnostics(std::size_t bits, std::size_t dim,
+                                       std::size_t n_vectors = 0);
 
 /// Pack bit-plane codes into native search layout (x86: PERM0 or vector-major).
 std::pair<std::vector<std::uint8_t>, std::size_t> repack(std::span<const std::uint8_t> packed_codes,

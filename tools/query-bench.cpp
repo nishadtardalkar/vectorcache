@@ -421,10 +421,8 @@ int main(int argc, char** argv) {
         vectorcache::planes_wanted(bits, n_byte_groups, db.rows) ? 1 : 0;
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
               << " scan_bits=" << bits << " rerank_bits=" << effective_rerank_bits
-              << " landmarks=" << landmarks << " k=" << k << " collect=top-k-heap"
-              << " search_backend=" << vectorcache::search_backend_name(bits, landmarks)
-              << " planes4=" << planes_on << "\n";
-    std::cout << vectorcache::search_backend_diagnostics(bits, landmarks);
+              << " landmarks=" << landmarks << " k=" << k << " planes=" << planes_on << "\n";
+    std::cout << vectorcache::search_backend_diagnostics(bits, landmarks, db.rows);
 
     vectorcache::SearchResults last;
     std::vector<double> run_ms;
@@ -495,25 +493,25 @@ int main(int argc, char** argv) {
       // Staged breakdown: 1-bit sign corpus scan vs 4-bit exact on shortlist.
       std::cout << "sign_median_ms=" << median_sign_ms
                 << " sign_ms_per_query=" << (median_sign_ms / nq) << "\n";
-      const double kernel_cpu = median_sign_vnni_ms + median_sign_epilogue_ms;
-      const double vnni_frac = kernel_cpu > 0.0 ? (median_sign_vnni_ms / kernel_cpu) : 0.0;
-      const double epi_frac = kernel_cpu > 0.0 ? (median_sign_epilogue_ms / kernel_cpu) : 0.0;
-      // Summed over OpenMP threads (CPU ms); fractions compare VNNI vs epilogue.
-      std::cout << "sign_vnni_cpu_ms=" << median_sign_vnni_ms
-                << " sign_epilogue_cpu_ms=" << median_sign_epilogue_ms
-                << " sign_vnni_frac=" << vnni_frac << " sign_epilogue_frac=" << epi_frac << "\n";
+      // Profile fractions only when VECTORCACHE_PROFILE_SIGN=1 (else always 0).
+      if (median_sign_vnni_ms + median_sign_epilogue_ms > 0.0) {
+        const double kernel_cpu = median_sign_vnni_ms + median_sign_epilogue_ms;
+        std::cout << "sign_vnni_cpu_ms=" << median_sign_vnni_ms
+                  << " sign_epilogue_cpu_ms=" << median_sign_epilogue_ms
+                  << " sign_vnni_frac=" << (median_sign_vnni_ms / kernel_cpu)
+                  << " sign_epilogue_frac=" << (median_sign_epilogue_ms / kernel_cpu) << "\n";
+      }
       std::cout << "exact_median_ms=" << median_exact_ms
                 << " exact_ms_per_query=" << (median_exact_ms / nq) << "\n";
       const double exact_kernel_cpu =
           median_exact_gather_ms + median_exact_alu_ms + median_exact_epi_ms;
-      std::cout << "exact_gather_cpu_ms=" << median_exact_gather_ms
-                << " exact_alu_cpu_ms=" << median_exact_alu_ms
-                << " exact_epi_cpu_ms=" << median_exact_epi_ms;
       if (exact_kernel_cpu > 0.0) {
-        std::cout << " exact_alu_frac=" << (median_exact_alu_ms / exact_kernel_cpu)
-                  << " exact_epi_frac=" << (median_exact_epi_ms / exact_kernel_cpu);
+        std::cout << "exact_gather_cpu_ms=" << median_exact_gather_ms
+                  << " exact_alu_cpu_ms=" << median_exact_alu_ms
+                  << " exact_epi_cpu_ms=" << median_exact_epi_ms
+                  << " exact_alu_frac=" << (median_exact_alu_ms / exact_kernel_cpu)
+                  << " exact_epi_frac=" << (median_exact_epi_ms / exact_kernel_cpu) << "\n";
       }
-      std::cout << "\n";
     }
 
     if (recall) {
