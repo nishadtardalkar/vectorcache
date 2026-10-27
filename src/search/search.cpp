@@ -35,8 +35,9 @@ namespace {
 
 /// 192×1 VNNI fused width (register-limited). Sign m=256 uses a wider fuse.
 constexpr std::size_t kNqBatchVnni = 2;
-/// True-VNNI sign fuses up to 8 queries (turbovec search_multi_query_vnni width).
-constexpr std::size_t kNqBatchSignM256 = 8;
+/// True-VNNI sign: NQ=4 keeps LUT tables in-register (hoist across halves) without
+/// spilling the 16 ZMM accumulators; NQ=8 forces table reloads / spills on MSVC.
+constexpr std::size_t kNqBatchSignM256 = 4;
 constexpr std::size_t kNqBatchPermute = 8;
 constexpr std::size_t kNqBatchPermuteWide = 10;
 constexpr std::size_t kTilesPerThread = 32;
