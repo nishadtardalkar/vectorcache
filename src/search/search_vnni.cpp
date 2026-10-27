@@ -387,105 +387,147 @@ void flush_sign_u16(__m512i acc_u16, std::size_t base_vec, std::size_t n_vectors
   }
 }
 
-/// i32 admit threshold for unscaled scores: score = scale * acc + bias.
-inline void sign_refresh_thr_i32(float heap_min, float lut_scale, float lut_bias,
-                                 std::int32_t& thr_i32, bool& thr_valid) {
-  if (!std::isfinite(heap_min) || !(lut_scale > 0.f)) {
-    thr_valid = false;
-    return;
-  }
-  const float t = (heap_min - lut_bias) / lut_scale;
-  if (!(t > 0.f)) {
-    thr_i32 = 0;
-    thr_valid = true;
-    return;
-  }
-  // Sign LUT sums fit well under 2^24; clamp for safety.
-  if (t >= 1.0e9f) {
-    thr_i32 = 1000000000;
-    thr_valid = true;
-    return;
-  }
-  thr_i32 = static_cast<std::int32_t>(std::floor(t));
-  thr_valid = true;
-}
-
-/// Sign H99: i32 prune first (skip float on cold blocks), then scale+admit.
+/// Sign H99 flush (turbovec `avx512_post_flush_heap_update` buffered path):
+/// score = (lut_scale · acc + bias) · α_i. Full blocks always threshold-mask
+/// when `heap_min` is finite (seeded or after first compact) — never push-all.
 VECTORCACHE_AVX512_FN
 void flush_sign_i32(__m512i a0, __m512i a1, std::size_t base_vec, std::size_t n_vectors,
                     std::size_t k, float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                     float& heap_min, std::size_t& heap_mi, float lut_scale, float lut_bias,
-                    const std::uint64_t* id_map, std::int32_t& thr_i32, bool& thr_valid) {
+                    const std::uint64_t* id_map, const float* vec_scales) {
   if (base_vec >= n_vectors) {
     return;
   }
   const std::size_t end = std::min(base_vec + kSignBlock, n_vectors);
   const std::size_t end_lane = end - base_vec;
-  const bool prune_ready =
-      (heap_sz >= k || heap_mi == kHeapBuffered) && end_lane == kSignBlock && thr_valid;
+  const __m512 vs = _mm512_set1_ps(lut_scale);
+  const __m512 vb = _mm512_set1_ps(lut_bias);
+  __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a0), vs), vb);
+  __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a1), vs), vb);
+  const bool buffered = heap_mi == kHeapBuffered;
+  const bool thr_ready = std::isfinite(heap_min) && (buffered || heap_sz >= k);
 
-  if (prune_ready) {
-    const __m512i thr = _mm512_set1_epi32(thr_i32);
-    const __mmask16 hit0 = _mm512_cmpgt_epi32_mask(a0, thr);
-    const __mmask16 hit1 = _mm512_cmpgt_epi32_mask(a1, thr);
-    if ((hit0 | hit1) == 0) {
-      return;
+  // Full block + α: turbovec path — SIMD α, thr-mask, early out when cold.
+  if (end_lane == kSignBlock) {
+    if (vec_scales != nullptr) {
+      f0 = _mm512_mul_ps(f0, _mm512_loadu_ps(vec_scales + base_vec));
+      f1 = _mm512_mul_ps(f1, _mm512_loadu_ps(vec_scales + base_vec + 16));
     }
-    const __m512 vs = _mm512_set1_ps(lut_scale);
-    const __m512 vb = _mm512_set1_ps(lut_bias);
-    const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a0), vs), vb);
-    const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a1), vs), vb);
-    const __m512 thr_ps = _mm512_set1_ps(heap_min);
-    std::uint32_t m0 =
-        static_cast<std::uint32_t>(_mm512_cmp_ps_mask(f0, thr_ps, _CMP_GT_OQ)) &
-        static_cast<std::uint32_t>(hit0);
-    std::uint32_t m1 =
-        static_cast<std::uint32_t>(_mm512_cmp_ps_mask(f1, thr_ps, _CMP_GT_OQ)) &
-        static_cast<std::uint32_t>(hit1);
-    if ((m0 | m1) == 0) {
-      return;
-    }
-    alignas(64) float scores[kSignBlock];
-    if (m0 != 0) {
-      _mm512_storeu_ps(scores, f0);
-    }
-    if (m1 != 0) {
-      _mm512_storeu_ps(scores + 16, f1);
-    }
-    const float old_min = heap_min;
-    for (std::size_t half = 0; half < 2; ++half) {
-      std::uint32_t m = (half == 0) ? m0 : m1;
-      while (m != 0) {
-        const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
-        m &= m - 1;
-        const std::size_t lane = half * 16 + bit;
-        const float score = scores[lane];
-        if (score > heap_min) {
-          heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, score,
-                               topk_map_id(id_map, base_vec + lane));
+    if (thr_ready) {
+      const __m512 thr_ps = _mm512_set1_ps(heap_min);
+      const std::uint32_t m0 =
+          static_cast<std::uint32_t>(_mm512_cmp_ps_mask(f0, thr_ps, _CMP_GT_OQ));
+      const std::uint32_t m1 =
+          static_cast<std::uint32_t>(_mm512_cmp_ps_mask(f1, thr_ps, _CMP_GT_OQ));
+      if ((m0 | m1) == 0) {
+        return;
+      }
+      alignas(64) float scores[kSignBlock];
+      if (m0 != 0) {
+        _mm512_storeu_ps(scores, f0);
+      }
+      if (m1 != 0) {
+        _mm512_storeu_ps(scores + 16, f1);
+      }
+      if (buffered) {
+        float thr = heap_min;
+        std::size_t sz = heap_sz;
+        for (std::size_t half = 0; half < 2; ++half) {
+          std::uint32_t m = (half == 0) ? m0 : m1;
+          while (m != 0) {
+            const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
+            m &= m - 1;
+            const std::size_t lane = half * 16 + bit;
+            const float score = scores[lane];
+            if (score > thr) {
+              heap_s[sz] = score;
+              heap_i[sz] = topk_map_id(id_map, base_vec + lane);
+              ++sz;
+              if (sz == k) {
+                thr = compact_half(heap_s, heap_i, k);
+                sz = std::max<std::size_t>(k / 2, 1);
+              }
+            }
+          }
+        }
+        heap_sz = sz;
+        heap_min = thr;
+        return;
+      }
+      for (std::size_t half = 0; half < 2; ++half) {
+        std::uint32_t m = (half == 0) ? m0 : m1;
+        while (m != 0) {
+          const unsigned bit = static_cast<unsigned>(std::countr_zero(m));
+          m &= m - 1;
+          const std::size_t lane = half * 16 + bit;
+          const float score = scores[lane];
+          if (score > heap_min) {
+            heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, score,
+                                 topk_map_id(id_map, base_vec + lane));
+          }
         }
       }
+      return;
     }
-    if (heap_min != old_min) {
-      sign_refresh_thr_i32(heap_min, lut_scale, lut_bias, thr_i32, thr_valid);
+    // Unseeded fill on a full block: admit all (thr = -inf).
+    alignas(64) float scores[kSignBlock];
+    _mm512_storeu_ps(scores, f0);
+    _mm512_storeu_ps(scores + 16, f1);
+    if (buffered) {
+      float thr = heap_min;
+      std::size_t sz = heap_sz;
+      for (std::size_t lane = 0; lane < kSignBlock; ++lane) {
+        const float score = scores[lane];
+        if (!(score > thr)) continue;
+        heap_s[sz] = score;
+        heap_i[sz] = topk_map_id(id_map, base_vec + lane);
+        ++sz;
+        if (sz == k) {
+          thr = compact_half(heap_s, heap_i, k);
+          sz = std::max<std::size_t>(k / 2, 1);
+        }
+      }
+      heap_sz = sz;
+      heap_min = thr;
+      return;
+    }
+    for (std::size_t lane = 0; lane < kSignBlock; ++lane) {
+      heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, scores[lane],
+                           topk_map_id(id_map, base_vec + lane));
     }
     return;
   }
 
-  const __m512 vs = _mm512_set1_ps(lut_scale);
-  const __m512 vb = _mm512_set1_ps(lut_bias);
-  const __m512 f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a0), vs), vb);
-  const __m512 f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a1), vs), vb);
+  // Ragged tail: scalar α (avoid reading past n_vectors).
   alignas(64) float scores[kSignBlock];
   _mm512_storeu_ps(scores, f0);
   _mm512_storeu_ps(scores + 16, f1);
-  const float old_min = heap_min;
+  if (vec_scales != nullptr) {
+    for (std::size_t lane = 0; lane < end_lane; ++lane) {
+      scores[lane] *= vec_scales[base_vec + lane];
+    }
+  }
+  if (buffered) {
+    float thr = heap_min;
+    std::size_t sz = heap_sz;
+    for (std::size_t lane = 0; lane < end_lane; ++lane) {
+      const float score = scores[lane];
+      if (!(score > thr)) continue;
+      heap_s[sz] = score;
+      heap_i[sz] = topk_map_id(id_map, base_vec + lane);
+      ++sz;
+      if (sz == k) {
+        thr = compact_half(heap_s, heap_i, k);
+        sz = std::max<std::size_t>(k / 2, 1);
+      }
+    }
+    heap_sz = sz;
+    heap_min = thr;
+    return;
+  }
   for (std::size_t lane = 0; lane < end_lane; ++lane) {
     heap_push_or_replace(heap_s, heap_i, heap_sz, heap_min, heap_mi, k, scores[lane],
                          topk_map_id(id_map, base_vec + lane));
-  }
-  if (heap_min != old_min || !thr_valid) {
-    sign_refresh_thr_i32(heap_min, lut_scale, lut_bias, thr_i32, thr_valid);
   }
 }
 
@@ -498,7 +540,7 @@ void score_sign_vnni_vm32_nq(const std::uint8_t* const* split_luts, const float*
                              std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                              float* const* heap_s, std::uint64_t* const* heap_i,
                              std::size_t* heap_sz, float* heap_min, std::size_t* heap_mi,
-                             const std::uint64_t* id_map) {
+                             const std::uint64_t* id_map, const float* vec_scales) {
   static_assert(NQ >= 1 && NQ <= 8);
   assert(nq >= 1 && nq <= NQ);
   assert(n_byte_groups % 4 == 0);
@@ -512,14 +554,6 @@ void score_sign_vnni_vm32_nq(const std::uint8_t* const* split_luts, const float*
   VnniKernelProfile* const prof = active_vnni_profile();
   std::atomic<std::uint64_t>* const vnni_ns = prof ? &prof->vnni_ns : nullptr;
   std::atomic<std::uint64_t>* const epi_ns = prof ? &prof->epilogue_ns : nullptr;
-
-  std::int32_t thr_i32[NQ];
-  bool thr_valid[NQ];
-  for (std::size_t qi = 0; qi < NQ; ++qi) {
-    thr_i32[qi] = 0;
-    thr_valid[qi] = false;
-    sign_refresh_thr_i32(heap_min[qi], lut_scales[qi], lut_biases[qi], thr_i32[qi], thr_valid[qi]);
-  }
 
   for (std::size_t b = 0; b < n_blocks; ++b) {
     const std::size_t block_base = b * block_bytes;
@@ -603,17 +637,9 @@ void score_sign_vnni_vm32_nq(const std::uint8_t* const* split_luts, const float*
       t_epi0 = std::chrono::steady_clock::now();
     }
     for (std::size_t qi = 0; qi < nq; ++qi) {
-      // Hot reject: one i32 compare per half, no float when the block is cold.
-      if (thr_valid[qi] && base_vec + kSignBlock <= n_vectors) {
-        const __m512i thr = _mm512_set1_epi32(thr_i32[qi]);
-        if (_mm512_cmpgt_epi32_mask(acc[qi][0], thr) == 0 &&
-            _mm512_cmpgt_epi32_mask(acc[qi][1], thr) == 0) {
-          continue;
-        }
-      }
       flush_sign_i32(acc[qi][0], acc[qi][1], base_vec, n_vectors, k, heap_s[qi], heap_i[qi],
                      heap_sz[qi], heap_min[qi], heap_mi[qi], lut_scales[qi], lut_biases[qi], id_map,
-                     thr_i32[qi], thr_valid[qi]);
+                     vec_scales);
     }
     if (sample_prof && epi_ns) {
       const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -634,7 +660,7 @@ void score_sign_vnni_vm32_blk2(const std::uint8_t* split_lut, float lut_scale, f
                                std::size_t n_byte_groups, std::size_t n_vectors, std::size_t n_blocks,
                                std::size_t k, float* heap_s, std::uint64_t* heap_i,
                                std::size_t& heap_sz, float& heap_min, std::size_t& heap_mi,
-                               const std::uint64_t* id_map) {
+                               const std::uint64_t* id_map, const float* vec_scales) {
   assert(n_byte_groups % 4 == 0);
   const __m512i m0f = _mm512_set1_epi8(static_cast<char>(0x0F));
   const __m512i kpos = _mm512_set1_epi32(static_cast<int>(0x30201000u));
@@ -643,19 +669,9 @@ void score_sign_vnni_vm32_blk2(const std::uint8_t* split_lut, float lut_scale, f
   const std::size_t block_bytes = n_byte_groups * kSignBlock;
   const std::size_t n_pairs = n_blocks / 2;
 
-  std::int32_t thr_i32 = 0;
-  bool thr_valid = false;
-  sign_refresh_thr_i32(heap_min, lut_scale, lut_bias, thr_i32, thr_valid);
-
   auto flush_one = [&](__m512i a0, __m512i a1, std::size_t base_vec) {
-    if (thr_valid && base_vec + kSignBlock <= n_vectors) {
-      const __m512i thr = _mm512_set1_epi32(thr_i32);
-      if (_mm512_cmpgt_epi32_mask(a0, thr) == 0 && _mm512_cmpgt_epi32_mask(a1, thr) == 0) {
-        return;
-      }
-    }
     flush_sign_i32(a0, a1, base_vec, n_vectors, k, heap_s, heap_i, heap_sz, heap_min, heap_mi,
-                   lut_scale, lut_bias, id_map, thr_i32, thr_valid);
+                   lut_scale, lut_bias, id_map, vec_scales);
   };
 
   for (std::size_t pb = 0; pb < n_pairs; ++pb) {
@@ -807,7 +823,7 @@ void score_sign_lut_m256_nq(const std::uint8_t* const* split_luts, const float* 
 
 VECTORCACHE_AVX512_FN
 void score_sign_lut_m256_impl(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
-                              std::span<const float> /*vec_scales*/, std::size_t n_byte_groups,
+                              std::span<const float> vec_scales, std::size_t n_byte_groups,
                               std::size_t n_vectors, std::size_t n_blocks, std::size_t k,
                               float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
                               float& heap_min, std::size_t& heap_mi, const std::uint64_t* id_map,
@@ -821,9 +837,10 @@ void score_sign_lut_m256_impl(QueryLutView lut, std::span<const std::uint8_t> bl
   float mins[1] = {heap_min};
   std::size_t mis[1] = {heap_mi};
   if (block_width == kSignBlock && n_byte_groups % 4 == 0) {
+    const float* vs = vec_scales.empty() ? nullptr : vec_scales.data();
     score_sign_vnni_vm32_blk2(lut.uint8_luts, lut.scale, lut.bias, blocked_codes, n_byte_groups,
                               n_vectors, n_blocks, k, heap_s, heap_i, heap_sz, heap_min, heap_mi,
-                              id_map);
+                              id_map, vs);
     return;
   }
   score_sign_lut_m256_nq<1>(luts, scales, biases, 1, blocked_codes, n_vectors, n_blocks, k, hs, hi,
@@ -1575,49 +1592,49 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
                                kSignBlock);
     }
 #else
-    (void)vec_scales;  // sign ranks unscaled LUT scores; exact stage reapplies α.
+    const float* vs = vec_scales.empty() ? nullptr : vec_scales.data();
     auto run_vm32 = [&](std::size_t base, std::size_t batch) {
       if (batch == 1) {
         // Dual-block interleaved (turbovec H34) for single-query tiles.
         score_sign_vnni_vm32_blk2(split_luts[base], lut_scales[base], lut_biases[base],
                                   blocked_codes, n_byte_groups, n_vectors, n_blocks, k,
                                   heap_s[base], heap_i[base], heap_sz[base], heap_min[base],
-                                  heap_mi[base], id_map);
+                                  heap_mi[base], id_map, vs);
       } else if (batch == 2) {
         score_sign_vnni_vm32_nq<2>(split_luts + base, lut_scales + base, lut_biases + base, 2,
                                    blocked_codes, n_byte_groups, n_vectors, n_blocks, k,
                                    heap_s + base, heap_i + base, heap_sz + base, heap_min + base,
-                                   heap_mi + base, id_map);
+                                   heap_mi + base, id_map, vs);
       } else if (batch == 3) {
         score_sign_vnni_vm32_nq<3>(split_luts + base, lut_scales + base, lut_biases + base, 3,
                                    blocked_codes, n_byte_groups, n_vectors, n_blocks, k,
                                    heap_s + base, heap_i + base, heap_sz + base, heap_min + base,
-                                   heap_mi + base, id_map);
+                                   heap_mi + base, id_map, vs);
       } else if (batch == 4) {
         score_sign_vnni_vm32_nq<4>(split_luts + base, lut_scales + base, lut_biases + base, 4,
                                    blocked_codes, n_byte_groups, n_vectors, n_blocks, k,
                                    heap_s + base, heap_i + base, heap_sz + base, heap_min + base,
-                                   heap_mi + base, id_map);
+                                   heap_mi + base, id_map, vs);
       } else if (batch == 5) {
         score_sign_vnni_vm32_nq<5>(split_luts + base, lut_scales + base, lut_biases + base, 5,
                                    blocked_codes, n_byte_groups, n_vectors, n_blocks, k,
                                    heap_s + base, heap_i + base, heap_sz + base, heap_min + base,
-                                   heap_mi + base, id_map);
+                                   heap_mi + base, id_map, vs);
       } else if (batch == 6) {
         score_sign_vnni_vm32_nq<6>(split_luts + base, lut_scales + base, lut_biases + base, 6,
                                    blocked_codes, n_byte_groups, n_vectors, n_blocks, k,
                                    heap_s + base, heap_i + base, heap_sz + base, heap_min + base,
-                                   heap_mi + base, id_map);
+                                   heap_mi + base, id_map, vs);
       } else if (batch == 7) {
         score_sign_vnni_vm32_nq<7>(split_luts + base, lut_scales + base, lut_biases + base, 7,
                                    blocked_codes, n_byte_groups, n_vectors, n_blocks, k,
                                    heap_s + base, heap_i + base, heap_sz + base, heap_min + base,
-                                   heap_mi + base, id_map);
+                                   heap_mi + base, id_map, vs);
       } else {
         score_sign_vnni_vm32_nq<8>(split_luts + base, lut_scales + base, lut_biases + base, 8,
                                    blocked_codes, n_byte_groups, n_vectors, n_blocks, k,
                                    heap_s + base, heap_i + base, heap_sz + base, heap_min + base,
-                                   heap_mi + base, id_map);
+                                   heap_mi + base, id_map, vs);
       }
     };
     for (std::size_t base = 0; base < nq;) {

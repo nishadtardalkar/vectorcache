@@ -56,6 +56,73 @@ std::size_t sign_heap_capacity(std::size_t e_len, std::size_t n_vectors) {
   return std::min(n_vectors, std::max<std::size_t>(cap, 1));
 }
 
+/// turbovec `sample_seeds`: strided sign blocks → top-r heap → r-th score as
+/// collector threshold so the main scan admits ~S candidates, not the whole prefix.
+std::vector<float> sign_sample_seeds(const PreparedQueries& prep,
+                                     std::span<const std::uint8_t> sign_codes,
+                                     std::size_t sign_n_blocks, std::span<const float> lm_scales,
+                                     std::size_t s_len, std::size_t n_vectors) {
+  const std::size_t nq = prep.nq;
+  const std::size_t nsg = prep.n_byte_groups;
+  const std::size_t bw = prep.block_width == 0 ? kSignBlock : prep.block_width;
+  std::vector<float> seeds(nq, -std::numeric_limits<float>::infinity());
+  if (nq == 0 || sign_n_blocks == 0 || nsg == 0 || lm_scales.size() < n_vectors ||
+      s_len == 0 || n_vectors == 0 || bw == 0) {
+    return seeds;
+  }
+  const std::size_t block_bytes = nsg * bw;
+  // Aim for a few thousand sample vectors (turbovec stores a strided sample).
+  const std::size_t want_vecs =
+      std::min(n_vectors, std::max<std::size_t>(s_len * 8, 2048));
+  std::size_t n_sample_blocks =
+      std::min(sign_n_blocks, std::max<std::size_t>(1, (want_vecs + bw - 1) / bw));
+  const std::size_t step =
+      std::max<std::size_t>(1, sign_n_blocks / n_sample_blocks);
+  n_sample_blocks = std::min(n_sample_blocks, (sign_n_blocks + step - 1) / step);
+
+  std::vector<std::uint8_t> s_codes(n_sample_blocks * block_bytes, 0);
+  std::vector<float> s_scales(n_sample_blocks * bw, 0.f);
+  std::size_t n_s = 0;
+  std::size_t out_b = 0;
+  for (std::size_t b = 0; b < sign_n_blocks && out_b < n_sample_blocks; b += step, ++out_b) {
+    if ((b + 1) * block_bytes > sign_codes.size()) break;
+    std::memcpy(s_codes.data() + out_b * block_bytes, sign_codes.data() + b * block_bytes,
+                block_bytes);
+    for (std::size_t lane = 0; lane < bw; ++lane) {
+      const std::size_t vi = b * bw + lane;
+      if (vi < n_vectors) {
+        s_scales[out_b * bw + lane] = lm_scales[vi];
+        ++n_s;
+      }
+    }
+  }
+  if (n_s == 0 || out_b == 0) {
+    return seeds;
+  }
+  // r: overshoot so more than a shortlist's worth of the corpus sits above the seed.
+  const float r_s = static_cast<float>(s_len) * static_cast<float>(n_s) /
+                    static_cast<float>(n_vectors);
+  constexpr float kWidth4 = 4.f;
+  const float over =
+      std::min(4.f, 1.f + kWidth4 / std::sqrt(std::max(1.f, r_s)));
+  const std::size_t r =
+      std::min(n_s, std::max<std::size_t>(6, static_cast<std::size_t>(std::ceil(over * r_s))));
+
+  SearchResults top =
+      score_prepared(prep, r, s_codes, out_b, s_scales, {}, {}, {}, {}, {}, nullptr,
+                     /*buffered=*/false);
+  const std::size_t rk = top.k;
+  if (rk == 0) {
+    return seeds;
+  }
+  for (std::size_t qi = 0; qi < nq; ++qi) {
+    // r-th best (worst of top-r) — matches turbovec `ss[qi*r + r - 1]`.
+    const std::size_t idx = std::min(r, rk) - 1;
+    seeds[qi] = top.scores[qi * rk + idx];
+  }
+  return seeds;
+}
+
 std::size_t nq_batch_for(bool use_permute_dot, std::size_t n_threads, std::size_t nq) {
   if (!use_permute_dot) {
     return kNqBatchVnni;
@@ -1339,9 +1406,43 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       vnni_profile_begin(&sign_prof);
     }
     const auto t_sign0 = clock::now();
+    // Seed collectors from a strided sample (turbovec H99) so admit rate stays ~S.
+    std::vector<float> sign_seeds =
+        sign_sample_seeds(prep_sign, sign_codes, sign_n_blocks, lm_scales, s_len, n_vectors);
     SearchResults shortlist =
         score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
-                       {}, nullptr, /*buffered=*/true);
+                       {}, nullptr, /*buffered=*/true, sign_seeds.data());
+    // Seed too aggressive → short collector; rescan those queries unseeded.
+    {
+      std::vector<std::size_t> short_q;
+      short_q.reserve(nq);
+      for (std::size_t qi = 0; qi < nq; ++qi) {
+        const std::size_t got =
+            shortlist.counts.empty() ? shortlist.k : shortlist.counts[qi];
+        if (got < e_len) {
+          short_q.push_back(qi);
+        }
+      }
+      if (!short_q.empty()) {
+        SearchResults redo = score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks,
+                                            lm_scales, {}, short_q, {}, {}, {}, nullptr,
+                                            /*buffered=*/true, nullptr);
+        const std::size_t sl_k = shortlist.k;
+        const std::size_t rd_k = redo.k;
+        for (std::size_t i = 0; i < short_q.size(); ++i) {
+          const std::size_t qi = short_q[i];
+          const std::size_t n_copy = std::min(sl_k, rd_k);
+          for (std::size_t j = 0; j < n_copy; ++j) {
+            shortlist.scores[qi * sl_k + j] = redo.scores[i * rd_k + j];
+            shortlist.ids[qi * sl_k + j] = redo.ids[i * rd_k + j];
+          }
+          if (!shortlist.counts.empty()) {
+            shortlist.counts[qi] =
+                redo.counts.empty() ? n_copy : std::min(n_copy, redo.counts[i]);
+          }
+        }
+      }
+    }
     if (timings != nullptr) {
       timings->sign_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
