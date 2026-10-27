@@ -95,14 +95,17 @@ struct SearchStageTimings {
   double sign_seed_ms = 0.0;
   /// Staged only: main buffered sign corpus scan.
   double sign_scan_ms = 0.0;
+  /// Staged only: wall of OpenMP tile loop (VNNI + flush + cand copy).
+  double sign_scan_kernel_ms = 0.0;
+  /// Staged only: wall of post-tile nth_element / write shortlist.
+  double sign_scan_select_ms = 0.0;
   /// Staged only: unseeded rescan for queries whose seed left the collector short.
   double sign_rescan_ms = 0.0;
   /// Staged only: how many queries needed an unseeded rescan (last call).
   std::size_t sign_short_queries = 0;
-  /// Staged only: VNNI accumulate time inside the sign kernel (summed over OpenMP
-  /// threads — use for VNNI vs epilogue ratio, not vs wall `sign_ms`).
+  /// Staged only: VNNI accumulate inside sign kernel (summed-thread CPU ms).
   double sign_vnni_ms = 0.0;
-  /// Staged only: convert/scale + `flush_block_heap` / H99 (same summed-thread basis).
+  /// Staged only: convert/thr/H99 flush (summed-thread CPU ms).
   double sign_epilogue_ms = 0.0;
   /// Staged only: 4-bit exact rescore of the shortlist (gather + permute-dot).
   double exact_ms = 0.0;
@@ -186,6 +189,8 @@ PreparedQueries prepared_query_at(const PreparedQueries& prep, std::size_t qi);
 /// Empty blocks are skipped inside the existing permute-dot / VNNI kernels.
 /// If `buffered`, uses turbovec H99 collector (capacity `k`, returns top `k/2`).
 /// Optional `seed_mins` (length `prep.nq`) seeds each query's admit threshold.
+/// Optional `kernel_ms` / `select_ms` receive wall-clock ms for the tile loop vs
+/// post-tile select (staged sign breakdown).
 SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const std::uint8_t> blocked_codes, std::size_t n_blocks,
                              std::span<const float> scales,
@@ -195,7 +200,8 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const float> residual_scales = {},
                              std::span<const float> scale_resid = {},
                              const std::uint64_t* const* hit_bitmaps = nullptr,
-                             bool buffered = false, const float* seed_mins = nullptr);
+                             bool buffered = false, const float* seed_mins = nullptr,
+                             double* kernel_ms = nullptr, double* select_ms = nullptr);
 
 /// Continue scoring into existing per-query top-k heaps (length `prep.nq`, indexed by global qi).
 /// Only `query_indices` are updated. Heaps may already be partially filled.

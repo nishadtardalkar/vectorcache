@@ -340,7 +340,8 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
                                 const float* residual_scales = nullptr,
                                 const float* scale_resid = nullptr,
                                 const std::uint64_t* const* hit_bitmaps = nullptr,
-                                bool buffered = false, const float* seed_mins = nullptr) {
+                                bool buffered = false, const float* seed_mins = nullptr,
+                                double* kernel_ms = nullptr, double* select_ms = nullptr) {
   const std::size_t nq = query_indices.empty() ? prep.nq : query_indices.size();
   auto global_qi = [&](std::size_t local_i) -> std::size_t {
     return query_indices.empty() ? local_i : query_indices[local_i];
@@ -424,6 +425,8 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   // Buffered sign uses n_ranges=1: each qi is owned by exactly one query-batch
   // tile, so threads can write `all_cands[qi]` directly (no critical merge).
   const bool exclusive_qi = buffered && n_ranges == 1;
+  using clock = std::chrono::steady_clock;
+  const auto t_kernel0 = clock::now();
   // MinGW Win64 miscompiles concurrent AVX-512 VNNI under OpenMP; keep the VM
   // tile loop serial there. MSVC / Linux keep query×block tiling.
 #if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
@@ -568,7 +571,11 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       }
     }
   }
+  if (kernel_ms != nullptr) {
+    *kernel_ms = std::chrono::duration<double, std::milli>(clock::now() - t_kernel0).count();
+  }
 
+  const auto t_select0 = clock::now();
   for (std::size_t qi = 0; qi < nq; ++qi) {
     auto& cands = all_cands[qi];
     const std::size_t kk = std::min(out_k, cands.size());
@@ -595,6 +602,9 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
     if (buffered) {
       out.counts[qi] = kk;
     }
+  }
+  if (select_ms != nullptr) {
+    *select_ms = std::chrono::duration<double, std::milli>(clock::now() - t_select0).count();
   }
   return out;
 }
@@ -1079,7 +1089,7 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
                              std::span<const float> residual_scales,
                              std::span<const float> scale_resid,
                              const std::uint64_t* const* hit_bitmaps, bool buffered,
-                             const float* seed_mins) {
+                             const float* seed_mins, double* kernel_ms, double* select_ms) {
   if (!query_indices.empty()) {
     for (std::size_t qi : query_indices) {
       if (qi >= prep.nq) {
@@ -1117,10 +1127,12 @@ SearchResults score_prepared(const PreparedQueries& prep, std::size_t k,
       prep.backend == SearchBackendKind::VmVnni) {
     out = score_prepared_vm(prep, effective_k, blocked_codes, n_blocks, scales, query_indices,
                             resid_ptr, resid_sc_ptr, scale_resid_ptr, hit_bitmaps, buffered,
-                            seed_mins);
+                            seed_mins, kernel_ms, select_ms);
   } else {
     (void)buffered;
     (void)seed_mins;
+    if (kernel_ms) *kernel_ms = 0;
+    if (select_ms) *select_ms = 0;
     out = score_prepared_perm0(prep, effective_k, blocked_codes, n_blocks, scales, query_indices);
     // AVX2/scalar heap: apply residual after (membership was s_L-only).
     if (resid_ptr != nullptr && resid_sc_ptr != nullptr) {
@@ -1406,18 +1418,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       timings->sign_prepare_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_prep0).count();
     }
-    // Kernel QPC sampling is opt-in — enabling it on every timed search inflated wall
-    // sign latency (thousands of clock reads over the corpus).
-    VnniKernelProfile sign_prof;
-    const bool profile_sign = timings != nullptr && [] {
-      if (const char* v = std::getenv("VECTORCACHE_PROFILE_SIGN")) {
-        return v[0] != '\0' && v[0] != '0';
-      }
-      return false;
-    }();
-    if (profile_sign) {
-      vnni_profile_begin(&sign_prof);
-    }
     // VECTORCACHE_SIGN_SEED=0 disables sample seeding. α: VECTORCACHE_SIGN_ALPHA=1.
     const bool do_seed = env_flag_on("VECTORCACHE_SIGN_SEED", /*default_on=*/true);
     const auto t_sign0 = clock::now();
@@ -1436,13 +1436,30 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
           std::chrono::duration<double, std::milli>(clock::now() - t_seed0).count();
     }
 
+    // Profile VNNI vs epilogue on the main scan only (not the seed sample).
+    VnniKernelProfile sign_prof;
+    const bool profile_sign = timings != nullptr;
+    if (profile_sign) {
+      vnni_profile_begin(&sign_prof);
+    }
     const auto t_sign_scan0 = clock::now();
+    double scan_kernel_ms = 0.0;
+    double scan_select_ms = 0.0;
     SearchResults shortlist =
         score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
-                       {}, nullptr, /*buffered=*/true, seed_ptr);
+                       {}, nullptr, /*buffered=*/true, seed_ptr, &scan_kernel_ms, &scan_select_ms);
     if (timings != nullptr) {
       timings->sign_scan_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_sign_scan0).count();
+      timings->sign_scan_kernel_ms = scan_kernel_ms;
+      timings->sign_scan_select_ms = scan_select_ms;
+      if (profile_sign) {
+        vnni_profile_end();
+        timings->sign_vnni_ms =
+            1e-6 * static_cast<double>(sign_prof.vnni_ns.load(std::memory_order_relaxed));
+        timings->sign_epilogue_ms =
+            1e-6 * static_cast<double>(sign_prof.epilogue_ns.load(std::memory_order_relaxed));
+      }
     }
 
     // Seed too aggressive → short collector; rescan those queries unseeded.
@@ -1485,13 +1502,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       timings->sign_short_queries = n_short;
       timings->sign_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
-      if (profile_sign) {
-        vnni_profile_end();
-        timings->sign_vnni_ms =
-            1e-6 * static_cast<double>(sign_prof.vnni_ns.load(std::memory_order_relaxed));
-        timings->sign_epilogue_ms =
-            1e-6 * static_cast<double>(sign_prof.epilogue_ns.load(std::memory_order_relaxed));
-      }
     }
 
     // Stage 2: shortlist permute-dot over codes_flat (W=32/64 SoA tiles — no 192 densify).

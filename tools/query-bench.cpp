@@ -455,6 +455,8 @@ int main(int argc, char** argv) {
     std::vector<double> sign_ms;
     std::vector<double> sign_seed_ms;
     std::vector<double> sign_scan_ms;
+    std::vector<double> sign_scan_kernel_ms;
+    std::vector<double> sign_scan_select_ms;
     std::vector<double> sign_rescan_ms;
     std::vector<std::size_t> sign_short_q;
     std::vector<double> sign_vnni_ms;
@@ -488,6 +490,8 @@ int main(int argc, char** argv) {
       sign_ms.push_back(stages.sign_ms);
       sign_seed_ms.push_back(stages.sign_seed_ms);
       sign_scan_ms.push_back(stages.sign_scan_ms);
+      sign_scan_kernel_ms.push_back(stages.sign_scan_kernel_ms);
+      sign_scan_select_ms.push_back(stages.sign_scan_select_ms);
       sign_rescan_ms.push_back(stages.sign_rescan_ms);
       sign_short_q.push_back(stages.sign_short_queries);
       sign_vnni_ms.push_back(stages.sign_vnni_ms);
@@ -504,6 +508,8 @@ int main(int argc, char** argv) {
     std::sort(sign_ms.begin(), sign_ms.end());
     std::sort(sign_seed_ms.begin(), sign_seed_ms.end());
     std::sort(sign_scan_ms.begin(), sign_scan_ms.end());
+    std::sort(sign_scan_kernel_ms.begin(), sign_scan_kernel_ms.end());
+    std::sort(sign_scan_select_ms.begin(), sign_scan_select_ms.end());
     std::sort(sign_rescan_ms.begin(), sign_rescan_ms.end());
     std::sort(sign_short_q.begin(), sign_short_q.end());
     std::sort(sign_vnni_ms.begin(), sign_vnni_ms.end());
@@ -518,6 +524,8 @@ int main(int argc, char** argv) {
     const double median_sign_ms = sign_ms[sign_ms.size() / 2];
     const double median_sign_seed_ms = sign_seed_ms[sign_seed_ms.size() / 2];
     const double median_sign_scan_ms = sign_scan_ms[sign_scan_ms.size() / 2];
+    const double median_sign_scan_kernel_ms = sign_scan_kernel_ms[sign_scan_kernel_ms.size() / 2];
+    const double median_sign_scan_select_ms = sign_scan_select_ms[sign_scan_select_ms.size() / 2];
     const double median_sign_rescan_ms = sign_rescan_ms[sign_rescan_ms.size() / 2];
     const std::size_t median_sign_short_q = sign_short_q[sign_short_q.size() / 2];
     const double median_sign_vnni_ms = sign_vnni_ms[sign_vnni_ms.size() / 2];
@@ -543,13 +551,25 @@ int main(int argc, char** argv) {
                 << " sign_scan_median_ms=" << median_sign_scan_ms
                 << " sign_rescan_median_ms=" << median_sign_rescan_ms
                 << " sign_short_queries=" << median_sign_short_q << "\n";
-      // Profile fractions only when VECTORCACHE_PROFILE_SIGN=1 (else always 0).
+      // sign_scan wall split: OpenMP tile kernel vs post-tile select.
+      if (median_sign_scan_ms > 0.0) {
+        const double setup =
+            std::max(0.0, median_sign_scan_ms - median_sign_scan_kernel_ms -
+                              median_sign_scan_select_ms);
+        std::cout << "sign_scan_kernel_ms=" << median_sign_scan_kernel_ms
+                  << " frac=" << (median_sign_scan_kernel_ms / median_sign_scan_ms)
+                  << " sign_scan_select_ms=" << median_sign_scan_select_ms
+                  << " frac=" << (median_sign_scan_select_ms / median_sign_scan_ms)
+                  << " sign_scan_setup_ms=" << setup
+                  << " frac=" << (setup / median_sign_scan_ms) << "\n";
+      }
+      // Inside kernel: VNNI vs flush (summed-thread CPU; fractions of that sum).
       if (median_sign_vnni_ms + median_sign_epilogue_ms > 0.0) {
         const double kernel_cpu = median_sign_vnni_ms + median_sign_epilogue_ms;
         std::cout << "sign_vnni_cpu_ms=" << median_sign_vnni_ms
+                  << " frac=" << (median_sign_vnni_ms / kernel_cpu)
                   << " sign_epilogue_cpu_ms=" << median_sign_epilogue_ms
-                  << " sign_vnni_frac=" << (median_sign_vnni_ms / kernel_cpu)
-                  << " sign_epilogue_frac=" << (median_sign_epilogue_ms / kernel_cpu) << "\n";
+                  << " frac=" << (median_sign_epilogue_ms / kernel_cpu) << "\n";
       }
       std::cout << "exact_median_ms=" << median_exact_ms
                 << " exact_ms_per_query=" << (median_exact_ms / nq) << "\n";
