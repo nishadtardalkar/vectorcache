@@ -1302,8 +1302,7 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
           1e-6 * static_cast<double>(sign_prof.epilogue_ns.load(std::memory_order_relaxed));
     }
 
-    // Stage 2: gather top-E (by sign) into a tiny blocked pack; same permute-dot
-    // kernel as the full scan (SIMD), not a scalar LUT walk over S.
+    // Stage 2: shortlist permute-dot over codes_flat (W=32/64 SoA tiles — no 192 densify).
     const auto t_exact0 = clock::now();
     auto prep_exact = prepare_from_rows(q_land, nq, scan_dim, lm_centroids, scan_bits);
     out.nq = nq;
@@ -1311,6 +1310,23 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     out.scores.assign(nq * kk, 0.f);
     out.ids.assign(nq * kk, 0);
     const std::size_t sl_k = shortlist.k;
+    const float* scale_resid_ptr = scale_resid.empty() ? nullptr : scale_resid.data();
+    const float* lm_scales_ptr = lm_scales.empty() ? nullptr : lm_scales.data();
+    // Build per-vector AoS scratch if caller only passed separate streams.
+    std::vector<float> scale_resid_scratch;
+    if (scale_resid_ptr == nullptr && !lm_scales.empty() && !residual_norms.empty()) {
+      scale_resid_scratch.resize(2 * n_vectors);
+      for (std::size_t vi = 0; vi < n_vectors; ++vi) {
+        scale_resid_scratch[2 * vi] = lm_scales[vi];
+        scale_resid_scratch[2 * vi + 1] = residual_norms[vi];
+      }
+      scale_resid_ptr = scale_resid_scratch.data();
+    }
+
+    ShortlistKernelProfile exact_prof;
+    if (timings != nullptr) {
+      shortlist_profile_begin(&exact_prof);
+    }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic)
 #endif
@@ -1319,42 +1335,81 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       const std::size_t n_cand =
           shortlist.counts.empty() ? std::min(e_len, sl_k)
                                    : std::min(e_len, shortlist.counts[qis]);
-      std::vector<std::uint8_t> gathered(n_cand * n_byte_groups_4);
-      std::vector<float> scales_e(n_cand);
-      std::vector<float> scale_resid_e(2 * n_cand);
-      std::vector<std::uint64_t> id_map_e(n_cand);
+      std::vector<std::uint64_t> cand_ids(n_cand);
       for (std::size_t j = 0; j < n_cand; ++j) {
-        const std::uint64_t id = shortlist.ids[qis * sl_k + j];
-        const std::size_t vi = static_cast<std::size_t>(id);
-        id_map_e[j] = id;
-        if (vi < n_vectors) {
-          std::memcpy(gathered.data() + j * n_byte_groups_4,
-                      codes_flat.data() + vi * n_byte_groups_4, n_byte_groups_4);
-          if (!scale_resid.empty()) {
-            scale_resid_e[2 * j] = scale_resid[2 * vi];
-            scale_resid_e[2 * j + 1] = scale_resid[2 * vi + 1];
-            scales_e[j] = scale_resid[2 * vi];
-          } else {
-            scales_e[j] = lm_scales[vi];
-            scale_resid_e[2 * j] = lm_scales[vi];
-            scale_resid_e[2 * j + 1] = residual_norms[vi];
+        cand_ids[j] = shortlist.ids[qis * sl_k + j];
+      }
+
+      std::vector<float> heap_s(kk);
+      std::vector<std::uint64_t> heap_i(kk);
+      std::size_t heap_sz = 0;
+      float heap_min = -std::numeric_limits<float>::infinity();
+      std::size_t heap_mi = 0;
+      const float rs = (qis < q_perp.size()) ? q_perp[qis] : 0.f;
+
+      if (prep_exact.backend == SearchBackendKind::VmPermuteDot && !prep_exact.pds.empty()) {
+        score_shortlist_permute_dot(prep_exact.pds[qis], codes_flat, n_byte_groups_4, cand_ids,
+                                    n_vectors, scale_resid_ptr, lm_scales_ptr, kk, heap_s.data(),
+                                    heap_i.data(), heap_sz, heap_min, heap_mi, rs);
+      } else {
+        // Fallback: densify + generic score_prepared (non-VM / MinGW).
+        std::vector<std::uint8_t> gathered(n_cand * n_byte_groups_4);
+        std::vector<float> scales_e(n_cand);
+        std::vector<float> scale_resid_e(2 * n_cand);
+        std::vector<std::uint64_t> id_map_e(n_cand);
+        for (std::size_t j = 0; j < n_cand; ++j) {
+          const std::uint64_t id = cand_ids[j];
+          const std::size_t vi = static_cast<std::size_t>(id);
+          id_map_e[j] = id;
+          if (vi < n_vectors) {
+            std::memcpy(gathered.data() + j * n_byte_groups_4,
+                        codes_flat.data() + vi * n_byte_groups_4, n_byte_groups_4);
+            if (scale_resid_ptr != nullptr) {
+              scale_resid_e[2 * j] = scale_resid_ptr[2 * vi];
+              scale_resid_e[2 * j + 1] = scale_resid_ptr[2 * vi + 1];
+              scales_e[j] = scale_resid_ptr[2 * vi];
+            } else {
+              scales_e[j] = lm_scales[vi];
+            }
           }
         }
+        auto packed_e = pack_flat_for_search(gathered, n_cand, scan_bits, n_byte_groups_4);
+        const std::size_t qi_one[1] = {qis};
+        SearchResults one =
+            score_prepared(prep_exact, kk, packed_e.first, packed_e.second, scales_e, id_map_e,
+                           std::span<const std::size_t>(qi_one, 1), {}, q_perp, scale_resid_e);
+        const std::size_t n_out = std::min(kk, one.k);
+        for (std::size_t j = 0; j < n_out; ++j) {
+          out.scores[qis * kk + j] = one.scores[j];
+          out.ids[qis * kk + j] = one.ids[j];
+        }
+        continue;
       }
-      auto packed_e = pack_flat_for_search(gathered, n_cand, scan_bits, n_byte_groups_4);
-      const std::size_t qi_one[1] = {qis};
-      SearchResults one =
-          score_prepared(prep_exact, kk, packed_e.first, packed_e.second, scales_e, id_map_e,
-                         std::span<const std::size_t>(qi_one, 1), {}, q_perp, scale_resid_e);
-      const std::size_t n_out = std::min(kk, one.k);
+
+      std::vector<std::size_t> order(heap_sz);
+      for (std::size_t i = 0; i < heap_sz; ++i) {
+        order[i] = i;
+      }
+      std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        if (heap_s[a] != heap_s[b]) return heap_s[a] > heap_s[b];
+        return heap_i[a] < heap_i[b];
+      });
+      const std::size_t n_out = std::min(kk, heap_sz);
       for (std::size_t j = 0; j < n_out; ++j) {
-        out.scores[qis * kk + j] = one.scores[j];
-        out.ids[qis * kk + j] = one.ids[j];
+        out.scores[qis * kk + j] = heap_s[order[j]];
+        out.ids[qis * kk + j] = heap_i[order[j]];
       }
     }
     if (timings != nullptr) {
+      shortlist_profile_end();
       timings->exact_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_exact0).count();
+      timings->exact_gather_ms =
+          1e-6 * static_cast<double>(exact_prof.gather_ns.load(std::memory_order_relaxed));
+      timings->exact_alu_ms =
+          1e-6 * static_cast<double>(exact_prof.alu_ns.load(std::memory_order_relaxed));
+      timings->exact_epi_ms =
+          1e-6 * static_cast<double>(exact_prof.epilogue_ns.load(std::memory_order_relaxed));
     }
   } else {
     (void)sign_codes;

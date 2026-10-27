@@ -433,6 +433,9 @@ int main(int argc, char** argv) {
     std::vector<double> sign_vnni_ms;
     std::vector<double> sign_epilogue_ms;
     std::vector<double> exact_ms;
+    std::vector<double> exact_gather_ms;
+    std::vector<double> exact_alu_ms;
+    std::vector<double> exact_epi_ms;
 
     vectorcache::LandmarkIndex index(db.cols, bits, landmarks, /*landmark_seed=*/0,
                                      effective_rerank_bits);
@@ -458,6 +461,9 @@ int main(int argc, char** argv) {
       sign_vnni_ms.push_back(stages.sign_vnni_ms);
       sign_epilogue_ms.push_back(stages.sign_epilogue_ms);
       exact_ms.push_back(stages.exact_ms);
+      exact_gather_ms.push_back(stages.exact_gather_ms);
+      exact_alu_ms.push_back(stages.exact_alu_ms);
+      exact_epi_ms.push_back(stages.exact_epi_ms);
     }
 
     std::sort(run_ms.begin(), run_ms.end());
@@ -466,12 +472,18 @@ int main(int argc, char** argv) {
     std::sort(sign_vnni_ms.begin(), sign_vnni_ms.end());
     std::sort(sign_epilogue_ms.begin(), sign_epilogue_ms.end());
     std::sort(exact_ms.begin(), exact_ms.end());
+    std::sort(exact_gather_ms.begin(), exact_gather_ms.end());
+    std::sort(exact_alu_ms.begin(), exact_alu_ms.end());
+    std::sort(exact_epi_ms.begin(), exact_epi_ms.end());
     const double median_ms = run_ms[run_ms.size() / 2];
     const double median_fastscan_ms = fastscan_ms[fastscan_ms.size() / 2];
     const double median_sign_ms = sign_ms[sign_ms.size() / 2];
     const double median_sign_vnni_ms = sign_vnni_ms[sign_vnni_ms.size() / 2];
     const double median_sign_epilogue_ms = sign_epilogue_ms[sign_epilogue_ms.size() / 2];
     const double median_exact_ms = exact_ms[exact_ms.size() / 2];
+    const double median_exact_gather_ms = exact_gather_ms[exact_gather_ms.size() / 2];
+    const double median_exact_alu_ms = exact_alu_ms[exact_alu_ms.size() / 2];
+    const double median_exact_epi_ms = exact_epi_ms[exact_epi_ms.size() / 2];
     const double nq = static_cast<double>(queries.rows);
     const double ms_per_query = median_ms / nq;
     const double fastscan_ms_per_query = median_fastscan_ms / nq;
@@ -492,6 +504,16 @@ int main(int argc, char** argv) {
                 << " sign_vnni_frac=" << vnni_frac << " sign_epilogue_frac=" << epi_frac << "\n";
       std::cout << "exact_median_ms=" << median_exact_ms
                 << " exact_ms_per_query=" << (median_exact_ms / nq) << "\n";
+      const double exact_kernel_cpu =
+          median_exact_gather_ms + median_exact_alu_ms + median_exact_epi_ms;
+      std::cout << "exact_gather_cpu_ms=" << median_exact_gather_ms
+                << " exact_alu_cpu_ms=" << median_exact_alu_ms
+                << " exact_epi_cpu_ms=" << median_exact_epi_ms;
+      if (exact_kernel_cpu > 0.0) {
+        std::cout << " exact_alu_frac=" << (median_exact_alu_ms / exact_kernel_cpu)
+                  << " exact_epi_frac=" << (median_exact_epi_ms / exact_kernel_cpu);
+      }
+      std::cout << "\n";
     }
 
     if (recall) {

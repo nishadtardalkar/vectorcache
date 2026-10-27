@@ -21,6 +21,16 @@ struct VnniKernelProfile {
 void vnni_profile_begin(VnniKernelProfile* profile);
 void vnni_profile_end();
 
+/// Optional accumulators for the staged 4-bit shortlist kernel (nanoseconds).
+struct ShortlistKernelProfile {
+  std::atomic<std::uint64_t> gather_ns{0};
+  std::atomic<std::uint64_t> alu_ns{0};
+  std::atomic<std::uint64_t> epilogue_ns{0};
+};
+
+void shortlist_profile_begin(ShortlistKernelProfile* profile);
+void shortlist_profile_end();
+
 /// Per-query state for the 4-bit permute-dot kernel (turbovec `QueryPermuteDot`).
 struct QueryPermuteDot {
   std::array<std::int8_t, 16> levels{};
@@ -47,6 +57,16 @@ void score_query_vnni(QueryLutView lut, std::span<const std::uint8_t> blocked_co
                       std::size_t& heap_mi, float bias_corr,
                       const std::uint64_t* id_map = nullptr, float score_offset = 0.f,
                       const float* residual_norms = nullptr, float residual_scale = 0.f);
+
+/// Sign-plane corpus scan specialized for `n_byte_groups == 32` (m=256 landmarks).
+/// Weighted ±q nibble LUT (same math as `build_sign_lut`); int-first H99 epilogue
+/// (no residual); software-pipelines the next 192-block under the flush.
+/// Falls back to `score_query_vnni` when `n_byte_groups != 32`.
+void score_sign_lut_m256(QueryLutView lut, std::span<const std::uint8_t> blocked_codes,
+                         std::span<const float> vec_scales, std::size_t n_byte_groups,
+                         std::size_t n_vectors, std::size_t n_blocks, std::size_t k, float* heap_s,
+                         std::uint64_t* heap_i, std::size_t& heap_sz, float& heap_min,
+                         std::size_t& heap_mi, const std::uint64_t* id_map = nullptr);
 
 /// Score up to 2 queries sharing one codes stream (192×1 VNNI-LUT).
 /// `nq` must be in [1, 2]; larger batches are multiple passes at the caller.
@@ -106,6 +126,19 @@ void score_queries_permute_dot(const QueryPermuteDot* const* pds, std::size_t nq
                                const float* residual_norms = nullptr,
                                const float* residual_scales = nullptr,
                                const float* scale_resid = nullptr);
+
+/// Staged exact: 4-bit permute-dot over a shortlist of corpus ids.
+/// Gathers `codes_flat` rows into W=64 SoA tiles (no 192-pad densify), scores all
+/// byte-groups, then residual-aware flush. `cand_ids[i]` is the corpus vector id.
+/// `scale_resid` is full-corpus AoS `[α, ‖r‖]` (length `2 * n_corpus`); if null,
+/// uses `vec_scales` only (no residual term).
+void score_shortlist_permute_dot(const QueryPermuteDot& pd,
+                                 std::span<const std::uint8_t> codes_flat,
+                                 std::size_t n_byte_groups,
+                                 std::span<const std::uint64_t> cand_ids, std::size_t n_corpus,
+                                 const float* scale_resid, const float* vec_scales, std::size_t k,
+                                 float* heap_s, std::uint64_t* heap_i, std::size_t& heap_sz,
+                                 float& heap_min, std::size_t& heap_mi, float residual_scale);
 
 }  // namespace vectorcache
 

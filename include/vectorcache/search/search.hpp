@@ -95,6 +95,12 @@ struct SearchStageTimings {
   double sign_epilogue_ms = 0.0;
   /// Staged only: 4-bit exact rescore of the shortlist (gather + permute-dot).
   double exact_ms = 0.0;
+  /// Staged only: gather codes_flat → SoA tile (summed-thread CPU ms).
+  double exact_gather_ms = 0.0;
+  /// Staged only: permute-dot ALU inside shortlist kernel (summed-thread CPU ms).
+  double exact_alu_ms = 0.0;
+  /// Staged only: residual flush / heap inside shortlist kernel (summed-thread CPU ms).
+  double exact_epi_ms = 0.0;
 };
 
 struct PreparedQueryLut {
@@ -139,7 +145,7 @@ PreparedQueries prepare_sign_from_rows(std::span<const float> rows, std::size_t 
 /// FWHT → 4-bit landmark project → FastScan top-k with residual-energy bound.
 /// Score = s_L + ‖q_⊥‖·‖r_i‖. No full-dim re-rank.
 /// If `timings` is non-null, fills `fastscan_ms` (and `sign_ms`/`exact_ms` when staged).
-/// When `sign_codes` is non-empty (planes layout), runs sign shortlist → densified exact.
+/// When `sign_codes` is non-empty (planes layout), runs sign shortlist → shortlist 4-bit exact.
 /// `codes_flat` is row-major `n × (scan_dim/(8/scan_bits))` for gathering the shortlist.
 SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t nq, std::size_t dim,
                                      std::size_t k, const QuantizedLandmarks& landmarks,

@@ -116,6 +116,43 @@ TEST(Index, StagedPlanesMatchesFullScanTop1) {
   EXPECT_GT(res.scores[0], 0.5f);
 }
 
+TEST(Index, StagedPlanesM256SelfQuery) {
+  // Exercises score_sign_lut_m256 (32 sign groups) + score_shortlist_permute_dot.
+#if defined(_WIN32)
+  _putenv_s("VECTORCACHE_PLANES_MIN", "256");
+  _putenv_s("TURBOVEC_4BIT_PLANES", "1");
+#else
+  setenv("VECTORCACHE_PLANES_MIN", "256", 1);
+  setenv("TURBOVEC_4BIT_PLANES", "1", 1);
+#endif
+  constexpr std::size_t dim = 256;
+  constexpr std::size_t n = 768;
+  constexpr std::size_t m = 256;
+  constexpr std::size_t k = 10;
+
+  if (!vectorcache::planes_wanted(4, m / 2, n)) {
+    GTEST_SKIP() << "planes layout unavailable (need AVX-512 VNNI + geometry)";
+  }
+
+  std::mt19937 rng(42);
+  std::normal_distribution<float> dist(0.f, 1.f);
+  std::vector<float> db(n * dim);
+  for (float& x : db) x = dist(rng);
+
+  vectorcache::LandmarkIndex index(dim, 4, m);
+  index.add(db);
+  index.prepare();
+
+  vectorcache::SearchStageTimings stages;
+  auto res = index.search(std::span<const float>(db.data(), dim), k, &stages);
+  ASSERT_EQ(res.k, k);
+  EXPECT_EQ(res.ids[0], 0u);
+  EXPECT_GT(res.scores[0], 0.5f);
+  // Staged path should have recorded both stages.
+  EXPECT_GT(stages.sign_ms, 0.0);
+  EXPECT_GT(stages.exact_ms, 0.0);
+}
+
 TEST(Index, SeparateScanAndRerankBits) {
   constexpr std::size_t dim = 64;
   constexpr std::size_t n = 128;
