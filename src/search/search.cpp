@@ -35,9 +35,9 @@ namespace {
 
 /// 192×1 VNNI fused width (register-limited). Sign m=256 uses a wider fuse.
 constexpr std::size_t kNqBatchVnni = 2;
-/// True-VNNI sign: NQ=4 keeps LUT tables in-register (hoist across halves) without
-/// spilling the 16 ZMM accumulators; NQ=8 forces table reloads / spills on MSVC.
-constexpr std::size_t kNqBatchSignM256 = 4;
+/// True-VNNI sign: NQ=8 without LUT hoist (reload tlo/thi per half). Accumulators
+/// take 16 ZMMs; hoist would need another 16 and spill. NQ≤4 still hoists in-kernel.
+constexpr std::size_t kNqBatchSignM256 = 8;
 constexpr std::size_t kNqBatchPermute = 8;
 constexpr std::size_t kNqBatchPermuteWide = 10;
 constexpr std::size_t kTilesPerThread = 32;
@@ -278,7 +278,7 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
   n_threads = static_cast<std::size_t>(std::max(1, omp_get_max_threads()));
 #endif
 
-  // block_bytes = n_byte_groups * block_width. Sign VM32 fuses 8 queries.
+  // block_bytes = n_byte_groups * block_width. Sign VM32 fuses up to 8 queries.
   const std::size_t block_width = prep.block_width == 0 ? kBlock : prep.block_width;
   const std::size_t nq_batch =
       (!use_pd && buffered && block_width == kSignBlock && n_byte_groups % 4 == 0)

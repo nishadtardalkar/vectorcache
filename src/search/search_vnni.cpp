@@ -542,43 +542,49 @@ void score_sign_vnni_vm32_nq(const std::uint8_t* const* split_luts, const float*
       t_vnni0 = std::chrono::steady_clock::now();
     }
     for (std::size_t q4 = 0; q4 < quads; ++q4) {
-      // Hoist LUT loads across the two halves (cuts table traffic 2×). Safe for
-      // NQ≤4 register-wise; NQ=5..8 reload inside h like turbovec to avoid spill.
-      __m512i tlo_q[NQ];
-      __m512i thi_q[NQ];
+      // NQ≤4: hoist LUT pairs across the two halves (~24 ZMM, no spill).
+      // NQ=5..8: reload per half — hoist would need +2*NQ ZMMs on top of 2*NQ accs.
       if constexpr (NQ <= 4) {
+        __m512i tlo_q[NQ];
+        __m512i thi_q[NQ];
         for (std::size_t qi = 0; qi < nq; ++qi) {
           const std::uint8_t* tp = split_luts[qi] + q4 * 128;
           tlo_q[qi] = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp));
           thi_q[qi] = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp + 64));
         }
-      }
-      for (std::size_t h = 0; h < 2; ++h) {
-        // Single-query: depth-8 prefetch (turbovec H5); skip when NQ>1 to avoid eviction.
-        if constexpr (NQ == 1) {
-          const std::size_t pf = block_base + (q4 + 8) * 128 + h * 64;
-          if (pf + 64 <= blocked_codes.size()) {
-            prefetch_t0(blocked_codes.data() + pf);
+        for (std::size_t h = 0; h < 2; ++h) {
+          if constexpr (NQ == 1) {
+            const std::size_t pf = block_base + (q4 + 8) * 128 + h * 64;
+            if (pf + 64 <= blocked_codes.size()) {
+              prefetch_t0(blocked_codes.data() + pf);
+            }
+          }
+          const __m512i c = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(
+              blocked_codes.data() + block_base + q4 * 128 + h * 64));
+          const __m512i ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
+          const __m512i ihi =
+              _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(c, 4), m0f), kpos);
+          for (std::size_t qi = 0; qi < nq; ++qi) {
+            acc[qi][h] =
+                _mm512_dpbusd_epi32(acc[qi][h], _mm512_permutexvar_epi8(ilo, tlo_q[qi]), ones);
+            acc[qi][h] =
+                _mm512_dpbusd_epi32(acc[qi][h], _mm512_permutexvar_epi8(ihi, thi_q[qi]), ones);
           }
         }
-        const __m512i c = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(
-            blocked_codes.data() + block_base + q4 * 128 + h * 64));
-        const __m512i ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
-        const __m512i ihi =
-            _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(c, 4), m0f), kpos);
-        for (std::size_t qi = 0; qi < nq; ++qi) {
-          __m512i tlo;
-          __m512i thi;
-          if constexpr (NQ <= 4) {
-            tlo = tlo_q[qi];
-            thi = thi_q[qi];
-          } else {
+      } else {
+        for (std::size_t h = 0; h < 2; ++h) {
+          const __m512i c = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(
+              blocked_codes.data() + block_base + q4 * 128 + h * 64));
+          const __m512i ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
+          const __m512i ihi =
+              _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(c, 4), m0f), kpos);
+          for (std::size_t qi = 0; qi < nq; ++qi) {
             const std::uint8_t* tp = split_luts[qi] + q4 * 128;
-            tlo = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp));
-            thi = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp + 64));
+            const __m512i tlo = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp));
+            const __m512i thi = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(tp + 64));
+            acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], _mm512_permutexvar_epi8(ilo, tlo), ones);
+            acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], _mm512_permutexvar_epi8(ihi, thi), ones);
           }
-          acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], _mm512_permutexvar_epi8(ilo, tlo), ones);
-          acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], _mm512_permutexvar_epi8(ihi, thi), ones);
         }
       }
     }
@@ -1615,8 +1621,8 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
       }
     };
     for (std::size_t base = 0; base < nq;) {
-      // Cap at 4: LUT hoist stays in-register; caller also batches at 4.
-      const std::size_t batch = std::min<std::size_t>(4, nq - base);
+      // Cap at 8: NQ≤4 hoists LUTs; NQ=5..8 reloads LUTs inside h (no spill).
+      const std::size_t batch = std::min<std::size_t>(8, nq - base);
       run_vm32(base, batch);
       base += batch;
     }
