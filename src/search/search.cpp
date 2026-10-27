@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -1289,21 +1290,31 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
 
     const auto t_sign0 = clock::now();
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
+    // Kernel QPC sampling is opt-in — enabling it on every timed search inflated wall
+    // sign latency (thousands of clock reads over the corpus).
     VnniKernelProfile sign_prof;
-    if (timings != nullptr) {
+    const bool profile_sign = timings != nullptr && [] {
+      if (const char* v = std::getenv("VECTORCACHE_PROFILE_SIGN")) {
+        return v[0] != '\0' && v[0] != '0';
+      }
+      return false;
+    }();
+    if (profile_sign) {
       vnni_profile_begin(&sign_prof);
     }
     SearchResults shortlist =
         score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
                        {}, nullptr, /*buffered=*/true);
     if (timings != nullptr) {
-      vnni_profile_end();
+      if (profile_sign) {
+        vnni_profile_end();
+        timings->sign_vnni_ms =
+            1e-6 * static_cast<double>(sign_prof.vnni_ns.load(std::memory_order_relaxed));
+        timings->sign_epilogue_ms =
+            1e-6 * static_cast<double>(sign_prof.epilogue_ns.load(std::memory_order_relaxed));
+      }
       timings->sign_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
-      timings->sign_vnni_ms =
-          1e-6 * static_cast<double>(sign_prof.vnni_ns.load(std::memory_order_relaxed));
-      timings->sign_epilogue_ms =
-          1e-6 * static_cast<double>(sign_prof.epilogue_ns.load(std::memory_order_relaxed));
     }
 
     // Stage 2: shortlist permute-dot over codes_flat (W=32/64 SoA tiles — no 192 densify).
