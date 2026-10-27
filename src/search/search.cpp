@@ -42,6 +42,20 @@ constexpr std::size_t kMinTileBlocks = 256;  // fewer, larger 192-wide blocks
 constexpr std::size_t kMinTileBlocksX86 = kMinTileBlocks * 3;
 constexpr std::size_t kSingleQueryParallelMinBlocks = 256;
 
+/// Buffered sign H99 capacity. Default `2 * e_len`. Override with
+/// `VECTORCACHE_SIGN_HEAP=<N>` (absolute collector slots; shortlist out = N/2).
+std::size_t sign_heap_capacity(std::size_t e_len, std::size_t n_vectors) {
+  std::size_t cap = std::max<std::size_t>(2 * e_len, e_len);
+  if (const char* v = std::getenv("VECTORCACHE_SIGN_HEAP"); v && v[0] != '\0') {
+    char* end = nullptr;
+    const unsigned long long x = std::strtoull(v, &end, 10);
+    if (end != v && *end == '\0' && x > 0) {
+      cap = static_cast<std::size_t>(x);
+    }
+  }
+  return std::min(n_vectors, std::max<std::size_t>(cap, 1));
+}
+
 std::size_t nq_batch_for(bool use_permute_dot, std::size_t n_threads, std::size_t nq) {
   if (!use_permute_dot) {
     return kNqBatchVnni;
@@ -327,13 +341,37 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       prune_seed[i].store(bits, std::memory_order_relaxed);
     }
   }
+  // Buffered sign uses n_ranges=1: each qi is owned by exactly one query-batch
+  // tile, so threads can write `all_cands[qi]` directly (no critical merge).
+  const bool exclusive_qi = buffered && n_ranges == 1;
   // MinGW Win64 miscompiles concurrent AVX-512 VNNI under OpenMP; keep the VM
   // tile loop serial there. MSVC / Linux keep query×block tiling.
 #if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
 #pragma omp parallel
 #endif
   {
-    std::vector<std::vector<TileCand>> local_cands(nq);
+    // Hoist heap scratch once per thread (was re-allocated every tile).
+    std::vector<float> heap_s_store(nq_batch * effective_k);
+    std::vector<std::uint64_t> heap_i_store(nq_batch * effective_k);
+    std::vector<std::size_t> heap_sz(nq_batch, 0);
+    std::vector<float> heap_min(nq_batch);
+    std::vector<std::size_t> heap_mi(nq_batch, buffered ? kHeapBuffered : 0);
+    std::vector<float*> heap_s_ptrs(nq_batch);
+    std::vector<std::uint64_t*> heap_i_ptrs(nq_batch);
+    for (std::size_t i = 0; i < nq_batch; ++i) {
+      heap_s_ptrs[i] = heap_s_store.data() + i * effective_k;
+      heap_i_ptrs[i] = heap_i_store.data() + i * effective_k;
+    }
+    std::vector<const std::uint8_t*> lut_ptrs(nq_batch);
+    std::vector<float> scales_batch(nq_batch);
+    std::vector<float> biases_batch(nq_batch);
+    std::vector<const QueryPermuteDot*> pd_ptrs(nq_batch);
+    std::vector<float> rs_batch;
+    std::vector<const std::uint64_t*> bm_batch;
+    std::vector<std::vector<TileCand>> local_cands;
+    if (!exclusive_qi) {
+      local_cands.resize(nq);
+    }
 #if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
 #pragma omp for schedule(dynamic)
 #endif
@@ -355,16 +393,11 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       auto codes_span = blocked_codes.subspan(code_off, code_len);
       auto scales_span = scales.subspan(vec_start, range_n);
 
-      std::vector<float> heap_s_store(batch_nq * effective_k);
-      std::vector<std::uint64_t> heap_i_store(batch_nq * effective_k);
-      std::vector<std::size_t> heap_sz(batch_nq, 0);
-      std::vector<float> heap_min(batch_nq);
-      std::vector<std::size_t> heap_mi(batch_nq, buffered ? kHeapBuffered : 0);
-      std::vector<float*> heap_s_ptrs(batch_nq);
-      std::vector<std::uint64_t*> heap_i_ptrs(batch_nq);
+      std::fill(heap_sz.begin(), heap_sz.begin() + static_cast<std::ptrdiff_t>(batch_nq),
+                std::size_t{0});
+      std::fill(heap_mi.begin(), heap_mi.begin() + static_cast<std::ptrdiff_t>(batch_nq),
+                buffered ? kHeapBuffered : std::size_t{0});
       for (std::size_t i = 0; i < batch_nq; ++i) {
-        heap_s_ptrs[i] = heap_s_store.data() + i * effective_k;
-        heap_i_ptrs[i] = heap_i_store.data() + i * effective_k;
         const std::uint32_t seed_bits =
             prune_seed[tile.qi_start + i].load(std::memory_order_acquire);
         std::memcpy(&heap_min[i], &seed_bits, sizeof(float));
@@ -373,7 +406,6 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       const float* range_resid =
           residual_norms != nullptr ? residual_norms + vec_start : nullptr;
       const float* range_sr = scale_resid != nullptr ? scale_resid + vec_start * 2 : nullptr;
-      std::vector<float> rs_batch;
       const float* rs_ptr = nullptr;
       if (residual_scales != nullptr) {
         rs_batch.resize(batch_nq);
@@ -382,7 +414,6 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
         }
         rs_ptr = rs_batch.data();
       }
-      std::vector<const std::uint64_t*> bm_batch;
       const std::uint64_t* const* bm_ptr = nullptr;
       if (hit_bitmaps != nullptr) {
         bm_batch.resize(batch_nq);
@@ -392,7 +423,6 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
         bm_ptr = bm_batch.data();
       }
       if (use_pd) {
-        std::vector<const QueryPermuteDot*> pd_ptrs(batch_nq);
         for (std::size_t i = 0; i < batch_nq; ++i) {
           pd_ptrs[i] = &prep.pds[global_qi(tile.qi_start + i)];
         }
@@ -402,9 +432,6 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
                                   heap_mi.data(), nullptr, nullptr, bm_ptr, vec_start, n_vectors,
                                   range_resid, rs_ptr, range_sr);
       } else {
-        std::vector<const std::uint8_t*> lut_ptrs(batch_nq);
-        std::vector<float> scales_batch(batch_nq);
-        std::vector<float> biases_batch(batch_nq);
         for (std::size_t i = 0; i < batch_nq; ++i) {
           const std::size_t gqi = global_qi(tile.qi_start + i);
           lut_ptrs[i] = prep.split_luts[gqi].data();
@@ -438,7 +465,7 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
             }
           }
         }
-        auto& dest = local_cands[qi];
+        auto& dest = exclusive_qi ? all_cands[qi] : local_cands[qi];
         dest.reserve(dest.size() + heap_sz[i]);
         for (std::size_t j = 0; j < heap_sz[i]; ++j) {
           dest.push_back(TileCand{heap_s_ptrs[i][j],
@@ -447,14 +474,16 @@ SearchResults score_prepared_vm(const PreparedQueries& prep, std::size_t effecti
       }
     }
 
+    if (!exclusive_qi) {
 #if defined(_OPENMP) && !(defined(_WIN32) && defined(__GNUC__) && !defined(__clang__))
 #pragma omp critical
 #endif
-    {
-      for (std::size_t qi = 0; qi < nq; ++qi) {
-        if (!local_cands[qi].empty()) {
-          all_cands[qi].insert(all_cands[qi].end(), local_cands[qi].begin(),
-                               local_cands[qi].end());
+      {
+        for (std::size_t qi = 0; qi < nq; ++qi) {
+          if (!local_cands[qi].empty()) {
+            all_cands[qi].insert(all_cands[qi].end(), local_cands[qi].begin(),
+                                 local_cands[qi].end());
+          }
         }
       }
     }
@@ -1287,11 +1316,16 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
   if (use_staged) {
     // No mid-plane: collect exact cut E with 2E H99. Dense to_rows+nth_element was
     // tried and lost badly at n=100k (write all scores + full select ≫ pruned epilogue).
+    // Override capacity with VECTORCACHE_SIGN_HEAP=<N> (absolute slots; out = N/2).
     const std::size_t e_len = planes_exact_len(kk, s_len);
-    const std::size_t sign_cap = std::min(n_vectors, std::max<std::size_t>(2 * e_len, e_len));
+    const std::size_t sign_cap = sign_heap_capacity(e_len, n_vectors);
 
-    const auto t_sign0 = clock::now();
+    const auto t_prep0 = clock::now();
     auto prep_sign = prepare_sign_from_rows(q_land, nq, scan_dim);
+    if (timings != nullptr) {
+      timings->sign_prepare_ms =
+          std::chrono::duration<double, std::milli>(clock::now() - t_prep0).count();
+    }
     // Kernel QPC sampling is opt-in — enabling it on every timed search inflated wall
     // sign latency (thousands of clock reads over the corpus).
     VnniKernelProfile sign_prof;
@@ -1304,10 +1338,13 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     if (profile_sign) {
       vnni_profile_begin(&sign_prof);
     }
+    const auto t_sign0 = clock::now();
     SearchResults shortlist =
         score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
                        {}, nullptr, /*buffered=*/true);
     if (timings != nullptr) {
+      timings->sign_ms =
+          std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
       if (profile_sign) {
         vnni_profile_end();
         timings->sign_vnni_ms =
@@ -1315,8 +1352,6 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
         timings->sign_epilogue_ms =
             1e-6 * static_cast<double>(sign_prof.epilogue_ns.load(std::memory_order_relaxed));
       }
-      timings->sign_ms =
-          std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
     }
 
     // Stage 2: shortlist permute-dot over codes_flat (W=32/64 SoA tiles — no 192 densify).

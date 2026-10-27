@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -321,6 +322,7 @@ int main(int argc, char** argv) {
   std::size_t landmarks = vectorcache::kDefaultLandmarks;
   bool recall = false;
   std::size_t timing_runs = 5;
+  std::size_t sign_heap = 0;  // 0 = default 2E; sets VECTORCACHE_SIGN_HEAP
 
   app.add_option("--dataset", dataset, "Named dataset (glove, sift1m, openai-1536, openai-3072)");
   app.add_option("--npy", npy, "Path to .npy matrix (overrides --dataset)");
@@ -336,11 +338,22 @@ int main(int argc, char** argv) {
                  "Bits for full-dim quantized re-rank (2-4; default = --bits)")
       ->check(CLI::Range(0, 4));
   app.add_option("--k", k, "Final top-k (heap size)");
+  app.add_option("--sign-heap", sign_heap,
+                 "Staged sign H99 collector capacity (default 2E via env VECTORCACHE_SIGN_HEAP)");
   app.add_option("--landmarks", landmarks, "Orthonormal landmark subspace dims");
   app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
   CLI11_PARSE(app, argc, argv);
+
+  if (sign_heap > 0) {
+    const std::string v = std::to_string(sign_heap);
+#if defined(_WIN32)
+    _putenv_s("VECTORCACHE_SIGN_HEAP", v.c_str());
+#else
+    setenv("VECTORCACHE_SIGN_HEAP", v.c_str(), 1);
+#endif
+  }
 
   try {
     auto to_split = [](const std::string& s) {
@@ -421,12 +434,17 @@ int main(int argc, char** argv) {
         vectorcache::planes_wanted(bits, n_byte_groups, db.rows) ? 1 : 0;
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
               << " scan_bits=" << bits << " rerank_bits=" << effective_rerank_bits
-              << " landmarks=" << landmarks << " k=" << k << " planes=" << planes_on << "\n";
+              << " landmarks=" << landmarks << " k=" << k << " planes=" << planes_on;
+    if (const char* sh = std::getenv("VECTORCACHE_SIGN_HEAP"); sh && sh[0] != '\0') {
+      std::cout << " sign_heap=" << sh;
+    }
+    std::cout << "\n";
     std::cout << vectorcache::search_backend_diagnostics(bits, landmarks, db.rows);
 
     vectorcache::SearchResults last;
     std::vector<double> run_ms;
     std::vector<double> fastscan_ms;
+    std::vector<double> sign_prepare_ms;
     std::vector<double> sign_ms;
     std::vector<double> sign_vnni_ms;
     std::vector<double> sign_epilogue_ms;
@@ -455,6 +473,7 @@ int main(int argc, char** argv) {
       const auto b = std::chrono::steady_clock::now();
       run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
       fastscan_ms.push_back(stages.fastscan_ms);
+      sign_prepare_ms.push_back(stages.sign_prepare_ms);
       sign_ms.push_back(stages.sign_ms);
       sign_vnni_ms.push_back(stages.sign_vnni_ms);
       sign_epilogue_ms.push_back(stages.sign_epilogue_ms);
@@ -466,6 +485,7 @@ int main(int argc, char** argv) {
 
     std::sort(run_ms.begin(), run_ms.end());
     std::sort(fastscan_ms.begin(), fastscan_ms.end());
+    std::sort(sign_prepare_ms.begin(), sign_prepare_ms.end());
     std::sort(sign_ms.begin(), sign_ms.end());
     std::sort(sign_vnni_ms.begin(), sign_vnni_ms.end());
     std::sort(sign_epilogue_ms.begin(), sign_epilogue_ms.end());
@@ -475,6 +495,7 @@ int main(int argc, char** argv) {
     std::sort(exact_epi_ms.begin(), exact_epi_ms.end());
     const double median_ms = run_ms[run_ms.size() / 2];
     const double median_fastscan_ms = fastscan_ms[fastscan_ms.size() / 2];
+    const double median_sign_prepare_ms = sign_prepare_ms[sign_prepare_ms.size() / 2];
     const double median_sign_ms = sign_ms[sign_ms.size() / 2];
     const double median_sign_vnni_ms = sign_vnni_ms[sign_vnni_ms.size() / 2];
     const double median_sign_epilogue_ms = sign_epilogue_ms[sign_epilogue_ms.size() / 2];
@@ -490,7 +511,9 @@ int main(int argc, char** argv) {
     std::cout << "fastscan_median_ms=" << median_fastscan_ms
               << " fastscan_ms_per_query=" << fastscan_ms_per_query << "\n";
     if (planes_on) {
-      // Staged breakdown: 1-bit sign corpus scan vs 4-bit exact on shortlist.
+      // Staged breakdown: LUT prep (separate) + 1-bit sign corpus scan vs 4-bit exact.
+      std::cout << "sign_prepare_median_ms=" << median_sign_prepare_ms
+                << " sign_prepare_ms_per_query=" << (median_sign_prepare_ms / nq) << "\n";
       std::cout << "sign_median_ms=" << median_sign_ms
                 << " sign_ms_per_query=" << (median_sign_ms / nq) << "\n";
       // Profile fractions only when VECTORCACHE_PROFILE_SIGN=1 (else always 0).

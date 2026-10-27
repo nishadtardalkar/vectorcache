@@ -87,7 +87,9 @@ struct SearchResults {
 struct SearchStageTimings {
   /// Total codes path (sign+exact when staged; full 4-bit scan otherwise).
   double fastscan_ms = 0.0;
-  /// Staged only: sign-plane (1-bit) corpus scan — seed + buffered collector + rank.
+  /// Staged only: sign LUT build (`prepare_sign_from_rows`) — not in `sign_ms`.
+  double sign_prepare_ms = 0.0;
+  /// Staged only: sign-plane (1-bit) corpus scan — buffered collector + rank (no LUT prep).
   double sign_ms = 0.0;
   /// Staged only: VNNI accumulate time inside the sign kernel (summed over OpenMP
   /// threads — use for VNNI vs epilogue ratio, not vs wall `sign_ms`).
