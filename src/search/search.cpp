@@ -56,24 +56,31 @@ std::size_t sign_heap_capacity(std::size_t e_len, std::size_t n_vectors) {
   return std::min(n_vectors, std::max<std::size_t>(cap, 1));
 }
 
-/// turbovec `sample_seeds`: strided sign blocks → top-r heap → r-th score as
-/// collector threshold so the main scan admits ~S candidates, not the whole prefix.
+bool env_flag_on(const char* name, bool default_on) {
+  if (const char* v = std::getenv(name); v && v[0] != '\0') {
+    return v[0] != '0';
+  }
+  return default_on;
+}
+
+/// Strided sample → r-th score as collector seed. Calibrated to `cut_len` (E for our
+/// path, not turbovec S). Sample scan is buffered so it uses sign NQ=8.
 std::vector<float> sign_sample_seeds(const PreparedQueries& prep,
                                      std::span<const std::uint8_t> sign_codes,
                                      std::size_t sign_n_blocks, std::span<const float> lm_scales,
-                                     std::size_t s_len, std::size_t n_vectors) {
+                                     std::size_t cut_len, std::size_t n_vectors) {
   const std::size_t nq = prep.nq;
   const std::size_t nsg = prep.n_byte_groups;
   const std::size_t bw = prep.block_width == 0 ? kSignBlock : prep.block_width;
   std::vector<float> seeds(nq, -std::numeric_limits<float>::infinity());
   if (nq == 0 || sign_n_blocks == 0 || nsg == 0 || lm_scales.size() < n_vectors ||
-      s_len == 0 || n_vectors == 0 || bw == 0) {
+      cut_len == 0 || n_vectors == 0 || bw == 0) {
     return seeds;
   }
   const std::size_t block_bytes = nsg * bw;
-  // Aim for a few thousand sample vectors (turbovec stores a strided sample).
+  // ~4×cut sample (smaller than prior 8×S) — enough for E≈384, cheaper wall.
   const std::size_t want_vecs =
-      std::min(n_vectors, std::max<std::size_t>(s_len * 8, 2048));
+      std::min(n_vectors, std::max<std::size_t>(cut_len * 4, 1024));
   std::size_t n_sample_blocks =
       std::min(sign_n_blocks, std::max<std::size_t>(1, (want_vecs + bw - 1) / bw));
   const std::size_t step =
@@ -99,26 +106,32 @@ std::vector<float> sign_sample_seeds(const PreparedQueries& prep,
   if (n_s == 0 || out_b == 0) {
     return seeds;
   }
-  // r: overshoot so more than a shortlist's worth of the corpus sits above the seed.
-  const float r_s = static_cast<float>(s_len) * static_cast<float>(n_s) /
+  const float r_s = static_cast<float>(cut_len) * static_cast<float>(n_s) /
                     static_cast<float>(n_vectors);
   constexpr float kWidth4 = 4.f;
   const float over =
       std::min(4.f, 1.f + kWidth4 / std::sqrt(std::max(1.f, r_s)));
   const std::size_t r =
       std::min(n_s, std::max<std::size_t>(6, static_cast<std::size_t>(std::ceil(over * r_s))));
-
+  // Buffered capacity 2r → out r, uses sign NQ=8 (non-buffered sample used NQ=2).
+  const std::size_t sample_cap = std::min(n_s, std::max<std::size_t>(2 * r, r));
   SearchResults top =
-      score_prepared(prep, r, s_codes, out_b, s_scales, {}, {}, {}, {}, {}, nullptr,
-                     /*buffered=*/false);
+      score_prepared(prep, sample_cap, s_codes, out_b, s_scales, {}, {}, {}, {}, {}, nullptr,
+                     /*buffered=*/true);
   const std::size_t rk = top.k;
   if (rk == 0) {
     return seeds;
   }
   for (std::size_t qi = 0; qi < nq; ++qi) {
-    // r-th best (worst of top-r) — matches turbovec `ss[qi*r + r - 1]`.
-    const std::size_t idx = std::min(r, rk) - 1;
-    seeds[qi] = top.scores[qi * rk + idx];
+    const std::size_t n_keep =
+        top.counts.empty() ? rk : std::min(rk, top.counts[qi]);
+    if (n_keep == 0) continue;
+    // Worst of the kept top (≈ r-th): min score among returned candidates.
+    float thr = top.scores[qi * rk];
+    for (std::size_t j = 1; j < n_keep; ++j) {
+      thr = std::min(thr, top.scores[qi * rk + j]);
+    }
+    seeds[qi] = thr;
   }
   return seeds;
 }
@@ -1405,15 +1418,37 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
     if (profile_sign) {
       vnni_profile_begin(&sign_prof);
     }
+    // VECTORCACHE_SIGN_SEED=0 disables sample seeding. α: VECTORCACHE_SIGN_ALPHA=1.
+    const bool do_seed = env_flag_on("VECTORCACHE_SIGN_SEED", /*default_on=*/true);
     const auto t_sign0 = clock::now();
-    // Seed collectors from a strided sample (turbovec H99) so admit rate stays ~S.
-    std::vector<float> sign_seeds =
-        sign_sample_seeds(prep_sign, sign_codes, sign_n_blocks, lm_scales, s_len, n_vectors);
+
+    std::vector<float> sign_seeds;
+    const float* seed_ptr = nullptr;
+    const auto t_seed0 = clock::now();
+    if (do_seed) {
+      // Calibrate to E (exact cut), not turbovec S — our collector keeps E.
+      sign_seeds =
+          sign_sample_seeds(prep_sign, sign_codes, sign_n_blocks, lm_scales, e_len, n_vectors);
+      seed_ptr = sign_seeds.data();
+    }
+    if (timings != nullptr) {
+      timings->sign_seed_ms =
+          std::chrono::duration<double, std::milli>(clock::now() - t_seed0).count();
+    }
+
+    const auto t_sign_scan0 = clock::now();
     SearchResults shortlist =
         score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks, lm_scales, {}, {}, {}, {},
-                       {}, nullptr, /*buffered=*/true, sign_seeds.data());
+                       {}, nullptr, /*buffered=*/true, seed_ptr);
+    if (timings != nullptr) {
+      timings->sign_scan_ms =
+          std::chrono::duration<double, std::milli>(clock::now() - t_sign_scan0).count();
+    }
+
     // Seed too aggressive → short collector; rescan those queries unseeded.
-    {
+    const auto t_rescan0 = clock::now();
+    std::size_t n_short = 0;
+    if (do_seed) {
       std::vector<std::size_t> short_q;
       short_q.reserve(nq);
       for (std::size_t qi = 0; qi < nq; ++qi) {
@@ -1423,6 +1458,7 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
           short_q.push_back(qi);
         }
       }
+      n_short = short_q.size();
       if (!short_q.empty()) {
         SearchResults redo = score_prepared(prep_sign, sign_cap, sign_codes, sign_n_blocks,
                                             lm_scales, {}, short_q, {}, {}, {}, nullptr,
@@ -1444,6 +1480,9 @@ SearchResults search_landmark_rerank(std::span<const float> queries, std::size_t
       }
     }
     if (timings != nullptr) {
+      timings->sign_rescan_ms =
+          std::chrono::duration<double, std::milli>(clock::now() - t_rescan0).count();
+      timings->sign_short_queries = n_short;
       timings->sign_ms =
           std::chrono::duration<double, std::milli>(clock::now() - t_sign0).count();
       if (profile_sign) {

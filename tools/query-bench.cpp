@@ -438,6 +438,13 @@ int main(int argc, char** argv) {
     if (const char* sh = std::getenv("VECTORCACHE_SIGN_HEAP"); sh && sh[0] != '\0') {
       std::cout << " sign_heap=" << sh;
     }
+    {
+      const char* seed = std::getenv("VECTORCACHE_SIGN_SEED");
+      const char* alpha = std::getenv("VECTORCACHE_SIGN_ALPHA");
+      const int seed_on = (seed == nullptr || seed[0] == '\0' || seed[0] != '0') ? 1 : 0;
+      const int alpha_on = (alpha != nullptr && alpha[0] != '\0' && alpha[0] != '0') ? 1 : 0;
+      std::cout << " sign_seed=" << seed_on << " sign_alpha=" << alpha_on;
+    }
     std::cout << "\n";
     std::cout << vectorcache::search_backend_diagnostics(bits, landmarks, db.rows);
 
@@ -446,6 +453,10 @@ int main(int argc, char** argv) {
     std::vector<double> fastscan_ms;
     std::vector<double> sign_prepare_ms;
     std::vector<double> sign_ms;
+    std::vector<double> sign_seed_ms;
+    std::vector<double> sign_scan_ms;
+    std::vector<double> sign_rescan_ms;
+    std::vector<std::size_t> sign_short_q;
     std::vector<double> sign_vnni_ms;
     std::vector<double> sign_epilogue_ms;
     std::vector<double> exact_ms;
@@ -475,6 +486,10 @@ int main(int argc, char** argv) {
       fastscan_ms.push_back(stages.fastscan_ms);
       sign_prepare_ms.push_back(stages.sign_prepare_ms);
       sign_ms.push_back(stages.sign_ms);
+      sign_seed_ms.push_back(stages.sign_seed_ms);
+      sign_scan_ms.push_back(stages.sign_scan_ms);
+      sign_rescan_ms.push_back(stages.sign_rescan_ms);
+      sign_short_q.push_back(stages.sign_short_queries);
       sign_vnni_ms.push_back(stages.sign_vnni_ms);
       sign_epilogue_ms.push_back(stages.sign_epilogue_ms);
       exact_ms.push_back(stages.exact_ms);
@@ -487,6 +502,10 @@ int main(int argc, char** argv) {
     std::sort(fastscan_ms.begin(), fastscan_ms.end());
     std::sort(sign_prepare_ms.begin(), sign_prepare_ms.end());
     std::sort(sign_ms.begin(), sign_ms.end());
+    std::sort(sign_seed_ms.begin(), sign_seed_ms.end());
+    std::sort(sign_scan_ms.begin(), sign_scan_ms.end());
+    std::sort(sign_rescan_ms.begin(), sign_rescan_ms.end());
+    std::sort(sign_short_q.begin(), sign_short_q.end());
     std::sort(sign_vnni_ms.begin(), sign_vnni_ms.end());
     std::sort(sign_epilogue_ms.begin(), sign_epilogue_ms.end());
     std::sort(exact_ms.begin(), exact_ms.end());
@@ -497,6 +516,10 @@ int main(int argc, char** argv) {
     const double median_fastscan_ms = fastscan_ms[fastscan_ms.size() / 2];
     const double median_sign_prepare_ms = sign_prepare_ms[sign_prepare_ms.size() / 2];
     const double median_sign_ms = sign_ms[sign_ms.size() / 2];
+    const double median_sign_seed_ms = sign_seed_ms[sign_seed_ms.size() / 2];
+    const double median_sign_scan_ms = sign_scan_ms[sign_scan_ms.size() / 2];
+    const double median_sign_rescan_ms = sign_rescan_ms[sign_rescan_ms.size() / 2];
+    const std::size_t median_sign_short_q = sign_short_q[sign_short_q.size() / 2];
     const double median_sign_vnni_ms = sign_vnni_ms[sign_vnni_ms.size() / 2];
     const double median_sign_epilogue_ms = sign_epilogue_ms[sign_epilogue_ms.size() / 2];
     const double median_exact_ms = exact_ms[exact_ms.size() / 2];
@@ -511,11 +534,15 @@ int main(int argc, char** argv) {
     std::cout << "fastscan_median_ms=" << median_fastscan_ms
               << " fastscan_ms_per_query=" << fastscan_ms_per_query << "\n";
     if (planes_on) {
-      // Staged breakdown: LUT prep (separate) + 1-bit sign corpus scan vs 4-bit exact.
+      // Staged breakdown: LUT prep (separate) + seed/scan/rescan vs 4-bit exact.
       std::cout << "sign_prepare_median_ms=" << median_sign_prepare_ms
                 << " sign_prepare_ms_per_query=" << (median_sign_prepare_ms / nq) << "\n";
       std::cout << "sign_median_ms=" << median_sign_ms
                 << " sign_ms_per_query=" << (median_sign_ms / nq) << "\n";
+      std::cout << "sign_seed_median_ms=" << median_sign_seed_ms
+                << " sign_scan_median_ms=" << median_sign_scan_ms
+                << " sign_rescan_median_ms=" << median_sign_rescan_ms
+                << " sign_short_queries=" << median_sign_short_q << "\n";
       // Profile fractions only when VECTORCACHE_PROFILE_SIGN=1 (else always 0).
       if (median_sign_vnni_ms + median_sign_epilogue_ms > 0.0) {
         const double kernel_cpu = median_sign_vnni_ms + median_sign_epilogue_ms;

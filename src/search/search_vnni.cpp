@@ -837,7 +837,14 @@ void score_sign_lut_m256_impl(QueryLutView lut, std::span<const std::uint8_t> bl
   float mins[1] = {heap_min};
   std::size_t mis[1] = {heap_mi};
   if (block_width == kSignBlock && n_byte_groups % 4 == 0) {
-    const float* vs = vec_scales.empty() ? nullptr : vec_scales.data();
+    const bool sign_alpha = [] {
+      if (const char* v = std::getenv("VECTORCACHE_SIGN_ALPHA")) {
+        return v[0] != '\0' && v[0] != '0';
+      }
+      return false;
+    }();
+    const float* vs =
+        (sign_alpha && !vec_scales.empty()) ? vec_scales.data() : nullptr;
     score_sign_vnni_vm32_blk2(lut.uint8_luts, lut.scale, lut.bias, blocked_codes, n_byte_groups,
                               n_vectors, n_blocks, k, heap_s, heap_i, heap_sz, heap_min, heap_mi,
                               id_map, vs);
@@ -1592,7 +1599,16 @@ void score_queries_vnni(const std::uint8_t* const* split_luts, const float* lut_
                                kSignBlock);
     }
 #else
-    const float* vs = vec_scales.empty() ? nullptr : vec_scales.data();
+    // α on sign is opt-in (`VECTORCACHE_SIGN_ALPHA=1`). Default off: landmark
+    // LUT ranking without α matched recall better; exact stage still applies α.
+    const bool sign_alpha = [] {
+      if (const char* v = std::getenv("VECTORCACHE_SIGN_ALPHA")) {
+        return v[0] != '\0' && v[0] != '0';
+      }
+      return false;
+    }();
+    const float* vs =
+        (sign_alpha && !vec_scales.empty()) ? vec_scales.data() : nullptr;
     auto run_vm32 = [&](std::size_t base, std::size_t batch) {
       if (batch == 1) {
         // Dual-block interleaved (turbovec H34) for single-query tiles.

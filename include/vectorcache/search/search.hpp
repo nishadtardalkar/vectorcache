@@ -89,8 +89,16 @@ struct SearchStageTimings {
   double fastscan_ms = 0.0;
   /// Staged only: sign LUT build (`prepare_sign_from_rows`) — not in `sign_ms`.
   double sign_prepare_ms = 0.0;
-  /// Staged only: sign-plane (1-bit) corpus scan — buffered collector + rank (no LUT prep).
+  /// Staged only: wall = seed + scan + rescan (no LUT prep).
   double sign_ms = 0.0;
+  /// Staged only: strided sample → collector seed thresholds.
+  double sign_seed_ms = 0.0;
+  /// Staged only: main buffered sign corpus scan.
+  double sign_scan_ms = 0.0;
+  /// Staged only: unseeded rescan for queries whose seed left the collector short.
+  double sign_rescan_ms = 0.0;
+  /// Staged only: how many queries needed an unseeded rescan (last call).
+  std::size_t sign_short_queries = 0;
   /// Staged only: VNNI accumulate time inside the sign kernel (summed over OpenMP
   /// threads — use for VNNI vs epilogue ratio, not vs wall `sign_ms`).
   double sign_vnni_ms = 0.0;
