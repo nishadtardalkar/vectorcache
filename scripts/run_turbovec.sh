@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Clone/build turbovec (Python bindings) and run an official openai/glove suite
-# script. Used by `make turbovec`.
+# script. Used by `make turbovec` / `make turbovec-setup`.
+#
+# HPC split (same idea as login/compute):
+#   Login (internet):  make turbovec-setup
+#   Compute (offline): make turbovec DATASET=openai-1536 BITS=4 ...
 #
 # Env / make vars:
 #   TURBOVEC_DIR       checkout path (default: .ref-turbovec)
@@ -15,6 +19,7 @@
 #   FORCE=1            rebuild wheel even if import works
 #   SKIP_FAISS=1       for speed suite: time turbovec only (no FAISS)
 #   SETUP_ONLY=1       clone + data + bindings; do not run a suite script
+#   TURBOVEC_OFFLINE=1 no git/pip network (default for `make turbovec`)
 
 set -euo pipefail
 
@@ -30,6 +35,7 @@ TURBOVEC_THREADS="${TURBOVEC_THREADS:-mt}"
 FORCE="${FORCE:-}"
 SKIP_FAISS="${SKIP_FAISS:-}"
 SETUP_ONLY="${SETUP_ONLY:-}"
+TURBOVEC_OFFLINE="${TURBOVEC_OFFLINE:-}"
 PYTHON="${PYTHON:-python3}"
 command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
 
@@ -44,6 +50,10 @@ detect_arch() {
 if [[ -z "${TURBOVEC_ARCH:-}" ]]; then
   TURBOVEC_ARCH="$(detect_arch)"
 fi
+
+have_checkout() {
+  [[ -f "$TURBOVEC_DIR/Cargo.toml" && -d "$TURBOVEC_DIR/turbovec-python" && -d "$TURBOVEC_DIR/benchmarks/suite" ]]
+}
 
 dim_tag_for_dataset() {
   case "$1" in
@@ -73,13 +83,38 @@ npy_candidates_for_dataset() {
   esac
 }
 
+find_wheel() {
+  ls -t "$TURBOVEC_DIR"/target/wheels/turbovec-*.whl \
+        "$TURBOVEC_DIR"/turbovec-python/target/wheels/turbovec-*.whl \
+        2>/dev/null | head -1 || true
+}
+
 ensure_clone() {
-  if [[ -d "$TURBOVEC_DIR/.git" || -f "$TURBOVEC_DIR/Cargo.toml" ]]; then
+  if have_checkout; then
     echo "turbovec checkout: $TURBOVEC_DIR"
     return
   fi
+
+  # Incomplete / failed clone (e.g. compute-node timeout) — drop and retry or abort.
+  if [[ -e "$TURBOVEC_DIR" ]]; then
+    echo "Incomplete turbovec checkout at $TURBOVEC_DIR; removing it." >&2
+    rm -rf "$TURBOVEC_DIR"
+  fi
+
+  if [[ -n "$TURBOVEC_OFFLINE" ]]; then
+    echo "Missing turbovec checkout at $TURBOVEC_DIR (offline mode)." >&2
+    echo "On a login node with internet, from this same project path, run:" >&2
+    echo "  make turbovec-setup" >&2
+    echo "Then re-run make turbovec on the compute node." >&2
+    exit 1
+  fi
+
   echo "Cloning turbovec into $TURBOVEC_DIR ..."
   git clone --depth 1 "$TURBOVEC_REPO" "$TURBOVEC_DIR"
+  if ! have_checkout; then
+    echo "Clone finished but checkout looks incomplete: $TURBOVEC_DIR" >&2
+    exit 1
+  fi
 }
 
 link_or_copy() {
@@ -114,12 +149,13 @@ ensure_data() {
         return
       fi
       local cand
-      for cand in $(npy_candidates_for_dataset "$DATASET"); do
+      while IFS= read -r cand; do
+        [[ -z "$cand" ]] && continue
         if [[ -s "$cand" ]]; then
           link_or_copy "$cand" "$dest"
           return
         fi
-      done
+      done < <(npy_candidates_for_dataset "$DATASET")
       echo "Missing $DATASET under $DATA_DIR (need openai-${dim}.npy or openai-${dim}-101k.npy)." >&2
       echo "Run: make login DATASETS=$DATASET" >&2
       exit 1
@@ -141,11 +177,37 @@ ensure_data() {
   esac
 }
 
+install_wheel() {
+  local wheel="$1"
+  echo "Installing $wheel ..."
+  if [[ -n "$TURBOVEC_OFFLINE" ]]; then
+    "$PYTHON" -m pip install --force-reinstall --no-deps --no-index "$wheel"
+  else
+    "$PYTHON" -m pip install --force-reinstall --no-deps "$wheel"
+  fi
+  "$PYTHON" -c "from turbovec import TurboQuantIndex; print('turbovec ready')"
+}
+
 ensure_bindings() {
   if [[ -z "$FORCE" ]] && "$PYTHON" -c "from turbovec import TurboQuantIndex" >/dev/null 2>&1; then
     echo "turbovec Python import OK ($PYTHON)"
     return
   fi
+
+  local wheel
+  wheel="$(find_wheel)"
+
+  if [[ -n "$TURBOVEC_OFFLINE" ]]; then
+    if [[ -n "$wheel" && -f "$wheel" ]]; then
+      install_wheel "$wheel"
+      return
+    fi
+    echo "turbovec is not importable and no local wheel was found under $TURBOVEC_DIR (offline)." >&2
+    echo "On a login node with internet, using the same Python env, run:" >&2
+    echo "  make turbovec-setup" >&2
+    exit 1
+  fi
+
   if ! "$PYTHON" -c "import maturin" >/dev/null 2>&1; then
     echo "Installing maturin ..."
     "$PYTHON" -m pip install -U 'maturin>=1.12,<2.0'
@@ -155,18 +217,12 @@ ensure_bindings() {
     cd "$TURBOVEC_DIR/turbovec-python"
     "$PYTHON" -m maturin build --release
   )
-  local wheel
-  wheel="$(ls -t "$TURBOVEC_DIR"/target/wheels/turbovec-*.whl 2>/dev/null | head -1 || true)"
-  if [[ -z "$wheel" ]]; then
-    wheel="$(ls -t "$TURBOVEC_DIR"/turbovec-python/target/wheels/turbovec-*.whl 2>/dev/null | head -1 || true)"
-  fi
+  wheel="$(find_wheel)"
   if [[ -z "$wheel" || ! -f "$wheel" ]]; then
     echo "maturin build produced no turbovec wheel under $TURBOVEC_DIR" >&2
     exit 1
   fi
-  echo "Installing $wheel ..."
-  "$PYTHON" -m pip install --force-reinstall --no-deps "$wheel"
-  "$PYTHON" -c "from turbovec import TurboQuantIndex; print('turbovec ready')"
+  install_wheel "$wheel"
 }
 
 suite_script() {
@@ -243,12 +299,22 @@ main() {
     exit 1
   fi
 
+  # Setup is online. Bench defaults offline (compute nodes have no GitHub).
+  if [[ -n "$SETUP_ONLY" ]]; then
+    TURBOVEC_OFFLINE=""
+  elif [[ "${TURBOVEC_ALLOW_NET:-}" == "1" ]]; then
+    TURBOVEC_OFFLINE=""
+  elif [[ -z "${TURBOVEC_OFFLINE}" ]]; then
+    TURBOVEC_OFFLINE=1
+  fi
+
   ensure_clone
   ensure_data
   ensure_bindings
 
   if [[ -n "$SETUP_ONLY" ]]; then
     echo "turbovec setup complete (DATASET=$DATASET)."
+    echo "On the compute node, run: make turbovec DATASET=$DATASET BITS=$BITS ..."
     return
   fi
 

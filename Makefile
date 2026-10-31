@@ -85,8 +85,8 @@ help:
 	@echo ""
 	@echo "  make login          Configure CMake, fetch dependencies, download datasets (login node)"
 	@echo "  make compute        Build, test, and query-bench offline (compute node)"
-	@echo "  make turbovec       Build/install reference turbovec and run its openai/glove suite"
-	@echo "  make turbovec-setup Clone + data wire + Python bindings only (no bench)"
+	@echo "  make turbovec-setup Login node: clone turbovec, build wheel, wire openai data (needs net)"
+	@echo "  make turbovec       Compute node: run official suite offline (needs prior turbovec-setup)"
 	@echo "  make clean          Remove build directory"
 	@echo ""
 	@echo "Build / login variables:"
@@ -111,7 +111,7 @@ help:
 	@echo "  TURBOVEC_THREADS=$(TURBOVEC_THREADS)  (mt|st)  TURBOVEC_ARCH=$(TURBOVEC_ARCH)  (x86|arm|auto)"
 	@echo "  TURBOVEC_DIR=$(TURBOVEC_DIR)  TURBOVEC_DATA_DIR=$(TURBOVEC_DATA_DIR)"
 	@echo "  SKIP_FAISS=1    speed: turbovec-only timing (no FAISS)"
-	@echo "  FORCE=1         rebuild turbovec wheel"
+	@echo "  FORCE=1         rebuild turbovec wheel (login / turbovec-setup)"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make login DATASETS=sift1m"
@@ -120,8 +120,8 @@ help:
 	@echo "Example: make compute DATASET=sift1m QUERY_LIMIT=10000"
 	@echo "Example: make compute LANDMARKS=512 K=64 RECALL=1"
 	@echo "Example: make compute BITS=2 LANDMARKS=1024 K=64"
-	@echo "Example: make turbovec"
-	@echo "Example: make turbovec DATASET=openai-1536 BITS=4 SKIP_FAISS=1"
+	@echo "Example: make turbovec-setup                    # login node (internet)"
+	@echo "Example: make turbovec DATASET=openai-1536 BITS=4 TURBOVEC_ARCH=x86 TURBOVEC_THREADS=mt"
 	@echo "Example: make turbovec TURBOVEC_SUITE=recall BITS=4"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 
@@ -184,15 +184,17 @@ compute:
 		"$$QUERY_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(QUERY_BENCH_ARGS)
 	fi
 
+# Login node (internet): clone + maturin wheel + wire DATA_DIR into TURBOVEC_DATA_DIR.
 turbovec-setup:
 	set -euo pipefail
 	DATASET="$(DATASET)" BITS="$(BITS)" \
 		TURBOVEC_DIR="$(TURBOVEC_DIR)" TURBOVEC_REPO="$(TURBOVEC_REPO)" \
 		TURBOVEC_DATA_DIR="$(TURBOVEC_DATA_DIR)" DATA_DIR="$(DATA_DIR)" \
-		FORCE="$(FORCE)" SETUP_ONLY=1 \
+		FORCE="$(FORCE)" SETUP_ONLY=1 TURBOVEC_OFFLINE= \
 		bash "$(TURBOVEC_SCRIPT)"
 
-# Official turbovec suite for openai-1536 / openai-3072 / glove.
+# Compute node (offline): run official suite. Requires prior `make turbovec-setup`
+# on a login node sharing this project path / Python env.
 # Default: openai-1536 4-bit x86 mt speed (matches published cells).
 turbovec:
 	set -euo pipefail
@@ -201,6 +203,7 @@ turbovec:
 		TURBOVEC_DATA_DIR="$(TURBOVEC_DATA_DIR)" DATA_DIR="$(DATA_DIR)" \
 		TURBOVEC_SUITE="$(TURBOVEC_SUITE)" TURBOVEC_THREADS="$(TURBOVEC_THREADS)" \
 		TURBOVEC_ARCH="$(TURBOVEC_ARCH)" FORCE="$(FORCE)" SKIP_FAISS="$(SKIP_FAISS)" \
+		TURBOVEC_OFFLINE=1 \
 		bash "$(TURBOVEC_SCRIPT)"
 
 clean:
