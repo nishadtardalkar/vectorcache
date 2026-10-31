@@ -39,9 +39,10 @@ FORCE="${FORCE:-}"
 SKIP_FAISS="${SKIP_FAISS:-}"
 SETUP_ONLY="${SETUP_ONLY:-}"
 TURBOVEC_OFFLINE="${TURBOVEC_OFFLINE:-}"
-# Keep Rust toolchains on the shared project path so login+compute see the same install.
-CARGO_HOME="${CARGO_HOME:-$ROOT/.ref-turbovec-cargo}"
-RUSTUP_HOME="${RUSTUP_HOME:-$ROOT/.ref-turbovec-rustup}"
+# Rust must live on an exec-capable filesystem. Shared project disks (e.g. /rsstu)
+# are often mounted noexec — default to $HOME, not $ROOT.
+CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export CARGO_HOME RUSTUP_HOME
 PYTHON="${PYTHON:-python3}"
 command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
@@ -52,6 +53,33 @@ source_cargo_env() {
     source "$CARGO_HOME/env"
   fi
   export PATH="$CARGO_HOME/bin:${PATH:-}"
+}
+
+rust_works() {
+  source_cargo_env
+  command -v rustc >/dev/null 2>&1 || return 1
+  command -v cargo >/dev/null 2>&1 || return 1
+  rustc -vV >/dev/null 2>&1 || return 1
+  cargo -V >/dev/null 2>&1 || return 1
+  return 0
+}
+
+warn_if_noexec_dir() {
+  local dir="$1"
+  local probe
+  mkdir -p "$dir" 2>/dev/null || return 0
+  probe="$(mktemp -p "$dir" .execprobe.XXXXXX 2>/dev/null || true)"
+  [[ -n "$probe" ]] || return 0
+  printf '#!/bin/sh\nexit 0\n' >"$probe"
+  chmod +x "$probe" || true
+  if ! "$probe" >/dev/null 2>&1; then
+    echo "WARNING: $dir appears noexec (cannot run binaries here)." >&2
+    echo "         Rust will be installed under \$HOME instead." >&2
+    rm -f "$probe"
+    return 1
+  fi
+  rm -f "$probe"
+  return 0
 }
 
 detect_arch() {
@@ -254,16 +282,36 @@ try_module_rust() {
 }
 
 ensure_rust() {
-  source_cargo_env
-  if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
-    echo "Rust OK: $(rustc --version); $(cargo --version)"
+  # Drop a previous project-local install that landed on a noexec mount.
+  local stale
+  for stale in "$ROOT/.ref-turbovec-cargo" "$ROOT/.ref-turbovec-rustup"; do
+    if [[ -e "$stale" ]]; then
+      echo "Removing stale noexec Rust install: $stale"
+      rm -rf "$stale"
+    fi
+  done
+
+  if rust_works; then
+    echo "Rust OK: $(rustc --version 2>/dev/null); $(cargo --version 2>/dev/null)"
     return
   fi
-  if try_module_rust; then
+  if try_module_rust && rust_works; then
     return
   fi
   if [[ -n "$TURBOVEC_OFFLINE" ]]; then
-    echo "cargo/rustc not found (offline). Run make turbovec-setup on a login node first." >&2
+    echo "cargo/rustc not runnable (offline). Run make turbovec-setup on a login node first." >&2
+    exit 1
+  fi
+
+  # Prefer $HOME; fall back only if caller overrode CARGO_HOME to an exec fs.
+  if ! warn_if_noexec_dir "$CARGO_HOME"; then
+    CARGO_HOME="$HOME/.cargo"
+    RUSTUP_HOME="$HOME/.rustup"
+    export CARGO_HOME RUSTUP_HOME
+  fi
+  if ! warn_if_noexec_dir "$HOME"; then
+    echo "\$HOME ($HOME) is also noexec; cannot install a runnable Rust toolchain." >&2
+    echo "Load a cluster Rust module (module load rust) or ask admins for an exec home." >&2
     exit 1
   fi
 
@@ -284,8 +332,11 @@ ensure_rust() {
   sh "$rustup_init" -y --profile minimal --default-toolchain stable --no-modify-path
   rm -f "$rustup_init"
   source_cargo_env
-  if ! command -v cargo >/dev/null 2>&1; then
-    echo "rustup finished but cargo still not on PATH ($CARGO_HOME/bin)." >&2
+  if ! rust_works; then
+    echo "rustup finished but rustc/cargo are not executable." >&2
+    echo "  which rustc: $(command -v rustc 2>/dev/null || echo missing)" >&2
+    echo "  which cargo: $(command -v cargo 2>/dev/null || echo missing)" >&2
+    echo "This usually means the install path is on a noexec filesystem." >&2
     exit 1
   fi
   echo "Rust installed: $(rustc --version); $(cargo --version)"
