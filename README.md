@@ -9,6 +9,7 @@ TurboQuant ANN engine (C++20) matching [turbovec](https://github.com/RyanCodrai/
 - OpenMP (recommended)
 - For `fetch-datasets`: libcurl; Apache Arrow/Parquet for OpenAI datasets
 - For GloVe / SIFT1M: HDF5 C library
+- For `make turbovec`: Rust toolchain, Python 3.9+, `maturin`, `numpy` (and `faiss` unless `SKIP_FAISS=1`)
 
 On HPC clusters:
 
@@ -29,10 +30,16 @@ make compute
 make compute BITS=4 RECALL=1 CALIBRATE=1
 make compute DATASET=openai-1536 BITS=2 K=64
 make compute DATASET=sift1m QUERY_LIMIT=10000
+
+# Reference turbovec (openai-1536 by default):
+make turbovec
+make turbovec DATASET=openai-1536 BITS=4 SKIP_FAISS=1
+make turbovec TURBOVEC_SUITE=recall BITS=4
 ```
 
 `make login` configures CMake and downloads datasets into `data/`.  
-`make compute` reconfigures offline, builds tests + `query-bench`, runs `ctest`, then runs `query-bench`.
+`make compute` reconfigures offline, builds tests + `query-bench`, runs `ctest`, then runs `query-bench`.  
+`make turbovec` clones/builds [turbovec](https://github.com/RyanCodrai/turbovec) under `.ref-turbovec`, wires `~/data/py-turboquant/openai-1536.npy` from `data/`, and runs the official suite (default: openai-1536 4-bit speed).
 
 ## Algorithm (turbovec-compatible + optional IVF)
 

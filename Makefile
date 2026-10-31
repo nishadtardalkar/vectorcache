@@ -27,6 +27,15 @@ CMAKE_OPTS    ?=
 ENV_SCRIPT    := scripts/envs.sh
 LOGIN_READY   := $(BUILD_DIR)/.login-ready
 
+TURBOVEC_DIR      ?= .ref-turbovec
+TURBOVEC_REPO     ?= https://github.com/RyanCodrai/turbovec.git
+TURBOVEC_DATA_DIR ?= $(HOME)/data/py-turboquant
+TURBOVEC_SUITE    ?= speed
+TURBOVEC_THREADS  ?= mt
+TURBOVEC_ARCH     ?=
+SKIP_FAISS        ?=
+TURBOVEC_SCRIPT   := scripts/run_turbovec.sh
+
 ifneq (,$(filter all openai-1536 openai-3072,$(DATASETS)))
 LOGIN_FETCH_OPENAI := ON
 else
@@ -67,16 +76,18 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,K,k) \
 	$(call flag_arg,RECALL,recall)
 
-.PHONY: help login compute clean
+.PHONY: help login compute turbovec turbovec-setup clean
 
 .DEFAULT_GOAL := help
 
 help:
 	@echo "VectorCache HPC targets:"
 	@echo ""
-	@echo "  make login    Configure CMake, fetch dependencies, download datasets (login node)"
-	@echo "  make compute  Build, test, and query-bench offline (compute node)"
-	@echo "  make clean    Remove build directory"
+	@echo "  make login          Configure CMake, fetch dependencies, download datasets (login node)"
+	@echo "  make compute        Build, test, and query-bench offline (compute node)"
+	@echo "  make turbovec       Build/install reference turbovec and run its openai/glove suite"
+	@echo "  make turbovec-setup Clone + data wire + Python bindings only (no bench)"
+	@echo "  make clean          Remove build directory"
 	@echo ""
 	@echo "Build / login variables:"
 	@echo "  BUILD_DIR=$(BUILD_DIR)  BUILD_TYPE=$(BUILD_TYPE)  JOBS=$(JOBS)"
@@ -95,6 +106,13 @@ help:
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
+	@echo "Turbovec variables (make turbovec):"
+	@echo "  DATASET=$(DATASET)  BITS=$(BITS)  TURBOVEC_SUITE=$(TURBOVEC_SUITE)  (speed|recall)"
+	@echo "  TURBOVEC_THREADS=$(TURBOVEC_THREADS)  (mt|st)  TURBOVEC_ARCH=$(TURBOVEC_ARCH)  (x86|arm|auto)"
+	@echo "  TURBOVEC_DIR=$(TURBOVEC_DIR)  TURBOVEC_DATA_DIR=$(TURBOVEC_DATA_DIR)"
+	@echo "  SKIP_FAISS=1    speed: turbovec-only timing (no FAISS)"
+	@echo "  FORCE=1         rebuild turbovec wheel"
+	@echo ""
 	@echo "Example: make login DATASETS=glove"
 	@echo "Example: make login DATASETS=sift1m"
 	@echo "Example: make compute"
@@ -102,6 +120,9 @@ help:
 	@echo "Example: make compute DATASET=sift1m QUERY_LIMIT=10000"
 	@echo "Example: make compute LANDMARKS=512 K=64 RECALL=1"
 	@echo "Example: make compute BITS=2 LANDMARKS=1024 K=64"
+	@echo "Example: make turbovec"
+	@echo "Example: make turbovec DATASET=openai-1536 BITS=4 SKIP_FAISS=1"
+	@echo "Example: make turbovec TURBOVEC_SUITE=recall BITS=4"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 
 login: $(LOGIN_READY)
@@ -162,6 +183,25 @@ compute:
 	else
 		"$$QUERY_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(QUERY_BENCH_ARGS)
 	fi
+
+turbovec-setup:
+	set -euo pipefail
+	DATASET="$(DATASET)" BITS="$(BITS)" \
+		TURBOVEC_DIR="$(TURBOVEC_DIR)" TURBOVEC_REPO="$(TURBOVEC_REPO)" \
+		TURBOVEC_DATA_DIR="$(TURBOVEC_DATA_DIR)" DATA_DIR="$(DATA_DIR)" \
+		FORCE="$(FORCE)" SETUP_ONLY=1 \
+		bash "$(TURBOVEC_SCRIPT)"
+
+# Official turbovec suite for openai-1536 / openai-3072 / glove.
+# Default: openai-1536 4-bit x86 mt speed (matches published cells).
+turbovec:
+	set -euo pipefail
+	DATASET="$(DATASET)" BITS="$(BITS)" \
+		TURBOVEC_DIR="$(TURBOVEC_DIR)" TURBOVEC_REPO="$(TURBOVEC_REPO)" \
+		TURBOVEC_DATA_DIR="$(TURBOVEC_DATA_DIR)" DATA_DIR="$(DATA_DIR)" \
+		TURBOVEC_SUITE="$(TURBOVEC_SUITE)" TURBOVEC_THREADS="$(TURBOVEC_THREADS)" \
+		TURBOVEC_ARCH="$(TURBOVEC_ARCH)" FORCE="$(FORCE)" SKIP_FAISS="$(SKIP_FAISS)" \
+		bash "$(TURBOVEC_SCRIPT)"
 
 clean:
 	rm -rf $(BUILD_DIR)
