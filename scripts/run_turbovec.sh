@@ -39,11 +39,12 @@ FORCE="${FORCE:-}"
 SKIP_FAISS="${SKIP_FAISS:-}"
 SETUP_ONLY="${SETUP_ONLY:-}"
 TURBOVEC_OFFLINE="${TURBOVEC_OFFLINE:-}"
-# Rust must live on an exec-capable filesystem. Shared project disks (e.g. /rsstu)
-# are often mounted noexec — default to $HOME, not $ROOT.
+# Rust + cargo target dir must live on an exec-capable filesystem. Shared project
+# disks (e.g. /rsstu) are often mounted noexec — default to $HOME, not $ROOT.
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
-export CARGO_HOME RUSTUP_HOME
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/vectorcache-turbovec-target}"
+export CARGO_HOME RUSTUP_HOME CARGO_TARGET_DIR
 PYTHON="${PYTHON:-python3}"
 command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
 
@@ -127,7 +128,8 @@ npy_candidates_for_dataset() {
 }
 
 find_wheel() {
-  ls -t "$TURBOVEC_DIR"/target/wheels/turbovec-*.whl \
+  ls -t "$CARGO_TARGET_DIR"/wheels/turbovec-*.whl \
+        "$TURBOVEC_DIR"/target/wheels/turbovec-*.whl \
         "$TURBOVEC_DIR"/turbovec-python/target/wheels/turbovec-*.whl \
         2>/dev/null | head -1 || true
 }
@@ -376,9 +378,21 @@ ensure_bindings() {
   fi
 
   ensure_rust
+  # Drop a previous in-tree target/ that cannot execute build-scripts (noexec).
+  if [[ -d "$TURBOVEC_DIR/target" ]]; then
+    echo "Removing noexec in-tree cargo target: $TURBOVEC_DIR/target"
+    rm -rf "$TURBOVEC_DIR/target"
+  fi
+  mkdir -p "$CARGO_TARGET_DIR"
+  if ! warn_if_noexec_dir "$CARGO_TARGET_DIR"; then
+    echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR is noexec; set CARGO_TARGET_DIR to an exec path (e.g. under \$HOME)." >&2
+    exit 1
+  fi
   echo "Building turbovec Python wheel (release) ..."
+  echo "  CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
   (
     source_cargo_env
+    export CARGO_TARGET_DIR
     cd "$TURBOVEC_DIR/turbovec-python"
     "$PYTHON" -m maturin build --release
   )
