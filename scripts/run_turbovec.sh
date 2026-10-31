@@ -507,6 +507,8 @@ path = os.path.join(data_dir, f"openai-{dim}.npy")
 print(f"Loading {path} (mmap) ...", flush=True)
 all_vecs = np.load(path, mmap_mode="r")
 n_all = int(all_vecs.shape[0])
+nbytes = os.path.getsize(path)
+print(f"  shape={all_vecs.shape} dtype={all_vecs.dtype} file={nbytes / 1e9:.2f} GB", flush=True)
 if n_all < 101_000:
     raise SystemExit(f"need >= 101000 rows, got {n_all}")
 if int(all_vecs.shape[1]) != dim:
@@ -514,9 +516,46 @@ if int(all_vecs.shape[1]) != dim:
 
 rng = np.random.RandomState(42)
 idx = rng.permutation(n_all)
-# Materialize only the 101k rows we need (full 1M np.load is what OOMs).
-database = np.asarray(all_vecs[idx[:100_000]], dtype=np.float32)
-queries = np.asarray(all_vecs[idx[100_000:101_000]], dtype=np.float32)
+db_idx = idx[:100_000]
+q_idx = idx[100_000:101_000]
+
+# Random fancy-index from a 1M mmap on shared FS is the slow step (minutes).
+# Cache the exact seed-42 101k slice under $HOME so re-runs are fast.
+cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "vectorcache-turbovec")
+os.makedirs(cache_dir, exist_ok=True)
+cache_path = os.path.join(cache_dir, f"openai-{dim}-seed42-101k.npy")
+if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+    print(f"Loading cached 101k slice {cache_path} ...", flush=True)
+    cached = np.load(cache_path)
+    database = cached[:100_000].astype(np.float32, copy=False)
+    queries = cached[100_000:101_000].astype(np.float32, copy=False)
+    del cached
+else:
+    print(
+        f"Gathering 101k rows via seed=42 permutation from {n_all} "
+        f"(random mmap I/O — can take several minutes on shared disks) ...",
+        flush=True,
+    )
+    t_g0 = time.perf_counter()
+    # Sort for more sequential reads, then unpermute.
+    take = np.concatenate([db_idx, q_idx])
+    order = np.argsort(take)
+    sorted_take = take[order]
+    gathered = np.empty((101_000, dim), dtype=np.float32)
+    chunk = 4096
+    for start in range(0, 101_000, chunk):
+        end = min(start + chunk, 101_000)
+        gathered[start:end] = np.asarray(all_vecs[sorted_take[start:end]], dtype=np.float32)
+        if start == 0 or end == 101_000 or (end % 16384) == 0:
+            print(f"  gathered {end}/101000 rows ({time.perf_counter() - t_g0:.1f}s)", flush=True)
+    inv = np.empty(101_000, dtype=np.int64)
+    inv[order] = np.arange(101_000)
+    selected = gathered[inv]
+    database = selected[:100_000]
+    queries = selected[100_000:101_000]
+    print(f"  gather done in {time.perf_counter() - t_g0:.1f}s; caching to {cache_path}", flush=True)
+    np.save(cache_path, selected)
+    del gathered, selected
 del all_vecs
 database /= np.linalg.norm(database, axis=-1, keepdims=True).astype(np.float32)
 queries /= np.linalg.norm(queries, axis=-1, keepdims=True).astype(np.float32)
