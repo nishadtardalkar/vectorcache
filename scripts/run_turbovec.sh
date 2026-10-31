@@ -45,8 +45,37 @@ CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/vectorcache-turbovec-target}"
 export CARGO_HOME RUSTUP_HOME CARGO_TARGET_DIR
-PYTHON="${PYTHON:-python3}"
-command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
+
+# Prefer an activated venv/conda interpreter. Bare `python3` often resolves to
+# /usr/bin/python3 (no pip) even when env/bin/python is on PATH first under `python`.
+pick_python() {
+  if [[ -n "${PYTHON:-}" ]]; then
+    command -v "$PYTHON" >/dev/null 2>&1 && { command -v "$PYTHON"; return; }
+    [[ -x "$PYTHON" ]] && { echo "$PYTHON"; return; }
+  fi
+  local cand
+  for cand in \
+      "${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}" \
+      "${CONDA_PREFIX:+$CONDA_PREFIX/bin/python}" \
+      python \
+      python3; do
+    [[ -z "$cand" ]] && continue
+    if [[ -x "$cand" ]]; then
+      echo "$cand"
+      return
+    fi
+    if command -v "$cand" >/dev/null 2>&1; then
+      command -v "$cand"
+      return
+    fi
+  done
+  return 1
+}
+PYTHON="$(pick_python || true)"
+if [[ -z "$PYTHON" ]]; then
+  echo "No Python interpreter found. Activate your env or set PYTHON=/path/to/python." >&2
+  exit 1
+fi
 
 source_cargo_env() {
   if [[ -f "$CARGO_HOME/env" ]]; then
@@ -227,12 +256,18 @@ pip_install() {
 }
 
 ensure_python() {
-  if ! command -v "$PYTHON" >/dev/null 2>&1; then
-    echo "Python not found (tried PYTHON=$PYTHON). Activate your env or set PYTHON=..." >&2
+  if [[ ! -x "$PYTHON" ]] && ! command -v "$PYTHON" >/dev/null 2>&1; then
+    echo "Python not found (PYTHON=$PYTHON). Activate your env or set PYTHON=..." >&2
     exit 1
   fi
   if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
-    echo "pip missing for $PYTHON; install pip then re-run." >&2
+    echo "pip missing for $PYTHON." >&2
+    echo "  sys.executable=$("$PYTHON" -c 'import sys; print(sys.executable)' 2>/dev/null || echo '?')" >&2
+    if [[ -n "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ]]; then
+      echo "  Active env detected but this interpreter has no pip — try: python -m ensurepip --upgrade" >&2
+    else
+      echo "  No venv/conda is active. Activate ./env first, or: PYTHON=./env/bin/python make turbovec-setup" >&2
+    fi
     exit 1
   fi
   echo "Python: $("$PYTHON" -c 'import sys; print(sys.executable)')"

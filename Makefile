@@ -35,6 +35,7 @@ TURBOVEC_THREADS  ?= mt
 TURBOVEC_ARCH     ?=
 SKIP_FAISS        ?=
 TURBOVEC_SCRIPT   := scripts/run_turbovec.sh
+PYTHON            ?=
 
 ifneq (,$(filter all openai-1536 openai-3072,$(DATASETS)))
 LOGIN_FETCH_OPENAI := ON
@@ -191,6 +192,7 @@ turbovec-setup:
 		TURBOVEC_DIR="$(TURBOVEC_DIR)" TURBOVEC_REPO="$(TURBOVEC_REPO)" \
 		TURBOVEC_DATA_DIR="$(TURBOVEC_DATA_DIR)" DATA_DIR="$(DATA_DIR)" \
 		FORCE="$(FORCE)" SETUP_ONLY=1 TURBOVEC_OFFLINE= \
+		$(if $(strip $(PYTHON)),PYTHON="$(PYTHON)",) \
 		bash "$(TURBOVEC_SCRIPT)"
 
 # Compute node (offline): run official suite. Requires prior `make turbovec-setup`
@@ -204,6 +206,7 @@ turbovec:
 		TURBOVEC_SUITE="$(TURBOVEC_SUITE)" TURBOVEC_THREADS="$(TURBOVEC_THREADS)" \
 		TURBOVEC_ARCH="$(TURBOVEC_ARCH)" FORCE="$(FORCE)" SKIP_FAISS="$(SKIP_FAISS)" \
 		TURBOVEC_OFFLINE=1 \
+		$(if $(strip $(PYTHON)),PYTHON="$(PYTHON)",) \
 		bash "$(TURBOVEC_SCRIPT)"
 
 clean:
