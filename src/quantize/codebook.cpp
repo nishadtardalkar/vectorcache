@@ -208,19 +208,18 @@ std::pair<std::vector<float>, std::vector<float>> codebook(std::size_t bits, std
     throw std::invalid_argument("dim must be >= 2");
   }
   {
-    std::unique_lock lock(g_memo_mu, std::try_to_lock);
-    if (lock.owns_lock()) {
-      auto it = g_memo.find({bits, dim});
-      if (it != g_memo.end()) {
-        return it->second;
-      }
+    std::lock_guard lock(g_memo_mu);
+    auto it = g_memo.find({bits, dim});
+    if (it != g_memo.end()) {
+      return it->second;
     }
   }
   auto computed = lloyd_max(bits, dim, 200, 1e-12);
   {
-    std::unique_lock lock(g_memo_mu, std::try_to_lock);
-    if (lock.owns_lock()) {
-      g_memo.emplace(std::make_pair(bits, dim), computed);
+    std::lock_guard lock(g_memo_mu);
+    auto [it, inserted] = g_memo.emplace(std::make_pair(bits, dim), computed);
+    if (!inserted) {
+      return it->second;
     }
   }
   return computed;

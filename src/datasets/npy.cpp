@@ -314,6 +314,25 @@ bool NpyReader::next_vector_into(std::span<float> out) {
   return true;
 }
 
+std::size_t NpyReader::copy_rows_into(std::span<float> out, std::size_t n) {
+  if (n == 0) {
+    return 0;
+  }
+  const std::size_t avail = count_ - index_;
+  const std::size_t take = (std::min)(n, avail);
+  if (out.size() < take * dim_) {
+    throw Error("copy_rows_into buffer too small");
+  }
+  const std::size_t byte_offset = data_offset_ + index_ * dim_ * 4;
+  const std::size_t nbytes = take * dim_ * 4;
+  if (byte_offset + nbytes > data_size()) {
+    throw Error("NPY data truncated during bulk copy");
+  }
+  std::memcpy(out.data(), data_ptr() + byte_offset, nbytes);
+  index_ += take;
+  return take;
+}
+
 void write_npy_f32_matrix(const std::filesystem::path& path, std::size_t rows, std::size_t cols,
                           const float* data) {
   if (path.has_parent_path()) {

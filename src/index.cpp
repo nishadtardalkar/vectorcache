@@ -3,6 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <vector>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #include "vectorcache/encode/encode.hpp"
 #include "vectorcache/pack/pack.hpp"
@@ -14,38 +19,100 @@ namespace {
 
 float l2_normalize_into(const float* src, float* dst, std::size_t dim) {
   double s = 0.0;
+#if defined(__x86_64__) || defined(_M_X64)
+  __m256 acc = _mm256_setzero_ps();
+  std::size_t i = 0;
+  for (; i + 8 <= dim; i += 8) {
+    const __m256 v = _mm256_loadu_ps(src + i);
+    acc = _mm256_fmadd_ps(v, v, acc);
+  }
+  alignas(32) float tmp[8];
+  _mm256_store_ps(tmp, acc);
+  s = static_cast<double>(tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7]);
+  for (; i < dim; ++i) {
+    s += static_cast<double>(src[i]) * src[i];
+  }
+#else
   for (std::size_t i = 0; i < dim; ++i) {
     s += static_cast<double>(src[i]) * src[i];
   }
+#endif
   const float nrm = static_cast<float>(std::sqrt(s));
   if (nrm < kMinInputNorm) {
-    for (std::size_t i = 0; i < dim; ++i) {
-      dst[i] = 0.f;
-    }
+    std::fill(dst, dst + static_cast<std::ptrdiff_t>(dim), 0.f);
     return 0.f;
   }
   const float inv = 1.f / nrm;
-  for (std::size_t i = 0; i < dim; ++i) {
-    dst[i] = src[i] * inv;
+  for (std::size_t d = 0; d < dim; ++d) {
+    dst[d] = src[d] * inv;
   }
   return nrm;
 }
 
-std::size_t quantize_coord(float x, std::span<const float> boundaries) {
-  std::size_t lo = 0;
-  std::size_t hi = boundaries.size();
-  while (lo < hi) {
-    const std::size_t mid = lo + (hi - lo) / 2;
-    if (x < boundaries[mid]) {
-      hi = mid;
-    } else {
-      lo = mid + 1;
-    }
+/// Branchless level count — vectorizes cleanly for bits ∈ {2,3,4}.
+inline std::size_t quantize_coord(float x, std::span<const float> boundaries) {
+  std::size_t v = 0;
+  for (float b : boundaries) {
+    v += static_cast<std::size_t>(x >= b);
   }
-  return lo;
+  return v;
+}
+
+inline float norm_sq_f32(const float* x, std::size_t dim) {
+#if defined(__x86_64__) || defined(_M_X64)
+  __m256 acc = _mm256_setzero_ps();
+  std::size_t i = 0;
+  for (; i + 8 <= dim; i += 8) {
+    const __m256 v = _mm256_loadu_ps(x + i);
+    acc = _mm256_fmadd_ps(v, v, acc);
+  }
+  alignas(32) float tmp[8];
+  _mm256_store_ps(tmp, acc);
+  float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+  for (; i < dim; ++i) {
+    s += x[i] * x[i];
+  }
+  return s;
+#else
+  float s = 0.f;
+  for (std::size_t i = 0; i < dim; ++i) {
+    s += x[i] * x[i];
+  }
+  return s;
+#endif
 }
 
 std::size_t pad_scan_dim(std::size_t m) { return (m + 7u) & ~std::size_t{7u}; }
+
+/// Encode one row into α·ŷ (full-dim) and return ‖α·ŷ‖². Uses caller scratch.
+float encode_scaled_yhat(const float* src, float* unit_scratch, float* rot_scratch,
+                         float* yhat_out, std::size_t dim, const Rotation& rotation,
+                         std::span<const float> boundaries, std::span<const float> centroids) {
+  l2_normalize_into(src, unit_scratch, dim);
+  std::copy(unit_scratch, unit_scratch + static_cast<std::ptrdiff_t>(dim), rot_scratch);
+  rotation.apply_with_scratch(std::span<float>(rot_scratch, dim),
+                              std::span<float>(unit_scratch, dim));
+
+  double dot = 0.0;
+  double yhat_norm2 = 0.0;
+  for (std::size_t i = 0; i < dim; ++i) {
+    const std::size_t code = quantize_coord(rot_scratch[i], boundaries);
+    const float c = centroids[code];
+    yhat_out[i] = c;
+    dot += static_cast<double>(rot_scratch[i]) * c;
+    yhat_norm2 += static_cast<double>(c) * c;
+  }
+  const float alpha =
+      (yhat_norm2 > kDegenerateInnerEps) ? static_cast<float>(dot / yhat_norm2) : 0.f;
+
+  float v_norm2 = 0.f;
+  for (std::size_t i = 0; i < dim; ++i) {
+    const float vi = alpha * yhat_out[i];
+    yhat_out[i] = vi;
+    v_norm2 += vi * vi;
+  }
+  return v_norm2;
+}
 
 }  // namespace
 
@@ -78,46 +145,6 @@ LandmarkIndex::LandmarkIndex(std::size_t dim, std::size_t scan_bits, std::size_t
   lm_centroids_ = std::move(lm_cb.second);
   landmark_basis_ = make_ortho_landmarks(dim_, n_landmarks_, landmark_seed_);
   landmark_basis_q4_ = quantize_landmarks(landmark_basis_, dim_, n_landmarks_);
-  rotate_scratch_.resize(dim_);
-}
-
-void LandmarkIndex::encode_row(const float* src, float* unit_out, float* landmark_row_out,
-                               float* residual_out) {
-  l2_normalize_into(src, unit_out, dim_);
-  std::copy(unit_out, unit_out + static_cast<std::ptrdiff_t>(dim_), rotate_scratch_.begin());
-  rotation_.apply(rotate_scratch_);
-
-  double dot = 0.0;
-  double yhat_norm2 = 0.0;
-  std::vector<float> yhat(dim_);
-  for (std::size_t i = 0; i < dim_; ++i) {
-    const std::size_t code = quantize_coord(rotate_scratch_[i], boundaries_);
-    const float c = centroids_[code];
-    yhat[i] = c;
-    dot += static_cast<double>(rotate_scratch_[i]) * c;
-    yhat_norm2 += static_cast<double>(c) * c;
-  }
-  const float alpha =
-      (yhat_norm2 > kDegenerateInnerEps) ? static_cast<float>(dot / yhat_norm2) : 0.f;
-
-  std::fill(landmark_row_out, landmark_row_out + scan_dim_, 0.f);
-  double land_norm2 = 0.0;
-  double v_norm2 = 0.0;
-  for (std::size_t i = 0; i < dim_; ++i) {
-    const double vi = static_cast<double>(alpha) * yhat[i];
-    v_norm2 += vi * vi;
-  }
-  for (std::size_t j = 0; j < n_landmarks_; ++j) {
-    double s = 0.0;
-    const float* Lj = landmark_basis_.data() + j * dim_;
-    for (std::size_t i = 0; i < dim_; ++i) {
-      s += static_cast<double>(alpha * yhat[i]) * Lj[i];
-    }
-    landmark_row_out[j] = static_cast<float>(s);
-    land_norm2 += s * s;
-  }
-  // ‖r‖ = ‖(α·ŷ) - P_L(α·ŷ)‖ with orthonormal L columns.
-  *residual_out = static_cast<float>(std::sqrt(std::max(0.0, v_norm2 - land_norm2)));
 }
 
 void LandmarkIndex::add(std::span<const float> vectors) {
@@ -130,26 +157,69 @@ void LandmarkIndex::add(std::span<const float> vectors) {
   }
   const std::size_t base = n_vectors_;
   n_vectors_ += n;
-  db_unit_.resize(n_vectors_ * dim_);
   landmark_rows_.resize(n_vectors_ * scan_dim_);
   residual_norms_.resize(n_vectors_);
   prepared_ = false;
 
-  for (std::size_t i = 0; i < n; ++i) {
-    encode_row(vectors.data() + i * dim_, db_unit_.data() + (base + i) * dim_,
-               landmark_rows_.data() + (base + i) * scan_dim_, &residual_norms_[base + i]);
+  // Process in row tiles so α·ŷ fits in cache while L is reused across the tile.
+  constexpr std::size_t kTile = 64;
+  const float* L = landmark_basis_.data();
+  const std::size_t dim = dim_;
+  const std::size_t m = n_landmarks_;
+  const std::size_t scan_dim = scan_dim_;
+  const auto boundaries = std::span<const float>(boundaries_);
+  const auto centroids = std::span<const float>(centroids_);
+  const Rotation& rotation = rotation_;
+
+  for (std::size_t tile = 0; tile < n; tile += kTile) {
+    const std::size_t tile_n = std::min(kTile, n - tile);
+    std::vector<float> Y(tile_n * dim);
+    std::vector<float> v_norm2(tile_n);
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+      std::vector<float> unit_scratch(dim);
+      std::vector<float> rot_scratch(dim);
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+      for (int ii = 0; ii < static_cast<int>(tile_n); ++ii) {
+        const std::size_t i = static_cast<std::size_t>(ii);
+        const float* src = vectors.data() + (tile + i) * dim;
+        float* yhat = Y.data() + i * dim;
+        v_norm2[i] =
+            encode_scaled_yhat(src, unit_scratch.data(), rot_scratch.data(), yhat, dim, rotation,
+                               boundaries, centroids);
+      }
+    }
+
+    float* lm_out = landmark_rows_.data() + (base + tile) * scan_dim;
+    project_rows_onto_landmarks(Y.data(), tile_n, dim, L, m, lm_out, scan_dim);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int ii = 0; ii < static_cast<int>(tile_n); ++ii) {
+      const std::size_t i = static_cast<std::size_t>(ii);
+      const float* row = lm_out + i * scan_dim;
+      const float land_norm2 = norm_sq_f32(row, m);
+      residual_norms_[base + tile + i] =
+          std::sqrt(std::max(0.f, v_norm2[i] - land_norm2));
+    }
   }
 }
 
 void LandmarkIndex::prepare() {
-  // Drop unit floats — single-scan path does not keep full-dim re-rank codes.
-  db_unit_.clear();
-  db_unit_.shrink_to_fit();
-
   // L2-normalize landmark rows for TurboQuant-style α, then FastScan-pack.
   std::vector<float> unit_lm(n_vectors_ * scan_dim_);
   std::vector<float> norms(n_vectors_);
-  for (std::size_t i = 0; i < n_vectors_; ++i) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int ii = 0; ii < static_cast<int>(n_vectors_); ++ii) {
+    const std::size_t i = static_cast<std::size_t>(ii);
     const float* src = landmark_rows_.data() + i * scan_dim_;
     float* dst = unit_lm.data() + i * scan_dim_;
     norms[i] = l2_normalize_into(src, dst, scan_dim_);
@@ -159,25 +229,32 @@ void LandmarkIndex::prepare() {
   scales_.clear();
   encode_prerotated(unit_lm, norms, n_vectors_, scan_dim_, lm_boundaries_, lm_centroids_,
                     scan_bits_, nullptr, packed, scales_);
-  auto repacked = repack(packed, n_vectors_, scan_bits_, scan_dim_);
-  blocked_codes_ = std::move(repacked.first);
-  n_blocks_ = repacked.second;
 
-  // Optional planes layout: sign region for shortlist + flat codes for densified exact.
+  // Single extract → pack; reuse flat codes for planes densify path.
+  const std::size_t n_byte_groups = scan_dim_ / (8 / scan_bits_);
+  codes_flat_ = codes_flat_from_packed(packed, n_vectors_, scan_bits_, scan_dim_);
+  auto packed_search = pack_flat_for_search(codes_flat_, n_vectors_, scan_bits_, n_byte_groups);
+  blocked_codes_ = std::move(packed_search.first);
+  n_blocks_ = packed_search.second;
+
   sign_codes_.clear();
   sign_n_blocks_ = 0;
-  codes_flat_.clear();
-  const std::size_t n_byte_groups = scan_dim_ / (8 / scan_bits_);
   if (planes_wanted(scan_bits_, n_byte_groups, n_vectors_)) {
     auto sign = planes_repack_sign(packed, n_vectors_, scan_bits_, scan_dim_);
     sign_codes_ = std::move(sign.first);
     sign_n_blocks_ = sign.second;
-    codes_flat_ = codes_flat_from_packed(packed, n_vectors_, scan_bits_, scan_dim_);
+  } else {
+    codes_flat_.clear();
+    codes_flat_.shrink_to_fit();
   }
 
   // Pack α and ‖r‖ as AoS pairs so flush loads one stream.
   scale_resid_.resize(2 * n_vectors_);
-  for (std::size_t i = 0; i < n_vectors_; ++i) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int ii = 0; ii < static_cast<int>(n_vectors_); ++ii) {
+    const std::size_t i = static_cast<std::size_t>(ii);
     scale_resid_[2 * i] = scales_[i];
     scale_resid_[2 * i + 1] = residual_norms_[i];
   }

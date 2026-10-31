@@ -25,6 +25,11 @@ FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
 # Bench parallelism: match published turbovec 8-vCPU cells.
+# Ignore ambient cluster OMP_NUM_THREADS so `make compute` always gets 8 unless
+# the user overrides on the make CLI (e.g. make compute OMP_NUM_THREADS=16).
+ifeq ($(origin OMP_NUM_THREADS),environment)
+OMP_NUM_THREADS := 8
+endif
 OMP_NUM_THREADS ?= 8
 ENV_SCRIPT    := scripts/envs.sh
 LOGIN_READY   := $(BUILD_DIR)/.login-ready
@@ -36,6 +41,11 @@ TURBOVEC_SUITE    ?= speed
 TURBOVEC_THREADS  ?= mt
 TURBOVEC_ARCH     ?=
 # Published openai-1536 4-bit staged mt cell (~0.12 ms/q) used 8 vCPUs.
+# Ignore ambient TURBOVEC_RAYON_THREADS / RAYON_NUM_THREADS so `make turbovec`
+# always gets 8 unless overridden on the make CLI.
+ifeq ($(origin TURBOVEC_RAYON_THREADS),environment)
+TURBOVEC_RAYON_THREADS := 8
+endif
 TURBOVEC_RAYON_THREADS ?= 8
 # Set to 1 to force whole-index 4-bit scan (TURBOVEC_4BIT_PLANES=0).
 TURBOVEC_FULLSCAN ?=
@@ -164,9 +174,10 @@ compute:
 		exit 1; \
 	fi
 	set -euo pipefail
+	source $(ENV_SCRIPT)
+	# Pin after envs.sh so modules cannot leave a different pool size.
 	export OMP_NUM_THREADS="$(OMP_NUM_THREADS)"
 	export RAYON_NUM_THREADS="$(TURBOVEC_RAYON_THREADS)"
-	source $(ENV_SCRIPT)
 	cmake -S . -B $(BUILD_DIR) $(CMAKE_COMPILER_FLAGS) \
 		-DFETCHCONTENT_FULLY_DISCONNECTED=ON \
 		$(CMAKE_COMPUTE_FLAGS)
@@ -216,12 +227,19 @@ turbovec-setup:
 # Default: openai-1536 4-bit staged mt speed (~0.12 ms/query published cell).
 turbovec:
 	set -euo pipefail
+	# Pin Rayon/OpenMP after any ambient cluster vars so the published 8-vCPU cell wins.
+	export TURBOVEC_RAYON_THREADS="$(TURBOVEC_RAYON_THREADS)"
+	export RAYON_NUM_THREADS="$(TURBOVEC_RAYON_THREADS)"
+	export OMP_NUM_THREADS="$(TURBOVEC_RAYON_THREADS)"
+	echo "turbovec RAYON_NUM_THREADS=$$RAYON_NUM_THREADS"
 	DATASET="$(DATASET)" BITS="$(BITS)" \
 		TURBOVEC_DIR="$(TURBOVEC_DIR)" TURBOVEC_REPO="$(TURBOVEC_REPO)" \
 		TURBOVEC_DATA_DIR="$(TURBOVEC_DATA_DIR)" DATA_DIR="$(DATA_DIR)" \
 		TURBOVEC_SUITE="$(TURBOVEC_SUITE)" TURBOVEC_THREADS="$(TURBOVEC_THREADS)" \
 		TURBOVEC_ARCH="$(TURBOVEC_ARCH)" \
 		TURBOVEC_RAYON_THREADS="$(TURBOVEC_RAYON_THREADS)" \
+		RAYON_NUM_THREADS="$(TURBOVEC_RAYON_THREADS)" \
+		OMP_NUM_THREADS="$(TURBOVEC_RAYON_THREADS)" \
 		TURBOVEC_FULLSCAN="$(TURBOVEC_FULLSCAN)" \
 		FORCE="$(FORCE)" SKIP_FAISS="$(SKIP_FAISS)" \
 		TURBOVEC_STOCK="$(TURBOVEC_STOCK)" TURBOVEC_OFFLINE=1 \

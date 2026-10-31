@@ -6,10 +6,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 option(VECTORCACHE_BUILD_GLOVE "Enable GloVe HDF5 reader" ON)
 option(VECTORCACHE_BUILD_TOOLS "Build CLI tools" ON)
 option(VECTORCACHE_BUILD_TESTS "Build GoogleTest suite" ON)
 option(VECTORCACHE_OPENMP "Enable OpenMP parallelism" ON)
+option(VECTORCACHE_NATIVE "Enable -march=native / host ISA" OFF)
 option(VECTORCACHE_FETCH_DATASETS "Build fetch-datasets (requires libcurl)" ON)
 option(VECTORCACHE_FETCH_OPENAI "Download/convert OpenAI parquet shards (requires Arrow)" ON)
 
@@ -55,7 +60,11 @@ else()
   target_compile_options(vectorcache PRIVATE
     -Wall -Wextra
     -mavx2 -mfma
+    -ffp-contract=fast
   )
+  if(VECTORCACHE_NATIVE)
+    target_compile_options(vectorcache PRIVATE -march=native)
+  endif()
   # Compile SIMD search TUs with broader ISA; runtime dispatch selects path.
   set_source_files_properties(src/search/search_avx2.cpp PROPERTIES
     COMPILE_OPTIONS "-mavx2;-mfma")

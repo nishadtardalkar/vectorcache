@@ -105,7 +105,11 @@ std::vector<std::uint8_t> extract_codes_flat(std::span<const std::uint8_t> packe
   const std::size_t n_out = 8 / codes_per_byte;
   const auto& lut = extract_lut(bits);
   std::vector<std::uint8_t> codes_flat(n_vectors * n_byte_groups);
-  for (std::size_t vec_idx = 0; vec_idx < n_vectors; ++vec_idx) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int v = 0; v < static_cast<int>(n_vectors); ++v) {
+    const std::size_t vec_idx = static_cast<std::size_t>(v);
     const std::size_t base = vec_idx * bytes_per_row;
     auto* row = codes_flat.data() + vec_idx * n_byte_groups;
     for (std::size_t c = 0; c < bytes_per_plane; ++c) {
@@ -130,7 +134,11 @@ std::vector<std::uint8_t> pack_blocked_sequential(std::size_t n, std::size_t n_b
                                                  std::size_t n_byte_groups, std::size_t blocked_size,
                                                  std::span<const std::uint8_t> codes_flat) {
   std::vector<std::uint8_t> blocked(blocked_size, 0);
-  for (std::size_t block_idx = 0; block_idx < n_blocks; ++block_idx) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int bi = 0; bi < static_cast<int>(n_blocks); ++bi) {
+    const std::size_t block_idx = static_cast<std::size_t>(bi);
     const std::size_t base_vec = block_idx * kBlock;
     for (std::size_t g = 0; g < n_byte_groups; ++g) {
       const std::size_t out_offset = (block_idx * n_byte_groups + g) * kBlock;
@@ -151,7 +159,11 @@ std::vector<std::uint8_t> pack_blocked_perm0(std::size_t n, std::size_t n_blocks
                                              std::span<const std::uint8_t> codes_flat) {
   // 192×1: PERM0 only defined on 32-lane tiles — pack each kFlushChunk sub-tile.
   std::vector<std::uint8_t> blocked(blocked_size, 0);
-  for (std::size_t block_idx = 0; block_idx < n_blocks; ++block_idx) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int bi = 0; bi < static_cast<int>(n_blocks); ++bi) {
+    const std::size_t block_idx = static_cast<std::size_t>(bi);
     const std::size_t base_vec = block_idx * kBlock;
     for (std::size_t g = 0; g < n_byte_groups; ++g) {
       const std::size_t out_offset = (block_idx * n_byte_groups + g) * kBlock;
@@ -485,7 +497,11 @@ std::pair<std::vector<std::uint8_t>, std::size_t> planes_repack_sign(
   const std::size_t bytes_per_row = bits * nsg;
   const std::size_t sign_off = (bits - 1) * nsg;
   std::vector<std::uint8_t> sign_rows(n_vectors * nsg);
-  for (std::size_t v = 0; v < n_vectors; ++v) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int vv = 0; vv < static_cast<int>(n_vectors); ++vv) {
+    const std::size_t v = static_cast<std::size_t>(vv);
     const std::uint8_t* row = packed_codes.data() + v * bytes_per_row + sign_off;
     std::memcpy(sign_rows.data() + v * nsg, row, nsg);
   }
@@ -495,7 +511,11 @@ std::pair<std::vector<std::uint8_t>, std::size_t> planes_repack_sign(
     const std::size_t n_blocks = (n_vectors + kSignBlock - 1) / kSignBlock;
     const std::size_t blocked_len = n_blocks * nsg * kSignBlock;
     std::vector<std::uint8_t> blocked(blocked_len, 0);
-    for (std::size_t block_idx = 0; block_idx < n_blocks; ++block_idx) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int bi = 0; bi < static_cast<int>(n_blocks); ++bi) {
+      const std::size_t block_idx = static_cast<std::size_t>(bi);
       const std::size_t base_vec = block_idx * kSignBlock;
       for (std::size_t g = 0; g < nsg; ++g) {
         const std::size_t out_offset = (block_idx * nsg + g) * kSignBlock;

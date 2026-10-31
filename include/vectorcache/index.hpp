@@ -36,8 +36,6 @@ class LandmarkIndex {
   SearchResults search(std::span<const float> queries, std::size_t k) const;
 
  private:
-  void encode_row(const float* src, float* unit_out, float* landmark_row_out, float* residual_out);
-
   std::size_t dim_;
   std::size_t scan_bits_;    // landmark FastScan quant
   std::size_t rerank_bits_;  // unused at search (ABI / ingest codebook for ŷ)
@@ -51,7 +49,6 @@ class LandmarkIndex {
   std::vector<float> lm_centroids_;
   std::vector<float> landmark_basis_;       // dim * m float (ingest / residual)
   QuantizedLandmarks landmark_basis_q4_;    // 4-bit packed query projection
-  std::vector<float> db_unit_;              // n * dim (scratch until prepare)
   std::vector<float> landmark_rows_;   // n * scan_dim (row-major before prepare)
   std::vector<float> residual_norms_;  // ‖r‖ of (α·ŷ) orthogonal to landmarks
   std::vector<std::uint8_t> blocked_codes_;  // landmark FastScan (full 4-bit)
@@ -65,7 +62,6 @@ class LandmarkIndex {
   mutable std::size_t sign_n_blocks_ = 0;
   std::size_t n_vectors_ = 0;
   mutable bool prepared_ = false;
-  mutable std::vector<float> rotate_scratch_;
 };
 
 using TurboQuantIndex = LandmarkIndex;

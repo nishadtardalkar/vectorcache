@@ -113,7 +113,7 @@ float fused_quantize_scale_pack(std::span<const float> rot_orig, std::span<const
                                 std::span<const float> scale_tq, std::span<const float> inv_scale_tq,
                                 std::span<const float> boundaries, std::span<const float> centroids,
                                 float norm, std::span<std::uint8_t> packed_row, std::size_t dim,
-                                std::size_t bits, std::size_t bytes_per_plane) {
+                                std::size_t bits, std::size_t bytes_per_plane, bool identity_cal) {
   double chains[4] = {};
   const std::size_t chunks = dim / 8;
   const std::size_t n_bounds = (1u << bits) - 1;
@@ -122,18 +122,27 @@ float fused_quantize_scale_pack(std::span<const float> rot_orig, std::span<const
     std::uint8_t codes[8];
     for (std::size_t k = 0; k < 8; ++k) {
       const std::size_t j = offset + k;
-      const float calib = (rot_orig[j] + shift[j]) * scale_tq[j];
       std::uint8_t v = 0;
-      for (std::size_t bi = 0; bi < n_bounds; ++bi) {
-        if (calib > boundaries[bi]) {
-          ++v;
+      if (identity_cal) {
+        const float x = rot_orig[j];
+        for (std::size_t bi = 0; bi < n_bounds; ++bi) {
+          v = static_cast<std::uint8_t>(v + static_cast<std::uint8_t>(x > boundaries[bi]));
         }
+        codes[k] = v;
+        chains[j % 4] += static_cast<double>(x) * static_cast<double>(centroids[v]);
+      } else {
+        const float calib = (rot_orig[j] + shift[j]) * scale_tq[j];
+        for (std::size_t bi = 0; bi < n_bounds; ++bi) {
+          if (calib > boundaries[bi]) {
+            ++v;
+          }
+        }
+        codes[k] = v;
+        const double centroid_in_orig =
+            recon_entry(centroids[v], static_cast<double>(inv_scale_tq[j]),
+                        static_cast<double>(shift[j]));
+        chains[j % 4] += static_cast<double>(rot_orig[j]) * centroid_in_orig;
       }
-      codes[k] = v;
-      const double centroid_in_orig =
-          recon_entry(centroids[v], static_cast<double>(inv_scale_tq[j]),
-                      static_cast<double>(shift[j]));
-      chains[j % 4] += static_cast<double>(rot_orig[j]) * centroid_in_orig;
     }
     for (std::size_t p = 0; p < bits; ++p) {
       std::uint8_t byte = 0;
@@ -192,8 +201,12 @@ void encode_prerotated_impl(std::span<const float> rotated, std::span<const floa
     scale_tq = identity_scale;
   }
   std::vector<float> inv_scale_tq(dim);
+  bool identity_cal = (calibration == nullptr);
   for (std::size_t d = 0; d < dim; ++d) {
     inv_scale_tq[d] = 1.f / scale_tq[d];
+    if (shift[d] != 0.f || scale_tq[d] != 1.f) {
+      identity_cal = false;
+    }
   }
 
   const std::size_t bytes_per_plane = dim / 8;
@@ -213,7 +226,7 @@ void encode_prerotated_impl(std::span<const float> rotated, std::span<const floa
                                 bytes_per_row);
     scales_out[scales_old + static_cast<std::size_t>(i)] = fused_quantize_scale_pack(
         rot, shift, scale_tq, inv_scale_tq, boundaries, centroids, norms[static_cast<std::size_t>(i)],
-        packed_row, dim, bit_width, bytes_per_plane);
+        packed_row, dim, bit_width, bytes_per_plane, identity_cal);
   }
 }
 

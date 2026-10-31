@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -94,12 +97,42 @@ inline std::int32_t dot_i8_q4_scalar(const std::int8_t* q, const std::uint8_t* p
   return acc;
 }
 
-}  // namespace
+#if defined(__x86_64__) || defined(_M_X64)
+inline float hsum256_ps(__m256 v) {
+  __m128 lo = _mm256_castps256_ps128(v);
+  __m128 hi = _mm256_extractf128_ps(v, 1);
+  lo = _mm_add_ps(lo, hi);
+  lo = _mm_hadd_ps(lo, lo);
+  lo = _mm_hadd_ps(lo, lo);
+  return _mm_cvtss_f32(lo);
+}
 
-std::vector<float> make_ortho_landmarks(std::size_t dim, std::size_t m, std::uint64_t seed) {
-  if (dim == 0 || m == 0 || m > dim) {
-    throw std::invalid_argument("landmarks require 0 < m <= dim");
+inline float dot_f32_avx2(const float* a, const float* b, std::size_t dim) {
+  __m256 acc = _mm256_setzero_ps();
+  std::size_t i = 0;
+  for (; i + 8 <= dim; i += 8) {
+    const __m256 va = _mm256_loadu_ps(a + i);
+    const __m256 vb = _mm256_loadu_ps(b + i);
+    acc = _mm256_fmadd_ps(va, vb, acc);
   }
+  float s = hsum256_ps(acc);
+  for (; i < dim; ++i) {
+    s += a[i] * b[i];
+  }
+  return s;
+}
+#else
+inline float dot_f32_avx2(const float* a, const float* b, std::size_t dim) {
+  float s = 0.f;
+  for (std::size_t i = 0; i < dim; ++i) {
+    s += a[i] * b[i];
+  }
+  return s;
+}
+#endif
+
+std::vector<float> make_ortho_landmarks_uncached(std::size_t dim, std::size_t m,
+                                                 std::uint64_t seed) {
   std::mt19937_64 rng(seed);
   std::normal_distribution<double> nd(0.0, 1.0);
   std::vector<double> A(static_cast<std::size_t>(dim) * m);
@@ -138,6 +171,66 @@ std::vector<float> make_ortho_landmarks(std::size_t dim, std::size_t m, std::uin
     L[i] = static_cast<float>(A[i]);
   }
   return L;
+}
+
+std::mutex g_landmark_memo_mu;
+std::map<std::tuple<std::size_t, std::size_t, std::uint64_t>, std::vector<float>> g_landmark_memo;
+
+}  // namespace
+
+std::vector<float> make_ortho_landmarks(std::size_t dim, std::size_t m, std::uint64_t seed) {
+  if (dim == 0 || m == 0 || m > dim) {
+    throw std::invalid_argument("landmarks require 0 < m <= dim");
+  }
+  const auto key = std::make_tuple(dim, m, seed);
+  {
+    std::lock_guard lock(g_landmark_memo_mu);
+    auto it = g_landmark_memo.find(key);
+    if (it != g_landmark_memo.end()) {
+      return it->second;
+    }
+  }
+  auto computed = make_ortho_landmarks_uncached(dim, m, seed);
+  {
+    std::lock_guard lock(g_landmark_memo_mu);
+    auto [it, inserted] = g_landmark_memo.emplace(key, computed);
+    if (!inserted) {
+      return it->second;
+    }
+  }
+  return computed;
+}
+
+void project_rows_onto_landmarks(const float* Y, std::size_t n, std::size_t dim, const float* L,
+                                 std::size_t m, float* out, std::size_t out_stride) {
+  if (n == 0 || m == 0) {
+    return;
+  }
+  if (out_stride < m) {
+    throw std::invalid_argument("project_rows_onto_landmarks: out_stride < m");
+  }
+  constexpr std::size_t kLmTile = 8;
+  const std::size_t m_aligned = m & ~(kLmTile - 1);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int ii = 0; ii < static_cast<int>(n); ++ii) {
+    const std::size_t i = static_cast<std::size_t>(ii);
+    const float* y = Y + i * dim;
+    float* dest = out + i * out_stride;
+    for (std::size_t j0 = 0; j0 < m_aligned; j0 += kLmTile) {
+      for (std::size_t t = 0; t < kLmTile; ++t) {
+        dest[j0 + t] = dot_f32_avx2(y, L + (j0 + t) * dim, dim);
+      }
+    }
+    for (std::size_t j = m_aligned; j < m; ++j) {
+      dest[j] = dot_f32_avx2(y, L + j * dim, dim);
+    }
+    for (std::size_t j = m; j < out_stride; ++j) {
+      dest[j] = 0.f;
+    }
+  }
 }
 
 QuantizedLandmarks quantize_landmarks(std::span<const float> L, std::size_t dim, std::size_t m) {

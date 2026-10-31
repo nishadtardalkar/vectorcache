@@ -40,6 +40,10 @@ class NpyReader : public DatasetReader {
   /// Zero-copy view of the next vector when backed by mmap or owned storage.
   std::optional<std::span<const float>> next_vector_span();
 
+  /// Bulk memcpy of the next `n` vectors into a contiguous float buffer (n*dim).
+  /// Advances the reader by the number of rows copied. Returns rows copied.
+  std::size_t copy_rows_into(std::span<float> out, std::size_t n);
+
  private:
   NpyReader(std::vector<char> owned_data, detail::MmapRegion mmap, const char* label,
             std::size_t dim, std::size_t count, std::size_t data_offset);

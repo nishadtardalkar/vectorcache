@@ -6,6 +6,10 @@
 #include <cmath>
 #include <stdexcept>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #include "vectorcache/chacha8.hpp"
 
 namespace vectorcache {
@@ -30,6 +34,40 @@ std::vector<std::uint32_t> fisher_yates(std::size_t dim, ChaCha8Rng& rng) {
   return perm;
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+void wht_block_avx2(float* blk, std::size_t block, float inv_sqrt_block) {
+  for (std::size_t len = 1; len < block; len <<= 1) {
+    if (len >= 8) {
+      for (std::size_t i = 0; i < block; i += 2 * len) {
+        for (std::size_t j = i; j < i + len; j += 8) {
+          const __m256 a = _mm256_loadu_ps(blk + j);
+          const __m256 b = _mm256_loadu_ps(blk + j + len);
+          _mm256_storeu_ps(blk + j, _mm256_add_ps(a, b));
+          _mm256_storeu_ps(blk + j + len, _mm256_sub_ps(a, b));
+        }
+      }
+    } else {
+      for (std::size_t i = 0; i < block; i += 2 * len) {
+        for (std::size_t j = i; j < i + len; ++j) {
+          const float a = blk[j];
+          const float b = blk[j + len];
+          blk[j] = a + b;
+          blk[j + len] = a - b;
+        }
+      }
+    }
+  }
+  const __m256 scale = _mm256_set1_ps(inv_sqrt_block);
+  std::size_t i = 0;
+  for (; i + 8 <= block; i += 8) {
+    _mm256_storeu_ps(blk + i, _mm256_mul_ps(_mm256_loadu_ps(blk + i), scale));
+  }
+  for (; i < block; ++i) {
+    blk[i] *= inv_sqrt_block;
+  }
+}
+#endif
+
 void wht_block_scalar(float* blk, std::size_t block, float inv_sqrt_block) {
   for (std::size_t len = 1; len < block; len <<= 1) {
     for (std::size_t i = 0; i < block; i += 2 * len) {
@@ -48,15 +86,38 @@ void wht_block_scalar(float* blk, std::size_t block, float inv_sqrt_block) {
 
 void wht_all(float* buf, std::size_t dim, std::size_t block, float inv_sqrt_block) {
   for (std::size_t offset = 0; offset < dim; offset += block) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (block >= 8) {
+      wht_block_avx2(buf + offset, block, inv_sqrt_block);
+    } else {
+      wht_block_scalar(buf + offset, block, inv_sqrt_block);
+    }
+#else
     wht_block_scalar(buf + offset, block, inv_sqrt_block);
+#endif
   }
 }
 
 void permute_gather_signed(const float* src, const std::uint32_t* perm, const float* signs,
                            float inv, float* dst, std::size_t dim) {
+#if defined(__x86_64__) || defined(_M_X64)
+  const __m256 vinv = _mm256_set1_ps(inv);
+  std::size_t i = 0;
+  for (; i + 8 <= dim; i += 8) {
+    // Gather is OK here: perm is random so cache misses dominate either way.
+    const __m256i idx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(perm + i));
+    const __m256 gathered = _mm256_i32gather_ps(src, idx, 4);
+    const __m256 sgn = _mm256_loadu_ps(signs + i);
+    _mm256_storeu_ps(dst + i, _mm256_mul_ps(_mm256_mul_ps(gathered, vinv), sgn));
+  }
+  for (; i < dim; ++i) {
+    dst[i] = (src[perm[i]] * inv) * signs[i];
+  }
+#else
   for (std::size_t i = 0; i < dim; ++i) {
     dst[i] = (src[perm[i]] * inv) * signs[i];
   }
+#endif
 }
 
 }  // namespace
@@ -85,8 +146,12 @@ Rotation::Rotation(std::size_t dim) : dim_(dim) {
 }
 
 void Rotation::apply(std::span<float> row) const {
-  std::vector<float> scratch(dim_);
-  apply_with_scratch(row, scratch);
+  // Thread-local scratch avoids per-call heap traffic on the hot ingest path.
+  thread_local std::vector<float> scratch;
+  if (scratch.size() < dim_) {
+    scratch.resize(dim_);
+  }
+  apply_with_scratch(row, std::span<float>(scratch.data(), dim_));
 }
 
 void Rotation::apply_with_scratch(std::span<float> row, std::span<float> scratch) const {

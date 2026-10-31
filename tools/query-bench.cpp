@@ -46,23 +46,46 @@ Matrix load_from_reader(vectorcache::datasets::DatasetReader& reader, std::size_
   return m;
 }
 
+Matrix load_npy(const fs::path& path, std::size_t limit) {
+  auto reader = vectorcache::datasets::NpyReader::open(path, "npy");
+  const auto meta = reader.meta();
+  const std::size_t n = limit == 0 ? meta.count : std::min(limit, meta.count);
+  Matrix m;
+  m.rows = n;
+  m.cols = meta.dim;
+  m.data.resize(n * meta.dim);
+  const std::size_t got = reader.copy_rows_into(m.data, n);
+  if (got != n) {
+    m.rows = got;
+    m.data.resize(got * meta.dim);
+  }
+  return m;
+}
+
 Matrix load_dataset(const std::string& dataset, const fs::path& data_dir,
                     vectorcache::datasets::DatasetSplit split, std::size_t limit) {
   auto kind = vectorcache::datasets::parse_dataset_kind(dataset);
   if (!kind) {
     throw std::runtime_error("unknown dataset: " + dataset);
   }
+  // OpenAI corpora are contiguous NPY — bulk memcpy instead of per-row copies.
+  if (*kind == vectorcache::datasets::DatasetKind::OpenAi1536 ||
+      *kind == vectorcache::datasets::DatasetKind::OpenAi3072) {
+    if (split == vectorcache::datasets::DatasetSplit::Test) {
+      throw std::runtime_error("OpenAI NPY datasets do not have a test split");
+    }
+    return load_npy(vectorcache::datasets::dataset_path(*kind, data_dir), limit);
+  }
   auto reader = vectorcache::datasets::OpenDatasetReader::open(*kind, data_dir, split);
   return load_from_reader(reader, limit);
 }
 
-Matrix load_npy(const fs::path& path, std::size_t limit) {
-  auto reader = vectorcache::datasets::NpyReader::open(path, "npy");
-  return load_from_reader(reader, limit);
-}
-
 void l2_normalize_rows(Matrix& m) {
-  for (std::size_t i = 0; i < m.rows; ++i) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int ii = 0; ii < static_cast<int>(m.rows); ++ii) {
+    const std::size_t i = static_cast<std::size_t>(ii);
     float* row = m.data.data() + i * m.cols;
     double s = 0.0;
     for (std::size_t d = 0; d < m.cols; ++d) s += static_cast<double>(row[d]) * row[d];
@@ -455,9 +478,13 @@ int main(int argc, char** argv) {
                                      effective_rerank_bits);
     const auto t0 = std::chrono::steady_clock::now();
     index.add(db.data);
+    const auto t_add = std::chrono::steady_clock::now();
     index.prepare();
     const auto t1 = std::chrono::steady_clock::now();
-    std::cout << "ingest_ms=" << std::chrono::duration<double, std::milli>(t1 - t0).count() << "\n"
+    const double add_ms = std::chrono::duration<double, std::milli>(t_add - t0).count();
+    const double prepare_ms = std::chrono::duration<double, std::milli>(t1 - t_add).count();
+    std::cout << "ingest_ms=" << (add_ms + prepare_ms) << " add_ms=" << add_ms
+              << " prepare_ms=" << prepare_ms << "\n"
               << std::flush;
 
     if (!recall) {
