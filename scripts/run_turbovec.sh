@@ -18,11 +18,16 @@
 #   TURBOVEC_ARCH      x86 | arm  (default: auto)
 #   FORCE=1            rebuild wheel even if import works
 #   SKIP_FAISS=1       for speed suite: time turbovec only (no FAISS)
+#   TURBOVEC_STOCK=1   run upstream benchmarks/suite/*.py as-is (may OOM on full npy)
 #   SETUP_ONLY=1       clone + data + bindings; do not run a suite script
 #   TURBOVEC_OFFLINE=1 no git/pip network (default for `make turbovec`)
 #
 # turbovec-setup bootstraps from a clean machine: rustup (if no cargo),
 # maturin, numpy, and faiss-cpu (unless SKIP_FAISS=1).
+#
+# Speed suite default is a mmap harness matching the official protocol
+# (100k+1k, seed=42, k=64, median of 5) — stock scripts np.load the whole
+# corpus then train FAISS PQFastScan(m=dim), which often gets SIGKILL/OOM.
 
 set -euo pipefail
 
@@ -37,6 +42,7 @@ TURBOVEC_SUITE="${TURBOVEC_SUITE:-speed}"
 TURBOVEC_THREADS="${TURBOVEC_THREADS:-mt}"
 FORCE="${FORCE:-}"
 SKIP_FAISS="${SKIP_FAISS:-}"
+TURBOVEC_STOCK="${TURBOVEC_STOCK:-}"
 SETUP_ONLY="${SETUP_ONLY:-}"
 TURBOVEC_OFFLINE="${TURBOVEC_OFFLINE:-}"
 # Rust + cargo target dir must live on an exec-capable filesystem. Shared project
@@ -464,43 +470,122 @@ suite_script() {
   esac
 }
 
-run_speed_tq_only() {
-  # Same timing protocol as suite/speed_*.py but skip FAISS (faster local loop).
+run_speed_harness() {
+  # Official protocol with mmap: 100k DB + 1k queries, seed=42, k=64, median of 5.
+  # TQ is timed first and written out so a later FAISS OOM still leaves TQ numbers.
   local dim="${DATASET#openai-}"
-  "$PYTHON" - "$dim" "$BITS" "$TURBOVEC_DATA_DIR" <<'PY'
+  local tag
+  tag="$(dim_tag_for_dataset "$DATASET")"
+  local out_json="$TURBOVEC_DIR/benchmarks/results/speed_${tag}_${BITS}bit_${TURBOVEC_ARCH}_${TURBOVEC_THREADS}.json"
+  local skip_faiss=0
+  [[ -n "$SKIP_FAISS" ]] && skip_faiss=1
+
+  if [[ "$TURBOVEC_THREADS" == st ]]; then
+    export RAYON_NUM_THREADS=1
+  else
+    unset RAYON_NUM_THREADS || true
+  fi
+
+  echo "Speed harness (mmap, seed=42, n=100000, nq=1000, k=64, median of 5)"
+  echo "  arch=$TURBOVEC_ARCH threads=$TURBOVEC_THREADS skip_faiss=$skip_faiss"
+  echo "  writing $out_json"
+
+  "$PYTHON" - "$dim" "$BITS" "$TURBOVEC_DATA_DIR" "$TURBOVEC_ARCH" "$TURBOVEC_THREADS" "$skip_faiss" "$out_json" <<'PY'
 import os, sys, time, json
 import numpy as np
 from turbovec import TurboQuantIndex
 
-dim, bits, data_dir = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+dim = int(sys.argv[1])
+bits = int(sys.argv[2])
+data_dir = sys.argv[3]
+arch = sys.argv[4]
+threading = sys.argv[5]
+skip_faiss = sys.argv[6] == "1"
+out_json = sys.argv[7]
+
 path = os.path.join(data_dir, f"openai-{dim}.npy")
-all_vecs = np.load(path)
+print(f"Loading {path} (mmap) ...", flush=True)
+all_vecs = np.load(path, mmap_mode="r")
+n_all = int(all_vecs.shape[0])
+if n_all < 101_000:
+    raise SystemExit(f"need >= 101000 rows, got {n_all}")
+if int(all_vecs.shape[1]) != dim:
+    raise SystemExit(f"expected dim={dim}, got {all_vecs.shape[1]}")
+
 rng = np.random.RandomState(42)
-idx = rng.permutation(len(all_vecs))
-database = all_vecs[idx[:100_000]].astype(np.float32, copy=False)
-queries = all_vecs[idx[100_000:101_000]].astype(np.float32, copy=False)
-database /= np.linalg.norm(database, axis=-1, keepdims=True)
-queries /= np.linalg.norm(queries, axis=-1, keepdims=True)
+idx = rng.permutation(n_all)
+# Materialize only the 101k rows we need (full 1M np.load is what OOMs).
+database = np.asarray(all_vecs[idx[:100_000]], dtype=np.float32)
+queries = np.asarray(all_vecs[idx[100_000:101_000]], dtype=np.float32)
+del all_vecs
+database /= np.linalg.norm(database, axis=-1, keepdims=True).astype(np.float32)
+queries /= np.linalg.norm(queries, axis=-1, keepdims=True).astype(np.float32)
+print(f"corpus ready: n={len(database)} nq={len(queries)} dim={dim}", flush=True)
 
 tq = TurboQuantIndex(dim=dim, bit_width=bits)
 tq.add(database)
 tq.search(queries[:1], k=64)
-times = []
+tq_times = []
 for _ in range(5):
     t0 = time.perf_counter()
     tq.search(queries, k=64)
-    times.append((time.perf_counter() - t0) / len(queries) * 1000)
-ms = sorted(times)[2]
-out = {
+    tq_times.append((time.perf_counter() - t0) / len(queries) * 1000)
+tq_ms = sorted(tq_times)[2]
+result = {
     "dim": dim,
     "bit_width": bits,
+    "arch": arch,
+    "threading": threading,
     "n": int(len(database)),
     "nq": int(len(queries)),
     "k": 64,
-    "tq_ms_per_query": round(ms, 6),
-    "runs_ms_per_query": [round(t, 6) for t in times],
+    "seed": 42,
+    "tq_ms_per_query": round(tq_ms, 3),
+    "tq_runs_ms_per_query": [round(t, 3) for t in tq_times],
 }
-print(json.dumps(out, indent=2))
+print(json.dumps(result, indent=2), flush=True)
+os.makedirs(os.path.dirname(out_json), exist_ok=True)
+with open(out_json, "w") as f:
+    json.dump(result, f, indent=2)
+print(f"Wrote TQ result to {out_json}", flush=True)
+
+if skip_faiss:
+    print("SKIP_FAISS=1 — done (TQ only).", flush=True)
+    raise SystemExit(0)
+
+print("Building FAISS IndexPQFastScan (memory-heavy; may OOM / SIGKILL) ...", flush=True)
+import faiss
+
+if threading == "st":
+    faiss.omp_set_num_threads(1)
+
+# Match suite/speed_d*_4bit_*: m_pq = dim for 4-bit, m_pq = dim // 2 for 2-bit.
+m_pq = dim if bits == 4 else dim // 2
+nbits = 4 if bits == 4 else 4  # FastScan scripts use nbits=4 with m matched to rate
+if bits == 2:
+    # stock 2-bit scripts: IndexPQFastScan(DIM, DIM // 2, 4) — codes pack 2-bit into 4-bit nibbles
+    m_pq = dim // 2
+    nbits = 4
+else:
+    m_pq = dim
+    nbits = 4
+
+pq = faiss.IndexPQFastScan(dim, m_pq, nbits)
+pq.train(database)
+pq.add(database)
+pq.search(queries[:1], 64)
+faiss_times = []
+for _ in range(5):
+    t0 = time.perf_counter()
+    pq.search(queries, 64)
+    faiss_times.append((time.perf_counter() - t0) / len(queries) * 1000)
+faiss_ms = sorted(faiss_times)[2]
+result["faiss_ms_per_query"] = round(faiss_ms, 3)
+result["faiss_runs_ms_per_query"] = [round(t, 3) for t in faiss_times]
+print(json.dumps(result, indent=2), flush=True)
+with open(out_json, "w") as f:
+    json.dump(result, f, indent=2)
+print(f"Wrote full result to {out_json}", flush=True)
 PY
 }
 
@@ -534,8 +619,8 @@ main() {
 
   echo "=== turbovec bench: DATASET=$DATASET BITS=$BITS SUITE=$TURBOVEC_SUITE ARCH=$TURBOVEC_ARCH THREADS=$TURBOVEC_THREADS ==="
 
-  if [[ "$TURBOVEC_SUITE" == speed && -n "$SKIP_FAISS" ]]; then
-    run_speed_tq_only
+  if [[ "$TURBOVEC_SUITE" == speed && -z "$TURBOVEC_STOCK" ]]; then
+    run_speed_harness
     return
   fi
 
@@ -545,7 +630,7 @@ main() {
     echo "Suite script not found: $script" >&2
     exit 1
   fi
-  echo "Running $script"
+  echo "Running stock script $script"
   "$PYTHON" "$script"
 }
 

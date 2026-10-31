@@ -34,6 +34,7 @@ TURBOVEC_SUITE    ?= speed
 TURBOVEC_THREADS  ?= mt
 TURBOVEC_ARCH     ?=
 SKIP_FAISS        ?=
+TURBOVEC_STOCK    ?=
 TURBOVEC_SCRIPT   := scripts/run_turbovec.sh
 PYTHON            ?=
 
@@ -111,7 +112,8 @@ help:
 	@echo "  DATASET=$(DATASET)  BITS=$(BITS)  TURBOVEC_SUITE=$(TURBOVEC_SUITE)  (speed|recall)"
 	@echo "  TURBOVEC_THREADS=$(TURBOVEC_THREADS)  (mt|st)  TURBOVEC_ARCH=$(TURBOVEC_ARCH)  (x86|arm|auto)"
 	@echo "  TURBOVEC_DIR=$(TURBOVEC_DIR)  TURBOVEC_DATA_DIR=$(TURBOVEC_DATA_DIR)"
-	@echo "  SKIP_FAISS=1    speed: turbovec-only timing (no FAISS)"
+	@echo "  SKIP_FAISS=1    speed: turbovec-only (skip memory-heavy FAISS PQFastScan)"
+	@echo "  TURBOVEC_STOCK=1  use upstream suite/*.py as-is (often OOMs)"
 	@echo "  FORCE=1         rebuild turbovec wheel (login / turbovec-setup)"
 	@echo ""
 	@echo "Example: make login DATASETS=glove"
@@ -123,6 +125,7 @@ help:
 	@echo "Example: make compute BITS=2 LANDMARKS=1024 K=64"
 	@echo "Example: make turbovec-setup                    # login node (internet)"
 	@echo "Example: make turbovec DATASET=openai-1536 BITS=4 TURBOVEC_ARCH=x86 TURBOVEC_THREADS=mt"
+	@echo "Example: make turbovec ... SKIP_FAISS=1         # recommended on tight-RAM nodes"
 	@echo "Example: make turbovec TURBOVEC_SUITE=recall BITS=4"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
 
@@ -205,7 +208,7 @@ turbovec:
 		TURBOVEC_DATA_DIR="$(TURBOVEC_DATA_DIR)" DATA_DIR="$(DATA_DIR)" \
 		TURBOVEC_SUITE="$(TURBOVEC_SUITE)" TURBOVEC_THREADS="$(TURBOVEC_THREADS)" \
 		TURBOVEC_ARCH="$(TURBOVEC_ARCH)" FORCE="$(FORCE)" SKIP_FAISS="$(SKIP_FAISS)" \
-		TURBOVEC_OFFLINE=1 \
+		TURBOVEC_STOCK="$(TURBOVEC_STOCK)" TURBOVEC_OFFLINE=1 \
 		$(if $(strip $(PYTHON)),PYTHON="$(PYTHON)",) \
 		bash "$(TURBOVEC_SCRIPT)"
 
