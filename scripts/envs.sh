@@ -70,4 +70,6 @@ fi
 unset _VECTORCACHE_GCC _VECTORCACHE_GXX
 
 export VECTORCACHE_DATA_DIR="${VECTORCACHE_DATA_DIR:-./data}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc 2>/dev/null || echo 1)}"
+# Match the published turbovec 8-vCPU cells (c3/c4a-standard-8).
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-8}"

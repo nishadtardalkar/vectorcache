@@ -24,6 +24,8 @@ RECALL        ?= 1
 FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
+# Bench parallelism: match published turbovec 8-vCPU cells.
+OMP_NUM_THREADS ?= 8
 ENV_SCRIPT    := scripts/envs.sh
 LOGIN_READY   := $(BUILD_DIR)/.login-ready
 
@@ -110,13 +112,14 @@ help:
 	@echo "  QUERY_LIMIT     --query-limit"
 	@echo "  QUERY_SPLIT     --query-split (test for glove/sift1m; holdout for openai)"
 	@echo "  RECALL=1        --recall (Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
+	@echo "  OMP_NUM_THREADS=$(OMP_NUM_THREADS)  OpenMP pool for query-bench (default 8)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
 	@echo "Turbovec variables (make turbovec):"
 	@echo "  Default = published openai-1536 4-bit staged mt cell (~0.12 ms/query)"
 	@echo "  DATASET=$(DATASET)  BITS=$(BITS)  TURBOVEC_SUITE=$(TURBOVEC_SUITE)  (speed|recall)"
 	@echo "  TURBOVEC_THREADS=$(TURBOVEC_THREADS)  (mt|st)  TURBOVEC_ARCH=$(TURBOVEC_ARCH)  (x86|arm|auto)"
-	@echo "  TURBOVEC_RAYON_THREADS=$(TURBOVEC_RAYON_THREADS)  (mt pool size; 8 = published box)"
+	@echo "  TURBOVEC_RAYON_THREADS=$(TURBOVEC_RAYON_THREADS)  (mt Rayon pool; default 8)"
 	@echo "  TURBOVEC_FULLSCAN=1  whole-index 4-bit scan (default: staged planes)"
 	@echo "  TURBOVEC_DIR=$(TURBOVEC_DIR)  TURBOVEC_DATA_DIR=$(TURBOVEC_DATA_DIR)"
 	@echo "  SKIP_FAISS=1    speed: turbovec-only (skip memory-heavy FAISS PQFastScan)"
@@ -161,6 +164,8 @@ compute:
 		exit 1; \
 	fi
 	set -euo pipefail
+	export OMP_NUM_THREADS="$(OMP_NUM_THREADS)"
+	export RAYON_NUM_THREADS="$(TURBOVEC_RAYON_THREADS)"
 	source $(ENV_SCRIPT)
 	cmake -S . -B $(BUILD_DIR) $(CMAKE_COMPILER_FLAGS) \
 		-DFETCHCONTENT_FULLY_DISCONNECTED=ON \
@@ -189,6 +194,7 @@ compute:
 		echo "query-bench not found under $(BUILD_DIR_ABS)."
 		exit 1
 	fi
+	echo "query-bench OMP_NUM_THREADS=$$OMP_NUM_THREADS"
 	if [ -n "$(strip $(NPY))" ]; then
 		"$$QUERY_BENCH" --npy $(NPY) --data-dir $(DATA_DIR) $(QUERY_BENCH_ARGS)
 	else

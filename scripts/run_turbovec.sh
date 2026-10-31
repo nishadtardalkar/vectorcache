@@ -497,6 +497,8 @@ run_speed_harness() {
     rayon_threads="$TURBOVEC_RAYON_THREADS"
   fi
   export RAYON_NUM_THREADS="$rayon_threads"
+  # Keep OpenMP (FAISS, etc.) on the same pool size as Rayon for the published cell.
+  export OMP_NUM_THREADS="$rayon_threads"
 
   # Published ~0.12 ms/query path is staged 4-bit (sign plane → shortlist → exact).
   # TURBOVEC_4BIT_PLANES=0 forces the whole-index scan instead.
