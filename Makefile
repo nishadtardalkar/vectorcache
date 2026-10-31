@@ -33,6 +33,10 @@ TURBOVEC_DATA_DIR ?= $(HOME)/data/py-turboquant
 TURBOVEC_SUITE    ?= speed
 TURBOVEC_THREADS  ?= mt
 TURBOVEC_ARCH     ?=
+# Published openai-1536 4-bit staged mt cell (~0.12 ms/q) used 8 vCPUs.
+TURBOVEC_RAYON_THREADS ?= 8
+# Set to 1 to force whole-index 4-bit scan (TURBOVEC_4BIT_PLANES=0).
+TURBOVEC_FULLSCAN ?=
 SKIP_FAISS        ?=
 TURBOVEC_STOCK    ?=
 TURBOVEC_SCRIPT   := scripts/run_turbovec.sh
@@ -109,8 +113,11 @@ help:
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
 	@echo "Turbovec variables (make turbovec):"
+	@echo "  Default = published openai-1536 4-bit staged mt cell (~0.12 ms/query)"
 	@echo "  DATASET=$(DATASET)  BITS=$(BITS)  TURBOVEC_SUITE=$(TURBOVEC_SUITE)  (speed|recall)"
 	@echo "  TURBOVEC_THREADS=$(TURBOVEC_THREADS)  (mt|st)  TURBOVEC_ARCH=$(TURBOVEC_ARCH)  (x86|arm|auto)"
+	@echo "  TURBOVEC_RAYON_THREADS=$(TURBOVEC_RAYON_THREADS)  (mt pool size; 8 = published box)"
+	@echo "  TURBOVEC_FULLSCAN=1  whole-index 4-bit scan (default: staged planes)"
 	@echo "  TURBOVEC_DIR=$(TURBOVEC_DIR)  TURBOVEC_DATA_DIR=$(TURBOVEC_DATA_DIR)"
 	@echo "  SKIP_FAISS=1    speed: turbovec-only (skip memory-heavy FAISS PQFastScan)"
 	@echo "  TURBOVEC_STOCK=1  use upstream suite/*.py as-is (often OOMs)"
@@ -124,7 +131,7 @@ help:
 	@echo "Example: make compute LANDMARKS=512 K=64 RECALL=1"
 	@echo "Example: make compute BITS=2 LANDMARKS=1024 K=64"
 	@echo "Example: make turbovec-setup                    # login node (internet)"
-	@echo "Example: make turbovec DATASET=openai-1536 BITS=4 TURBOVEC_ARCH=x86 TURBOVEC_THREADS=mt"
+	@echo "Example: make turbovec                          # 4-bit staged mt (~0.12 ms cell)"
 	@echo "Example: make turbovec ... SKIP_FAISS=1         # recommended on tight-RAM nodes"
 	@echo "Example: make turbovec TURBOVEC_SUITE=recall BITS=4"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
@@ -200,14 +207,17 @@ turbovec-setup:
 
 # Compute node (offline): run official suite. Requires prior `make turbovec-setup`
 # on a login node sharing this project path / Python env.
-# Default: openai-1536 4-bit x86 mt speed (matches published cells).
+# Default: openai-1536 4-bit staged mt speed (~0.12 ms/query published cell).
 turbovec:
 	set -euo pipefail
 	DATASET="$(DATASET)" BITS="$(BITS)" \
 		TURBOVEC_DIR="$(TURBOVEC_DIR)" TURBOVEC_REPO="$(TURBOVEC_REPO)" \
 		TURBOVEC_DATA_DIR="$(TURBOVEC_DATA_DIR)" DATA_DIR="$(DATA_DIR)" \
 		TURBOVEC_SUITE="$(TURBOVEC_SUITE)" TURBOVEC_THREADS="$(TURBOVEC_THREADS)" \
-		TURBOVEC_ARCH="$(TURBOVEC_ARCH)" FORCE="$(FORCE)" SKIP_FAISS="$(SKIP_FAISS)" \
+		TURBOVEC_ARCH="$(TURBOVEC_ARCH)" \
+		TURBOVEC_RAYON_THREADS="$(TURBOVEC_RAYON_THREADS)" \
+		TURBOVEC_FULLSCAN="$(TURBOVEC_FULLSCAN)" \
+		FORCE="$(FORCE)" SKIP_FAISS="$(SKIP_FAISS)" \
 		TURBOVEC_STOCK="$(TURBOVEC_STOCK)" TURBOVEC_OFFLINE=1 \
 		$(if $(strip $(PYTHON)),PYTHON="$(PYTHON)",) \
 		bash "$(TURBOVEC_SCRIPT)"

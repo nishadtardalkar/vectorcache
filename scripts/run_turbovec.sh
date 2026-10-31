@@ -12,10 +12,14 @@
 #   TURBOVEC_DATA_DIR  where suite scripts look (default: ~/data/py-turboquant)
 #   DATA_DIR           vectorcache data/ (source of openai-*.npy)
 #   DATASET            openai-1536 | openai-3072 | glove  (default: openai-1536)
-#   BITS               2 | 4  (default: 4)
+#   BITS               2 | 4  (default: 4 — published staged cell)
 #   TURBOVEC_SUITE     speed | recall  (default: speed)
 #   TURBOVEC_THREADS   mt | st  (default: mt; speed only)
 #   TURBOVEC_ARCH      x86 | arm  (default: auto)
+#   TURBOVEC_RAYON_THREADS  Rayon pool size for mt (default: 8 — matches
+#                      published c3/c4a-standard-8 ~0.12 ms/query cell)
+#   TURBOVEC_FULLSCAN=1  force whole-index 4-bit scan (TURBOVEC_4BIT_PLANES=0);
+#                      default is staged planes (sign → shortlist → exact)
 #   FORCE=1            rebuild wheel even if import works
 #   SKIP_FAISS=1       for speed suite: time turbovec only (no FAISS)
 #   TURBOVEC_STOCK=1   run upstream benchmarks/suite/*.py as-is (may OOM on full npy)
@@ -25,9 +29,11 @@
 # turbovec-setup bootstraps from a clean machine: rustup (if no cargo),
 # maturin, numpy, and faiss-cpu (unless SKIP_FAISS=1).
 #
-# Speed suite default is a mmap harness matching the official protocol
-# (100k+1k, seed=42, k=64, median of 5) — stock scripts np.load the whole
-# corpus then train FAISS PQFastScan(m=dim), which often gets SIGKILL/OOM.
+# Default `make turbovec` reproduces the published openai-1536 4-bit staged
+# multi-thread speed cell (~0.12 ms/query on GCP c3/c4a-standard-8): 100k+1k,
+# seed=42, k=64, median of 5, RAYON_NUM_THREADS=8, staged planes on. The mmap
+# harness matches that protocol — stock scripts np.load the whole corpus then
+# train FAISS PQFastScan(m=dim), which often gets SIGKILL/OOM.
 
 set -euo pipefail
 
@@ -40,6 +46,9 @@ DATASET="${DATASET:-openai-1536}"
 BITS="${BITS:-4}"
 TURBOVEC_SUITE="${TURBOVEC_SUITE:-speed}"
 TURBOVEC_THREADS="${TURBOVEC_THREADS:-mt}"
+# Published mt cell is an 8-vCPU box; pin Rayon so big HPC nodes stay comparable.
+TURBOVEC_RAYON_THREADS="${TURBOVEC_RAYON_THREADS:-8}"
+TURBOVEC_FULLSCAN="${TURBOVEC_FULLSCAN:-}"
 FORCE="${FORCE:-}"
 SKIP_FAISS="${SKIP_FAISS:-}"
 TURBOVEC_STOCK="${TURBOVEC_STOCK:-}"
@@ -479,18 +488,40 @@ run_speed_harness() {
   local out_json="$TURBOVEC_DIR/benchmarks/results/speed_${tag}_${BITS}bit_${TURBOVEC_ARCH}_${TURBOVEC_THREADS}.json"
   local skip_faiss=0
   [[ -n "$SKIP_FAISS" ]] && skip_faiss=1
+  local rayon_threads=1
+  local staged=1
 
   if [[ "$TURBOVEC_THREADS" == st ]]; then
-    export RAYON_NUM_THREADS=1
+    rayon_threads=1
   else
-    unset RAYON_NUM_THREADS || true
+    rayon_threads="$TURBOVEC_RAYON_THREADS"
+  fi
+  export RAYON_NUM_THREADS="$rayon_threads"
+
+  # Published ~0.12 ms/query path is staged 4-bit (sign plane → shortlist → exact).
+  # TURBOVEC_4BIT_PLANES=0 forces the whole-index scan instead.
+  if [[ -n "$TURBOVEC_FULLSCAN" || "$BITS" != "4" ]]; then
+    if [[ -n "$TURBOVEC_FULLSCAN" ]]; then
+      export TURBOVEC_4BIT_PLANES=0
+      staged=0
+    else
+      # 2-bit has its own staging; leave env alone.
+      staged=0
+    fi
+  else
+    unset TURBOVEC_4BIT_PLANES || true
+    staged=1
   fi
 
   echo "Speed harness (mmap, seed=42, n=100000, nq=1000, k=64, median of 5)"
-  echo "  arch=$TURBOVEC_ARCH threads=$TURBOVEC_THREADS skip_faiss=$skip_faiss"
+  echo "  arch=$TURBOVEC_ARCH threads=$TURBOVEC_THREADS rayon=$rayon_threads staged=$staged skip_faiss=$skip_faiss"
+  if [[ "$BITS" == "4" && "$TURBOVEC_THREADS" == mt && "$DATASET" == openai-1536 && "$staged" == "1" ]]; then
+    echo "  published cell: openai-1536 4-bit staged mt (~0.12 ms/query on c3/c4a-standard-8)"
+  fi
   echo "  writing $out_json"
 
-  "$PYTHON" - "$dim" "$BITS" "$TURBOVEC_DATA_DIR" "$TURBOVEC_ARCH" "$TURBOVEC_THREADS" "$skip_faiss" "$out_json" <<'PY'
+  "$PYTHON" - "$dim" "$BITS" "$TURBOVEC_DATA_DIR" "$TURBOVEC_ARCH" "$TURBOVEC_THREADS" \
+    "$skip_faiss" "$out_json" "$rayon_threads" "$staged" <<'PY'
 import os, sys, time, json
 import numpy as np
 from turbovec import TurboQuantIndex
@@ -502,6 +533,8 @@ arch = sys.argv[4]
 threading = sys.argv[5]
 skip_faiss = sys.argv[6] == "1"
 out_json = sys.argv[7]
+rayon_threads = int(sys.argv[8])
+staged = sys.argv[9] == "1"
 
 path = os.path.join(data_dir, f"openai-{dim}.npy")
 print(f"Loading {path} (mmap) ...", flush=True)
@@ -578,6 +611,8 @@ result = {
     "bit_width": bits,
     "arch": arch,
     "threading": threading,
+    "rayon_threads": rayon_threads,
+    "staged_4bit": staged if bits == 4 else None,
     "n": int(len(database)),
     "nq": int(len(queries)),
     "k": 64,
@@ -599,8 +634,7 @@ if skip_faiss:
 print("Building FAISS IndexPQFastScan (memory-heavy; may OOM / SIGKILL) ...", flush=True)
 import faiss
 
-if threading == "st":
-    faiss.omp_set_num_threads(1)
+faiss.omp_set_num_threads(1 if threading == "st" else rayon_threads)
 
 # Match suite/speed_d*_4bit_*: m_pq = dim for 4-bit, m_pq = dim // 2 for 2-bit.
 m_pq = dim if bits == 4 else dim // 2
@@ -664,7 +698,7 @@ main() {
     return
   fi
 
-  echo "=== turbovec bench: DATASET=$DATASET BITS=$BITS SUITE=$TURBOVEC_SUITE ARCH=$TURBOVEC_ARCH THREADS=$TURBOVEC_THREADS ==="
+  echo "=== turbovec bench: DATASET=$DATASET BITS=$BITS SUITE=$TURBOVEC_SUITE ARCH=$TURBOVEC_ARCH THREADS=$TURBOVEC_THREADS RAYON=$TURBOVEC_RAYON_THREADS FULLSCAN=${TURBOVEC_FULLSCAN:-0} ==="
 
   if [[ "$TURBOVEC_SUITE" == speed && -z "$TURBOVEC_STOCK" ]]; then
     run_speed_harness

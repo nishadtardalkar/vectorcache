@@ -31,18 +31,18 @@ make compute BITS=4 RECALL=1 CALIBRATE=1
 make compute DATASET=openai-1536 BITS=2 K=64
 make compute DATASET=sift1m QUERY_LIMIT=10000
 
-# Reference turbovec (openai-1536 by default):
+# Reference turbovec (published openai-1536 4-bit staged mt ~0.12 ms/query cell):
 # Login node (internet):
 make turbovec-setup
 # Compute node (offline):
-make turbovec DATASET=openai-1536 BITS=4 TURBOVEC_ARCH=x86 TURBOVEC_THREADS=mt
+make turbovec
 make turbovec TURBOVEC_SUITE=recall BITS=4
 ```
 
 `make login` configures CMake and downloads datasets into `data/`.  
 `make compute` reconfigures offline, builds tests + `query-bench`, runs `ctest`, then runs `query-bench`.  
 `make turbovec-setup` (login) clones [turbovec](https://github.com/RyanCodrai/turbovec) into `.ref-turbovec`, builds the Python wheel, and wires `~/data/py-turboquant/openai-1536.npy` from `data/`.  
-`make turbovec` (compute) runs the official suite offline and does not touch the network.
+`make turbovec` (compute) runs the published 4-bit staged multi-thread speed cell offline (8 Rayon threads, planes on) and does not touch the network.
 
 ## Algorithm (turbovec-compatible + optional IVF)
 
