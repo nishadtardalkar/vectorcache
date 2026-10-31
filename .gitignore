@@ -2,5 +2,7 @@
 /build-win/
 /.cache/
 /.ref-turbovec/
+/.ref-turbovec-cargo/
+/.ref-turbovec-rustup/
 *.tmp
 /env/

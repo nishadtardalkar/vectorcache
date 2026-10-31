@@ -9,7 +9,7 @@ TurboQuant ANN engine (C++20) matching [turbovec](https://github.com/RyanCodrai/
 - OpenMP (recommended)
 - For `fetch-datasets`: libcurl; Apache Arrow/Parquet for OpenAI datasets
 - For GloVe / SIFT1M: HDF5 C library
-- For `make turbovec`: Rust toolchain, Python 3.9+, `maturin`, `numpy` (and `faiss` unless `SKIP_FAISS=1`)
+- For `make turbovec-setup`: Python 3.9+ with pip and network; the script installs rustup/cargo, maturin, numpy, and faiss-cpu if missing
 
 On HPC clusters:
 

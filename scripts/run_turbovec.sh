@@ -20,6 +20,9 @@
 #   SKIP_FAISS=1       for speed suite: time turbovec only (no FAISS)
 #   SETUP_ONLY=1       clone + data + bindings; do not run a suite script
 #   TURBOVEC_OFFLINE=1 no git/pip network (default for `make turbovec`)
+#
+# turbovec-setup bootstraps from a clean machine: rustup (if no cargo),
+# maturin, numpy, and faiss-cpu (unless SKIP_FAISS=1).
 
 set -euo pipefail
 
@@ -36,8 +39,20 @@ FORCE="${FORCE:-}"
 SKIP_FAISS="${SKIP_FAISS:-}"
 SETUP_ONLY="${SETUP_ONLY:-}"
 TURBOVEC_OFFLINE="${TURBOVEC_OFFLINE:-}"
+# Keep Rust toolchains on the shared project path so login+compute see the same install.
+CARGO_HOME="${CARGO_HOME:-$ROOT/.ref-turbovec-cargo}"
+RUSTUP_HOME="${RUSTUP_HOME:-$ROOT/.ref-turbovec-rustup}"
+export CARGO_HOME RUSTUP_HOME
 PYTHON="${PYTHON:-python3}"
 command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
+
+source_cargo_env() {
+  if [[ -f "$CARGO_HOME/env" ]]; then
+    # shellcheck disable=SC1090
+    source "$CARGO_HOME/env"
+  fi
+  export PATH="$CARGO_HOME/bin:${PATH:-}"
+}
 
 detect_arch() {
   local m
@@ -177,6 +192,105 @@ ensure_data() {
   esac
 }
 
+pip_install() {
+  "$PYTHON" -m pip install "$@"
+}
+
+ensure_python() {
+  if ! command -v "$PYTHON" >/dev/null 2>&1; then
+    echo "Python not found (tried PYTHON=$PYTHON). Activate your env or set PYTHON=..." >&2
+    exit 1
+  fi
+  if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
+    echo "pip missing for $PYTHON; install pip then re-run." >&2
+    exit 1
+  fi
+  echo "Python: $("$PYTHON" -c 'import sys; print(sys.executable)')"
+}
+
+ensure_python_packages() {
+  ensure_python
+  if [[ -n "$TURBOVEC_OFFLINE" ]]; then
+    local missing=()
+    "$PYTHON" -c "import numpy" >/dev/null 2>&1 || missing+=(numpy)
+    if [[ -z "$SKIP_FAISS" ]]; then
+      "$PYTHON" -c "import faiss" >/dev/null 2>&1 || missing+=(faiss)
+    fi
+    if ((${#missing[@]})); then
+      echo "Missing Python packages offline: ${missing[*]}" >&2
+      echo "On a login node with the same env, run: make turbovec-setup" >&2
+      exit 1
+    fi
+    return
+  fi
+
+  echo "Ensuring numpy / maturin (and faiss-cpu unless SKIP_FAISS=1) ..."
+  pip_install -U pip setuptools wheel
+  pip_install -U 'numpy>=1.20' 'maturin>=1.12,<2.0'
+  if [[ -z "$SKIP_FAISS" ]]; then
+    if ! "$PYTHON" -c "import faiss" >/dev/null 2>&1; then
+      # Official suite scripts `import faiss`. Prefer faiss-cpu; fall back to conda hint.
+      if ! pip_install -U faiss-cpu; then
+        echo "WARNING: faiss-cpu pip install failed. Official speed/recall scripts need faiss." >&2
+        echo "  conda install -c pytorch faiss-cpu   # or set SKIP_FAISS=1 for TQ-only speed" >&2
+      fi
+    fi
+  fi
+}
+
+try_module_rust() {
+  type module >/dev/null 2>&1 || return 1
+  local m
+  for m in rust rust/1.80 rust/1.78 rust/1.75; do
+    if module is-avail "$m" >/dev/null 2>&1 || module -t avail 2>&1 | grep -Eq "(^|/)${m}(/|$)"; then
+      module load "$m" 2>/dev/null || continue
+      if command -v cargo >/dev/null 2>&1; then
+        echo "Loaded module $m ($(cargo --version))"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+ensure_rust() {
+  source_cargo_env
+  if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
+    echo "Rust OK: $(rustc --version); $(cargo --version)"
+    return
+  fi
+  if try_module_rust; then
+    return
+  fi
+  if [[ -n "$TURBOVEC_OFFLINE" ]]; then
+    echo "cargo/rustc not found (offline). Run make turbovec-setup on a login node first." >&2
+    exit 1
+  fi
+
+  echo "Installing Rust toolchain via rustup into:"
+  echo "  CARGO_HOME=$CARGO_HOME"
+  echo "  RUSTUP_HOME=$RUSTUP_HOME"
+  mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
+  local rustup_init
+  rustup_init="$(mktemp)"
+  if command -v curl >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$rustup_init" https://sh.rustup.rs
+  else
+    echo "Need curl or wget to install rustup." >&2
+    exit 1
+  fi
+  sh "$rustup_init" -y --profile minimal --default-toolchain stable --no-modify-path
+  rm -f "$rustup_init"
+  source_cargo_env
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "rustup finished but cargo still not on PATH ($CARGO_HOME/bin)." >&2
+    exit 1
+  fi
+  echo "Rust installed: $(rustc --version); $(cargo --version)"
+}
+
 install_wheel() {
   local wheel="$1"
   echo "Installing $wheel ..."
@@ -189,6 +303,8 @@ install_wheel() {
 }
 
 ensure_bindings() {
+  ensure_python_packages
+
   if [[ -z "$FORCE" ]] && "$PYTHON" -c "from turbovec import TurboQuantIndex" >/dev/null 2>&1; then
     echo "turbovec Python import OK ($PYTHON)"
     return
@@ -208,12 +324,10 @@ ensure_bindings() {
     exit 1
   fi
 
-  if ! "$PYTHON" -c "import maturin" >/dev/null 2>&1; then
-    echo "Installing maturin ..."
-    "$PYTHON" -m pip install -U 'maturin>=1.12,<2.0'
-  fi
+  ensure_rust
   echo "Building turbovec Python wheel (release) ..."
   (
+    source_cargo_env
     cd "$TURBOVEC_DIR/turbovec-python"
     "$PYTHON" -m maturin build --release
   )

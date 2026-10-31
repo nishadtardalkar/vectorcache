@@ -85,7 +85,7 @@ help:
 	@echo ""
 	@echo "  make login          Configure CMake, fetch dependencies, download datasets (login node)"
 	@echo "  make compute        Build, test, and query-bench offline (compute node)"
-	@echo "  make turbovec-setup Login node: clone turbovec, build wheel, wire openai data (needs net)"
+	@echo "  make turbovec-setup Login node: bootstrap Rust/maturin/deps, clone+build turbovec (needs net)"
 	@echo "  make turbovec       Compute node: run official suite offline (needs prior turbovec-setup)"
 	@echo "  make clean          Remove build directory"
 	@echo ""
