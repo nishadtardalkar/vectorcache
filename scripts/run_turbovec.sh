@@ -562,7 +562,10 @@ queries /= np.linalg.norm(queries, axis=-1, keepdims=True).astype(np.float32)
 print(f"corpus ready: n={len(database)} nq={len(queries)} dim={dim}", flush=True)
 
 tq = TurboQuantIndex(dim=dim, bit_width=bits)
+t_ingest0 = time.perf_counter()
 tq.add(database)
+tq_ingest_ms = (time.perf_counter() - t_ingest0) * 1000
+print(f"tq_ingest_ms={tq_ingest_ms:.3f}", flush=True)
 tq.search(queries[:1], k=64)
 tq_times = []
 for _ in range(5):
@@ -579,6 +582,7 @@ result = {
     "nq": int(len(queries)),
     "k": 64,
     "seed": 42,
+    "tq_ingest_ms": round(tq_ingest_ms, 3),
     "tq_ms_per_query": round(tq_ms, 3),
     "tq_runs_ms_per_query": [round(t, 3) for t in tq_times],
 }
@@ -610,8 +614,11 @@ else:
     nbits = 4
 
 pq = faiss.IndexPQFastScan(dim, m_pq, nbits)
+t_ingest0 = time.perf_counter()
 pq.train(database)
 pq.add(database)
+faiss_ingest_ms = (time.perf_counter() - t_ingest0) * 1000
+print(f"faiss_ingest_ms={faiss_ingest_ms:.3f}", flush=True)
 pq.search(queries[:1], 64)
 faiss_times = []
 for _ in range(5):
@@ -619,6 +626,7 @@ for _ in range(5):
     pq.search(queries, 64)
     faiss_times.append((time.perf_counter() - t0) / len(queries) * 1000)
 faiss_ms = sorted(faiss_times)[2]
+result["faiss_ingest_ms"] = round(faiss_ingest_ms, 3)
 result["faiss_ms_per_query"] = round(faiss_ms, 3)
 result["faiss_runs_ms_per_query"] = [round(t, 3) for t in faiss_times]
 print(json.dumps(result, indent=2), flush=True)
