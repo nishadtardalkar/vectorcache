@@ -357,7 +357,8 @@ int main(int argc, char** argv) {
   std::size_t landmarks = vectorcache::kDefaultLandmarks;
   bool recall = false;
   bool float_rescore = true;
-  std::size_t timing_runs = 5;
+  std::size_t timing_runs = 11;  // mean over these after warmup (was median-of-5)
+  std::size_t warmup_runs = 1;   // discarded before timed loop
   std::size_t sign_heap = 0;  // 0 = default 2E; sets VECTORCACHE_SIGN_HEAP
 
   app.add_option("--dataset", dataset, "Named dataset (glove, sift1m, openai-1536, openai-3072)");
@@ -381,7 +382,9 @@ int main(int argc, char** argv) {
                "Dual recall curves for t=1,2,4,...,k: recall1@t (1-recall) and recall@t (set-overlap)");
   app.add_flag("--float-rescore,!--no-float-rescore", float_rescore,
                "Exact-IP re-rank of ANN top-k using unit corpus (timed; default ON)");
-  app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
+  app.add_option("--timing-runs", timing_runs,
+                 "Timed search runs after warmup; primary latency is the mean (default 11)");
+  app.add_option("--warmup", warmup_runs, "Untimed warmup search batches before timing (default 1)");
 
   CLI11_PARSE(app, argc, argv);
 
@@ -520,44 +523,86 @@ int main(int argc, char** argv) {
       db = Matrix{};
     }
 
-    // Split ANN vs float re-rank timing (paper needs both columns).
-    std::vector<double> ann_ms;
-    std::vector<double> rerank_ms;
-    ann_ms.reserve(timing_runs);
-    rerank_ms.reserve(timing_runs);
-    run_ms.reserve(timing_runs);
-
-    for (std::size_t r = 0; r < timing_runs; ++r) {
+    // Split ANN vs float re-rank timing. Warm up, then mean over timing_runs
+    // (median-of-5 was too noisy — float-on could appear faster than float-off).
+    auto run_once = [&](bool timed, double* ann_out, double* rerank_out) {
       const auto a = std::chrono::steady_clock::now();
       last = index.search(queries.data, k, /*float_corpus=*/{});
       const auto b = std::chrono::steady_clock::now();
       const double ann = std::chrono::duration<double, std::milli>(b - a).count();
-      ann_ms.push_back(ann);
       double rerank = 0.0;
       if (float_rescore) {
         const auto c = std::chrono::steady_clock::now();
         vectorcache::float_rescore_topk(last, queries.data, db.data, db.cols);
         const auto d = std::chrono::steady_clock::now();
         rerank = std::chrono::duration<double, std::milli>(d - c).count();
-        rerank_ms.push_back(rerank);
       }
+      if (timed) {
+        *ann_out = ann;
+        *rerank_out = rerank;
+      }
+    };
+
+    for (std::size_t w = 0; w < warmup_runs; ++w) {
+      double unused_a = 0.0, unused_r = 0.0;
+      run_once(/*timed=*/false, &unused_a, &unused_r);
+    }
+
+    std::vector<double> ann_ms;
+    std::vector<double> rerank_ms;
+    ann_ms.reserve(timing_runs);
+    rerank_ms.reserve(timing_runs);
+    run_ms.reserve(timing_runs);
+
+    if (timing_runs == 0) {
+      throw std::runtime_error("--timing-runs must be >= 1");
+    }
+    for (std::size_t r = 0; r < timing_runs; ++r) {
+      double ann = 0.0, rerank = 0.0;
+      run_once(/*timed=*/true, &ann, &rerank);
+      ann_ms.push_back(ann);
+      if (float_rescore) rerank_ms.push_back(rerank);
       run_ms.push_back(ann + rerank);
     }
 
+    auto mean_of = [](const std::vector<double>& v) {
+      double s = 0.0;
+      for (double x : v) s += x;
+      return s / static_cast<double>(v.size());
+    };
+    auto std_of = [&](const std::vector<double>& v, double mean) {
+      if (v.size() < 2) return 0.0;
+      double ss = 0.0;
+      for (double x : v) {
+        const double d = x - mean;
+        ss += d * d;
+      }
+      return std::sqrt(ss / static_cast<double>(v.size() - 1));
+    };
     auto median_of = [](std::vector<double> v) {
       std::sort(v.begin(), v.end());
       return v[v.size() / 2];
     };
+
+    const double mean_ms = mean_of(run_ms);
+    const double mean_ann_ms = mean_of(ann_ms);
     const double median_ms = median_of(run_ms);
-    const double median_ann_ms = median_of(ann_ms);
+    const double std_ms = std_of(run_ms, mean_ms);
     const double nq = static_cast<double>(queries.rows);
-    const double ms_per_query = median_ms / nq;
-    const double ann_ms_per_query = median_ann_ms / nq;
-    std::cout << "search_median_ms=" << median_ms << " ms_per_query=" << ms_per_query
+    // Primary column is the mean (ms_per_query); median kept for diagnostics.
+    const double ms_per_query = mean_ms / nq;
+    const double ann_ms_per_query = mean_ann_ms / nq;
+    std::cout << "timing_runs=" << timing_runs << " warmup=" << warmup_runs
+              << " search_mean_ms=" << mean_ms << " search_median_ms=" << median_ms
+              << " search_std_ms=" << std_ms << " ms_per_query=" << ms_per_query
+              << " ms_per_query_median=" << (median_ms / nq)
+              << " ms_per_query_std=" << (std_ms / nq)
               << " ann_ms_per_query=" << ann_ms_per_query;
     if (float_rescore && !rerank_ms.empty()) {
-      const double rerank_ms_per_query = median_of(rerank_ms) / nq;
-      std::cout << " rerank_ms_per_query=" << rerank_ms_per_query;
+      const double mean_rerank_ms = mean_of(rerank_ms);
+      std::cout << " rerank_ms_per_query=" << (mean_rerank_ms / nq)
+                << " rerank_ms_per_query_std="
+                << (std_of(rerank_ms, mean_rerank_ms) / nq);
     }
     std::cout << "\n";
 

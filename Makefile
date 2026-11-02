@@ -58,6 +58,10 @@ PAPER_BENCH_SCRIPT := scripts/run_paper_benchmark.sh
 BENCHMARK_OUT     ?=
 BENCHMARK_OUT_DIR ?= results
 SKIP_ABLATIONS    ?=
+# Latency stability: outer process repeats × inner timed searches (mean after warmup).
+CELL_REPEATS      ?= 3
+TIMING_RUNS       ?= 21
+WARMUP            ?= 2
 PYTHON            ?=
 
 ifneq (,$(filter all openai-1536 openai-3072,$(DATASETS)))
@@ -138,6 +142,7 @@ help:
 	@echo "  Writes $(BENCHMARK_OUT_DIR)/paper_benchmark_<dataset>_<utc>.txt (or BENCHMARK_OUT=...)"
 	@echo "  A/B FLOAT_RESCORE=0/1 at LANDMARKS=$(LANDMARKS) BITS=$(BITS) K=$(K)"
 	@echo "  C ablations m∈{256,512}, bits=2, planes-off (SKIP_ABLATIONS=1 to skip)"
+	@echo "  Latency: CELL_REPEATS=$(CELL_REPEATS) × TIMING_RUNS=$(TIMING_RUNS) (mean) after WARMUP=$(WARMUP)"
 	@echo "  Does not run turbovec/FAISS (use make turbovec separately if needed)"
 	@echo ""
 	@echo "Turbovec variables (make turbovec):"
@@ -245,6 +250,7 @@ benchmark:
 		BITS="$(BITS)" K="$(K)" LANDMARKS="$(LANDMARKS)" \
 		OMP_NUM_THREADS="$(OMP_NUM_THREADS)" \
 		SKIP_ABLATIONS="$(SKIP_ABLATIONS)" \
+		CELL_REPEATS="$(CELL_REPEATS)" TIMING_RUNS="$(TIMING_RUNS)" WARMUP="$(WARMUP)" \
 		BENCHMARK_OUT="$(BENCHMARK_OUT)" BENCHMARK_OUT_DIR="$(BENCHMARK_OUT_DIR)" \
 		bash "$(PAPER_BENCH_SCRIPT)"
 

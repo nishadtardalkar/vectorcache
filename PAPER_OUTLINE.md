@@ -212,4 +212,6 @@ make benchmark   # → results/paper_benchmark_openai-1536_<utc>.txt
 
 **Baselines for the paper draft:** cite **TurboQuant** ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) for the encode family, and **FAISS PQ / published ANN** for iso-bit quality/speed — not turbovec README cells (third-party impl, self-reported, no paper). Keep `make turbovec` only as an optional engineering cross-check, outside the paper pack.
 
-Knobs: `SKIP_ABLATIONS=1`, `BENCHMARK_OUT=path`.
+Knobs: `SKIP_ABLATIONS=1`, `BENCHMARK_OUT=path`, `CELL_REPEATS=3`, `TIMING_RUNS=21`, `WARMUP=2`.
+
+Latency protocol: each cell is a fresh process+ingest, repeated `CELL_REPEATS` times; within each process, `WARMUP` untimed batches then mean over `TIMING_RUNS` searches. Report `cell_avg_ms_per_query` (and ann/rerank). A single median-of-5 pass can make float-on look faster than float-off — do not use that.

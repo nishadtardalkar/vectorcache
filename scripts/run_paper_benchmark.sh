@@ -8,11 +8,14 @@
 #   D  scraped key=value summary (latency, dual recall, bytes/vector)
 #
 # Protocol: openai-1536, n=100K, nq=1K holdout (last rows), OMP=8, RECALL=1.
+# Latency: each cell is invoked CELL_REPEATS times; query-bench means over
+# TIMING_RUNS searches after WARMUP (avoids float-on appearing faster than float-off).
 # This harness does not invoke turbovec or FAISS.
 #
 # Usage (via Make):  make benchmark
 # Env overrides: DATASET BITS LIMIT QUERY_LIMIT K LANDMARKS OMP_NUM_THREADS
 #                SKIP_ABLATIONS=1  BENCHMARK_OUT=path  BUILD_DIR=build
+#                CELL_REPEATS=3  TIMING_RUNS=21  WARMUP=2
 
 set -euo pipefail
 
@@ -35,6 +38,10 @@ K="${K:-64}"
 LANDMARKS="${LANDMARKS:-1024}"
 OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 SKIP_ABLATIONS="${SKIP_ABLATIONS:-}"
+# Outer process repeats (fresh ingest each time) + inner timed searches.
+CELL_REPEATS="${CELL_REPEATS:-3}"
+TIMING_RUNS="${TIMING_RUNS:-21}"
+WARMUP="${WARMUP:-2}"
 LOGIN_READY="${BUILD_DIR}/.login-ready"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%Y%m%d)"
@@ -92,11 +99,13 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --is-inside-work-t
 fi
 log "dataset=$DATASET limit=$LIMIT query_limit=$QUERY_LIMIT bits=$BITS k=$K landmarks_default=$LANDMARKS"
 log "OMP_NUM_THREADS=$OMP_NUM_THREADS SKIP_ABLATIONS=${SKIP_ABLATIONS:-0}"
+log "CELL_REPEATS=$CELL_REPEATS TIMING_RUNS=$TIMING_RUNS WARMUP=$WARMUP"
 log "output=$OUT"
 log ""
 log "Metrics:"
-log "  ms_per_query / ann_ms_per_query / rerank_ms_per_query  (median of timing-runs)"
-log "  recall1@t = 1-recall (exact NN in approx[:t])"
+log "  ms_per_query / ann_ms_per_query / rerank_ms_per_query = mean over timing-runs (after warmup)"
+log "  cell_avg_* = mean of those means across CELL_REPEATS fresh process+ingest runs"
+log "  recall1@t = 1-recall (exact NN in approx[:t])  (measured on last repeat only)"
 log "  recall@t  = set-overlap |approx[:t] ∩ exact[:t]| / t"
 log "  codes_bytes_per_vector / index_bytes_per_vector / float32_bytes_per_vector"
 log ""
@@ -140,6 +149,12 @@ if [[ -z "$QUERY_BENCH" || ! -f "$QUERY_BENCH" ]]; then
 fi
 log "query-bench=$QUERY_BENCH"
 
+# Parse first key=value float from a (possibly multi-key) line; empty if missing.
+parse_kv() {
+  local file="$1" key="$2"
+  grep -oE "${key}=[0-9.+-eE]+" "$file" 2>/dev/null | head -n1 | cut -d= -f2 || true
+}
+
 ours() {
   local label="$1"
   shift
@@ -160,7 +175,7 @@ ours() {
     esac
   done
 
-  local args=(
+  local args_base=(
     --dataset "$DATASET"
     --data-dir "$DATA_DIR"
     --limit "$LIMIT"
@@ -168,22 +183,71 @@ ours() {
     --bits "$bits"
     --landmarks "$landmarks"
     --k "$K"
-    --recall
+    --timing-runs "$TIMING_RUNS"
+    --warmup "$WARMUP"
   )
   if [[ "$float_rescore" -eq 0 ]]; then
-    args+=(--no-float-rescore)
+    args_base+=(--no-float-rescore)
   else
-    args+=(--float-rescore)
+    args_base+=(--float-rescore)
   fi
-  args+=("${extra[@]}")
+  args_base+=("${extra[@]}")
 
   log ""
   log "### $label"
-  log "config landmarks=$landmarks bits=$bits k=$K float_rescore=$float_rescore planes_off=$planes_off"
-  if [[ "$planes_off" -eq 1 ]]; then
-    run_logged env TURBOVEC_4BIT_PLANES=0 "$QUERY_BENCH" "${args[@]}"
+  log "config landmarks=$landmarks bits=$bits k=$K float_rescore=$float_rescore planes_off=$planes_off cell_repeats=$CELL_REPEATS timing_runs=$TIMING_RUNS warmup=$WARMUP"
+
+  local sum_ms=0 sum_ann=0 sum_rr=0 n_ok=0
+  local rep
+  for ((rep = 1; rep <= CELL_REPEATS; rep++)); do
+    local tmp
+    tmp="$(mktemp)"
+    local args=("${args_base[@]}")
+    # Recall is deterministic; only pay for dual recall on the last repeat.
+    if [[ "$rep" -eq "$CELL_REPEATS" ]]; then
+      args+=(--recall)
+    fi
+
+    log "#### repeat $rep/$CELL_REPEATS"
+    set +e
+    if [[ "$planes_off" -eq 1 ]]; then
+      env TURBOVEC_4BIT_PLANES=0 "$QUERY_BENCH" "${args[@]}" 2>&1 | tee -a "$OUT" "$tmp"
+    else
+      "$QUERY_BENCH" "${args[@]}" 2>&1 | tee -a "$OUT" "$tmp"
+    fi
+    local rc=${PIPESTATUS[0]}
+    set -e
+
+    if [[ "$rc" -ne 0 ]]; then
+      log "!! FAILED (exit $rc) repeat $rep: $label"
+      rm -f "$tmp"
+      continue
+    fi
+
+    local ms ann rr
+    ms="$(parse_kv "$tmp" ms_per_query)"
+    ann="$(parse_kv "$tmp" ann_ms_per_query)"
+    rr="$(parse_kv "$tmp" rerank_ms_per_query)"
+    rm -f "$tmp"
+
+    if [[ -z "$ms" ]]; then
+      log "!! missing ms_per_query on repeat $rep"
+      continue
+    fi
+    sum_ms="$(awk -v a="$sum_ms" -v b="$ms" 'BEGIN { printf "%.12g", a + b }')"
+    sum_ann="$(awk -v a="$sum_ann" -v b="${ann:-0}" 'BEGIN { printf "%.12g", a + b }')"
+    sum_rr="$(awk -v a="$sum_rr" -v b="${rr:-0}" 'BEGIN { printf "%.12g", a + b }')"
+    n_ok=$((n_ok + 1))
+  done
+
+  if [[ "$n_ok" -gt 0 ]]; then
+    local avg_ms avg_ann avg_rr
+    avg_ms="$(awk -v s="$sum_ms" -v n="$n_ok" 'BEGIN { printf "%.6g", s / n }')"
+    avg_ann="$(awk -v s="$sum_ann" -v n="$n_ok" 'BEGIN { printf "%.6g", s / n }')"
+    avg_rr="$(awk -v s="$sum_rr" -v n="$n_ok" 'BEGIN { printf "%.6g", s / n }')"
+    log "cell_avg_ms_per_query=$avg_ms cell_avg_ann_ms_per_query=$avg_ann cell_avg_rerank_ms_per_query=$avg_rr cell_repeats_ok=$n_ok/$CELL_REPEATS"
   else
-    run_logged "$QUERY_BENCH" "${args[@]}"
+    log "!! no successful repeats for $label"
   fi
 }
 
@@ -220,7 +284,7 @@ if command -v awk >/dev/null 2>&1; then
   awk '
     /^### / { label=$0; next }
     /^config / { cfg=$0; next }
-    /^ingest_ms=/ || /^codes_bytes=/ || /^search_median_ms=/ || /^recall1@/ || /^recall@/ {
+    /^ingest_ms=/ || /^codes_bytes=/ || /^timing_runs=/ || /^search_mean_ms=/ || /^search_median_ms=/ || /^cell_avg_/ || /^recall1@/ || /^recall@/ {
       if (label != "") { print label; label="" }
       if (cfg != "") { print cfg; cfg="" }
       print
