@@ -364,7 +364,7 @@ int main(int argc, char** argv) {
   app.add_option("--sign-heap", sign_heap,
                  "Staged sign H99 collector capacity (default 2E via env VECTORCACHE_SIGN_HEAP)");
   app.add_option("--landmarks", landmarks, "Orthonormal landmark subspace dims");
-  app.add_flag("--recall", recall, "Compute Recall@1@k and Recall@k");
+  app.add_flag("--recall", recall, "Compute Recall@1, Recall@1@k, and Recall@k");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
   CLI11_PARSE(app, argc, argv);
@@ -537,18 +537,22 @@ int main(int argc, char** argv) {
         }
       }
 
-      double r1 = 0.0;
+      double r1 = 0.0;       // true NN is approx top-1 (turbovec "recall@1")
+      double r1_at_k = 0.0;  // true NN in approx top-k
       double rk = 0.0;
       for (std::size_t qi = 0; qi < queries.rows; ++qi) {
         const auto& exact = exact_ids_per_query[qi];
         std::vector<std::uint64_t> approx(last.ids.begin() + static_cast<std::ptrdiff_t>(qi * k),
                                           last.ids.begin() + static_cast<std::ptrdiff_t>((qi + 1) * k));
-        if (!exact.empty() && recall_at_1_at_k(approx, exact[0])) ++r1;
+        if (!exact.empty() && !approx.empty() && approx[0] == exact[0]) ++r1;
+        if (!exact.empty() && recall_at_1_at_k(approx, exact[0])) ++r1_at_k;
         rk += recall_at_k(approx, exact);
       }
       r1 /= static_cast<double>(queries.rows);
+      r1_at_k /= static_cast<double>(queries.rows);
       rk /= static_cast<double>(queries.rows);
-      std::cout << "recall@1@" << k << "=" << r1 << "\n";
+      std::cout << "recall@1=" << r1 << "\n";
+      std::cout << "recall@1@" << k << "=" << r1_at_k << "\n";
       std::cout << "recall@" << k << "=" << rk << "\n";
     }
 
