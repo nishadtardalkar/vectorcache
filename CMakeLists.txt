@@ -39,6 +39,7 @@ set(VECTORCACHE_SOURCES
   src/search/search_avx2.cpp
   src/search/search_vnni.cpp
   src/search/search.cpp
+  src/search/float_rescore.cpp
   src/index.cpp
   src/datasets/npy.cpp
   src/datasets/datasets.cpp

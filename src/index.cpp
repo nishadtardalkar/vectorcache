@@ -12,6 +12,7 @@
 #include "vectorcache/encode/encode.hpp"
 #include "vectorcache/pack/pack.hpp"
 #include "vectorcache/quantize/codebook.hpp"
+#include "vectorcache/search/float_rescore.hpp"
 #include "vectorcache/transform/landmarks.hpp"
 
 namespace vectorcache {
@@ -263,7 +264,8 @@ void LandmarkIndex::prepare() {
   prepared_ = true;
 }
 
-SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t k) const {
+SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t k,
+                                    std::span<const float> float_corpus) const {
   if (queries.size() % dim_ != 0) {
     throw std::invalid_argument("queries length must be multiple of dim");
   }
@@ -272,9 +274,18 @@ SearchResults LandmarkIndex::search(std::span<const float> queries, std::size_t 
   }
   const std::size_t nq = queries.size() / dim_;
   const std::size_t kk = std::min(k, n_vectors_);
-  return search_landmark_rerank(queries, nq, dim_, kk, landmark_basis_q4_, scan_dim_, lm_centroids_,
-                                scan_bits_, blocked_codes_, n_blocks_, scales_, residual_norms_,
-                                rotation_, scale_resid_, sign_codes_, sign_n_blocks_, codes_flat_);
+  SearchResults out =
+      search_landmark_rerank(queries, nq, dim_, kk, landmark_basis_q4_, scan_dim_, lm_centroids_,
+                             scan_bits_, blocked_codes_, n_blocks_, scales_, residual_norms_,
+                             rotation_, scale_resid_, sign_codes_, sign_n_blocks_, codes_flat_);
+  if (!float_corpus.empty()) {
+    if (float_corpus.size() < n_vectors_ * dim_) {
+      throw std::invalid_argument("float_corpus must have at least size() * dim rows");
+    }
+    // Exact IP on the ANN shortlist; caller should include this in timed search.
+    float_rescore_topk(out, queries, float_corpus.subspan(0, n_vectors_ * dim_), dim_);
+  }
+  return out;
 }
 
 }  // namespace vectorcache

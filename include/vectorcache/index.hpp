@@ -33,7 +33,10 @@ class LandmarkIndex {
   void add(std::span<const float> vectors);
   void prepare();
 
-  SearchResults search(std::span<const float> queries, std::size_t k) const;
+  /// ANN search. If `float_corpus` is non-empty (row-major unit vectors, `size()*dim`),
+  /// exact-IP re-ranks the returned top-k in-place (include in timed latency).
+  SearchResults search(std::span<const float> queries, std::size_t k,
+                       std::span<const float> float_corpus = {}) const;
 
  private:
   std::size_t dim_;

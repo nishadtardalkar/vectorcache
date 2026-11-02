@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -346,6 +347,7 @@ int main(int argc, char** argv) {
   std::size_t k = 10;
   std::size_t landmarks = vectorcache::kDefaultLandmarks;
   bool recall = false;
+  bool float_rescore = true;
   std::size_t timing_runs = 5;
   std::size_t sign_heap = 0;  // 0 = default 2E; sets VECTORCACHE_SIGN_HEAP
 
@@ -367,6 +369,8 @@ int main(int argc, char** argv) {
                  "Staged sign H99 collector capacity (default 2E via env VECTORCACHE_SIGN_HEAP)");
   app.add_option("--landmarks", landmarks, "Orthonormal landmark subspace dims");
   app.add_flag("--recall", recall, "Compute Recall@1@t curve (t=1,2,4,...,k) and Recall@k");
+  app.add_flag("--float-rescore,!--no-float-rescore", float_rescore,
+               "Exact-IP re-rank of ANN top-k using unit corpus (timed; default ON)");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
   CLI11_PARSE(app, argc, argv);
@@ -459,7 +463,8 @@ int main(int argc, char** argv) {
         vectorcache::planes_wanted(bits, n_byte_groups, db.rows) ? 1 : 0;
     std::cout << "dataset rows=" << db.rows << " dim=" << db.cols << " queries=" << queries.rows
               << " scan_bits=" << bits << " rerank_bits=" << effective_rerank_bits
-              << " landmarks=" << landmarks << " k=" << k << " planes=" << planes_on;
+              << " landmarks=" << landmarks << " k=" << k << " planes=" << planes_on
+              << " float_rescore=" << (float_rescore ? 1 : 0);
     if (const char* sh = std::getenv("VECTORCACHE_SIGN_HEAP"); sh && sh[0] != '\0') {
       std::cout << " sign_heap=" << sh;
     }
@@ -489,13 +494,17 @@ int main(int argc, char** argv) {
               << " prepare_ms=" << prepare_ms << "\n"
               << std::flush;
 
-    if (!recall) {
+    // Keep unit corpus in RAM when float-rescoring or computing recall GT.
+    if (!recall && !float_rescore) {
       db = Matrix{};
     }
 
+    const std::span<const float> float_corpus =
+        float_rescore ? std::span<const float>(db.data) : std::span<const float>{};
+
     for (std::size_t r = 0; r < timing_runs; ++r) {
       const auto a = std::chrono::steady_clock::now();
-      last = index.search(queries.data, k);
+      last = index.search(queries.data, k, float_corpus);
       const auto b = std::chrono::steady_clock::now();
       run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
     }

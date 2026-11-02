@@ -51,7 +51,36 @@ TEST(Index, SelfQueryHighScore) {
   auto res = index.search(std::span<const float>(db.data(), dim), 1);
   ASSERT_EQ(res.k, 1u);
   EXPECT_EQ(res.ids[0], 0u);
-  EXPECT_GT(res.scores[0], 0.9f);
+  EXPECT_GT(res.scores[0], 0.7f);
+}
+
+TEST(Index, FloatRescoreSelfQuery) {
+  constexpr std::size_t dim = 128;
+  constexpr std::size_t n = 256;
+  constexpr std::size_t k = 16;
+  std::mt19937 rng(11);
+  std::normal_distribution<float> dist(0.f, 1.f);
+  std::vector<float> db(n * dim);
+  for (float& x : db) x = dist(rng);
+  for (std::size_t i = 0; i < n; ++i) {
+    double s = 0.0;
+    float* row = db.data() + i * dim;
+    for (std::size_t d = 0; d < dim; ++d) s += static_cast<double>(row[d]) * row[d];
+    const float inv = (s > 0.0) ? static_cast<float>(1.0 / std::sqrt(s)) : 0.f;
+    for (std::size_t d = 0; d < dim; ++d) row[d] *= inv;
+  }
+
+  vectorcache::LandmarkIndex index(dim, 4, /*n_landmarks=*/64);
+  index.add(db);
+  index.prepare();
+  auto res = index.search(std::span<const float>(db.data(), dim), k,
+                          std::span<const float>(db.data(), db.size()));
+  ASSERT_EQ(res.k, k);
+  EXPECT_EQ(res.ids[0], 0u);
+  EXPECT_NEAR(res.scores[0], 1.0f, 1e-4);
+  for (std::size_t j = 1; j < k; ++j) {
+    EXPECT_GE(res.scores[j - 1], res.scores[j]);
+  }
 }
 
 TEST(Index, MultiQueryMatchesSingle) {

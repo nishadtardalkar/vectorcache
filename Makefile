@@ -21,6 +21,7 @@ QUERY_SPLIT   ?=
 QUERY_LIMIT   ?=
 K             ?= 64
 RECALL        ?= 1
+FLOAT_RESCORE ?= 1
 FORCE         ?=
 BENCH_EXTRA_ARGS ?=
 CMAKE_OPTS    ?=
@@ -92,7 +93,8 @@ QUERY_BENCH_ARGS = \
 	$(call opt_arg,QUERY_SPLIT,query-split) \
 	$(call opt_arg,QUERY_LIMIT,query-limit) \
 	$(call opt_arg,K,k) \
-	$(call flag_arg,RECALL,recall)
+	$(call flag_arg,RECALL,recall) \
+	$(if $(filter 0 OFF off false FALSE no NO,$(FLOAT_RESCORE)),--no-float-rescore,)
 
 .PHONY: help login compute turbovec turbovec-setup clean
 
@@ -122,6 +124,7 @@ help:
 	@echo "  QUERY_LIMIT     --query-limit"
 	@echo "  QUERY_SPLIT     --query-split (test for glove/sift1m; holdout for openai)"
 	@echo "  RECALL=1        --recall (Recall@1 + Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
+	@echo "  FLOAT_RESCORE=1 exact-IP re-rank of ANN top-k (timed; default ON; 0 → --no-float-rescore)"
 	@echo "  OMP_NUM_THREADS=$(OMP_NUM_THREADS)  OpenMP pool for query-bench (default 8)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
 	@echo ""
