@@ -53,6 +53,11 @@ TURBOVEC_FULLSCAN ?=
 SKIP_FAISS        ?=
 TURBOVEC_STOCK    ?=
 TURBOVEC_SCRIPT   := scripts/run_turbovec.sh
+PAPER_BENCH_SCRIPT := scripts/run_paper_benchmark.sh
+# make benchmark: ours-only paper pack → one file under results/
+BENCHMARK_OUT     ?=
+BENCHMARK_OUT_DIR ?= results
+SKIP_ABLATIONS    ?=
 PYTHON            ?=
 
 ifneq (,$(filter all openai-1536 openai-3072,$(DATASETS)))
@@ -96,7 +101,7 @@ QUERY_BENCH_ARGS = \
 	$(call flag_arg,RECALL,recall) \
 	$(if $(filter 0 OFF off false FALSE no NO,$(FLOAT_RESCORE)),--no-float-rescore,)
 
-.PHONY: help login compute turbovec turbovec-setup clean
+.PHONY: help login compute benchmark turbovec turbovec-setup clean
 
 .DEFAULT_GOAL := help
 
@@ -105,6 +110,7 @@ help:
 	@echo ""
 	@echo "  make login          Configure CMake, fetch dependencies, download datasets (login node)"
 	@echo "  make compute        Build, test, and query-bench offline (compute node)"
+	@echo "  make benchmark      Ours-only paper pack → one results file (dual recall, split timing, ablations)"
 	@echo "  make turbovec-setup Login node: bootstrap Rust/maturin/deps, clone+build turbovec (needs net)"
 	@echo "  make turbovec       Compute node: run official suite offline (needs prior turbovec-setup)"
 	@echo "  make clean          Remove build directory"
@@ -123,10 +129,16 @@ help:
 	@echo "  K               --k top-k heap size (default $(K))"
 	@echo "  QUERY_LIMIT     --query-limit"
 	@echo "  QUERY_SPLIT     --query-split (test for glove/sift1m; holdout for openai)"
-	@echo "  RECALL=1        --recall (set-overlap Recall@t for t=1,2,4,...,k; caches exact top-k under .cache/exact_topk/)"
+	@echo "  RECALL=1        --recall (dual: recall1@t 1-recall + recall@t set-overlap; caches .cache/exact_topk/)"
 	@echo "  FLOAT_RESCORE=1 exact-IP re-rank of ANN top-k (timed; default ON; 0 → --no-float-rescore)"
 	@echo "  OMP_NUM_THREADS=$(OMP_NUM_THREADS)  OpenMP pool for query-bench (default 8)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"
+	@echo ""
+	@echo "Paper benchmark (make benchmark) — ours only; see PAPER_OUTLINE.md §8:"
+	@echo "  Writes $(BENCHMARK_OUT_DIR)/paper_benchmark_<dataset>_<utc>.txt (or BENCHMARK_OUT=...)"
+	@echo "  A/B FLOAT_RESCORE=0/1 at LANDMARKS=$(LANDMARKS) BITS=$(BITS) K=$(K)"
+	@echo "  C ablations m∈{256,512}, bits=2, planes-off (SKIP_ABLATIONS=1 to skip)"
+	@echo "  Does not run turbovec/FAISS (use make turbovec separately if needed)"
 	@echo ""
 	@echo "Turbovec variables (make turbovec):"
 	@echo "  Default = published openai-1536 4-bit staged mt cell (~0.12 ms/query)"
@@ -146,6 +158,8 @@ help:
 	@echo "Example: make compute DATASET=sift1m QUERY_LIMIT=10000"
 	@echo "Example: make compute LANDMARKS=512 K=64 RECALL=1"
 	@echo "Example: make compute BITS=2 LANDMARKS=1024 K=64"
+	@echo "Example: make benchmark                         # ours paper pack → results/"
+	@echo "Example: make benchmark SKIP_ABLATIONS=1        # primary A/B cells only"
 	@echo "Example: make turbovec-setup                    # login node (internet)"
 	@echo "Example: make turbovec                          # 4-bit staged mt (~0.12 ms cell)"
 	@echo "Example: make turbovec ... SKIP_FAISS=1         # recommended on tight-RAM nodes"
@@ -214,6 +228,25 @@ compute:
 	else
 		"$$QUERY_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(QUERY_BENCH_ARGS)
 	fi
+
+# Ours-only paper pack (PAPER_OUTLINE.md §8): ± float re-rank + ablations → one
+# timestamped file under results/. Requires prior `make login`. No turbovec/FAISS.
+benchmark:
+	@if [ ! -f $(LOGIN_READY) ]; then \
+		echo "Run 'make login' on a login node first."; \
+		exit 1; \
+	fi
+	set -euo pipefail
+	source $(ENV_SCRIPT)
+	export OMP_NUM_THREADS="$(OMP_NUM_THREADS)"
+	BUILD_DIR="$(BUILD_DIR)" BUILD_TYPE="$(BUILD_TYPE)" JOBS="$(JOBS)" \
+		DATA_DIR="$(DATA_DIR)" DATASET="$(DATASET)" \
+		LIMIT="$(LIMIT)" QUERY_LIMIT="$(if $(strip $(QUERY_LIMIT)),$(QUERY_LIMIT),1000)" \
+		BITS="$(BITS)" K="$(K)" LANDMARKS="$(LANDMARKS)" \
+		OMP_NUM_THREADS="$(OMP_NUM_THREADS)" \
+		SKIP_ABLATIONS="$(SKIP_ABLATIONS)" \
+		BENCHMARK_OUT="$(BENCHMARK_OUT)" BENCHMARK_OUT_DIR="$(BENCHMARK_OUT_DIR)" \
+		bash "$(PAPER_BENCH_SCRIPT)"
 
 # Login node (internet): clone + maturin wheel + wire DATA_DIR into TURBOVEC_DATA_DIR.
 turbovec-setup:

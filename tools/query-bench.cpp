@@ -19,6 +19,7 @@
 #include "vectorcache/datasets/npy.hpp"
 #include "vectorcache/index.hpp"
 #include "vectorcache/pack/pack.hpp"
+#include "vectorcache/search/float_rescore.hpp"
 
 namespace fs = std::filesystem;
 
@@ -112,7 +113,7 @@ std::vector<std::size_t> exact_topk_ids(const Matrix& db, const float* query, st
   return ids;
 }
 
-/// Set-overlap Recall@t: |approx[:t] ∩ exact[:t]| / t using the prefix of a larger-k list.
+/// Set-overlap (t-recall@t): |approx[:t] ∩ exact[:t]| / t from a fixed larger-k list.
 float recall_at_t(const std::vector<std::uint64_t>& approx, const std::vector<std::size_t>& exact,
                   std::size_t t) {
   const std::size_t n = std::min({t, approx.size(), exact.size()});
@@ -128,6 +129,18 @@ float recall_at_t(const std::vector<std::uint64_t>& approx, const std::vector<st
     }
   }
   return static_cast<float>(hit) / static_cast<float>(n);
+}
+
+/// 1-recall@t: 1 iff exact nearest neighbor (exact[0]) appears in approx[:t].
+float recall1_at_t(const std::vector<std::uint64_t>& approx, const std::vector<std::size_t>& exact,
+                   std::size_t t) {
+  if (exact.empty() || approx.empty() || t == 0) return 0.f;
+  const std::size_t nn = exact[0];
+  const std::size_t n = std::min(t, approx.size());
+  for (std::size_t ai = 0; ai < n; ++ai) {
+    if (approx[ai] == nn) return 1.f;
+  }
+  return 0.f;
 }
 
 struct ExactTopkCacheKey {
@@ -365,7 +378,7 @@ int main(int argc, char** argv) {
                  "Staged sign H99 collector capacity (default 2E via env VECTORCACHE_SIGN_HEAP)");
   app.add_option("--landmarks", landmarks, "Orthonormal landmark subspace dims");
   app.add_flag("--recall", recall,
-               "Compute set-overlap Recall@t curve (t=1,2,4,...,k) from the top-k list");
+               "Dual recall curves for t=1,2,4,...,k: recall1@t (1-recall) and recall@t (set-overlap)");
   app.add_flag("--float-rescore,!--no-float-rescore", float_rescore,
                "Exact-IP re-rank of ANN top-k using unit corpus (timed; default ON)");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
@@ -491,26 +504,62 @@ int main(int argc, char** argv) {
               << " prepare_ms=" << prepare_ms << "\n"
               << std::flush;
 
+    const std::size_t n_index = index.size();
+    const std::size_t dim = index.dim();
+    const std::size_t codes_b = index.codes_bytes();
+    const std::size_t index_b = index.index_bytes();
+    const double inv_n = n_index > 0 ? 1.0 / static_cast<double>(n_index) : 0.0;
+    std::cout << "codes_bytes=" << codes_b << " index_bytes=" << index_b
+              << " codes_bytes_per_vector=" << (codes_b * inv_n)
+              << " index_bytes_per_vector=" << (index_b * inv_n)
+              << " float32_bytes_per_vector=" << (dim * sizeof(float)) << "\n"
+              << std::flush;
+
     // Keep unit corpus in RAM when float-rescoring or computing recall GT.
     if (!recall && !float_rescore) {
       db = Matrix{};
     }
 
-    const std::span<const float> float_corpus =
-        float_rescore ? std::span<const float>(db.data) : std::span<const float>{};
+    // Split ANN vs float re-rank timing (paper needs both columns).
+    std::vector<double> ann_ms;
+    std::vector<double> rerank_ms;
+    ann_ms.reserve(timing_runs);
+    rerank_ms.reserve(timing_runs);
+    run_ms.reserve(timing_runs);
 
     for (std::size_t r = 0; r < timing_runs; ++r) {
       const auto a = std::chrono::steady_clock::now();
-      last = index.search(queries.data, k, float_corpus);
+      last = index.search(queries.data, k, /*float_corpus=*/{});
       const auto b = std::chrono::steady_clock::now();
-      run_ms.push_back(std::chrono::duration<double, std::milli>(b - a).count());
+      const double ann = std::chrono::duration<double, std::milli>(b - a).count();
+      ann_ms.push_back(ann);
+      double rerank = 0.0;
+      if (float_rescore) {
+        const auto c = std::chrono::steady_clock::now();
+        vectorcache::float_rescore_topk(last, queries.data, db.data, db.cols);
+        const auto d = std::chrono::steady_clock::now();
+        rerank = std::chrono::duration<double, std::milli>(d - c).count();
+        rerank_ms.push_back(rerank);
+      }
+      run_ms.push_back(ann + rerank);
     }
 
-    std::sort(run_ms.begin(), run_ms.end());
-    const double median_ms = run_ms[run_ms.size() / 2];
+    auto median_of = [](std::vector<double> v) {
+      std::sort(v.begin(), v.end());
+      return v[v.size() / 2];
+    };
+    const double median_ms = median_of(run_ms);
+    const double median_ann_ms = median_of(ann_ms);
     const double nq = static_cast<double>(queries.rows);
     const double ms_per_query = median_ms / nq;
-    std::cout << "search_median_ms=" << median_ms << " ms_per_query=" << ms_per_query << "\n";
+    const double ann_ms_per_query = median_ann_ms / nq;
+    std::cout << "search_median_ms=" << median_ms << " ms_per_query=" << ms_per_query
+              << " ann_ms_per_query=" << ann_ms_per_query;
+    if (float_rescore && !rerank_ms.empty()) {
+      const double rerank_ms_per_query = median_of(rerank_ms) / nq;
+      std::cout << " rerank_ms_per_query=" << rerank_ms_per_query;
+    }
+    std::cout << "\n";
 
     if (recall) {
       ExactTopkCacheKey cache_key;
@@ -545,7 +594,9 @@ int main(int argc, char** argv) {
         }
       }
 
-      // Set-overlap Recall@t: approx[:t] vs exact[:t] for t ∈ {1,2,4,...,k}.
+      // Dual metrics for t ∈ {1,2,4,...,k}:
+      //   recall1@t = 1-recall (exact NN in approx[:t]) — turbovec-comparable
+      //   recall@t  = set-overlap |approx[:t] ∩ exact[:t]| / t
       static constexpr std::size_t kCurve[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
       std::vector<std::size_t> cuts;
       for (std::size_t t : kCurve) {
@@ -553,16 +604,21 @@ int main(int argc, char** argv) {
       }
       if (cuts.empty() || cuts.back() != k) cuts.push_back(k);
 
+      std::vector<double> r1(cuts.size(), 0.0);
       std::vector<double> rt(cuts.size(), 0.0);
       for (std::size_t qi = 0; qi < queries.rows; ++qi) {
         const auto& exact = exact_ids_per_query[qi];
         std::vector<std::uint64_t> approx(last.ids.begin() + static_cast<std::ptrdiff_t>(qi * k),
                                           last.ids.begin() + static_cast<std::ptrdiff_t>((qi + 1) * k));
         for (std::size_t ci = 0; ci < cuts.size(); ++ci) {
+          r1[ci] += recall1_at_t(approx, exact, cuts[ci]);
           rt[ci] += recall_at_t(approx, exact, cuts[ci]);
         }
       }
       const double inv_nq = 1.0 / static_cast<double>(queries.rows);
+      for (std::size_t ci = 0; ci < cuts.size(); ++ci) {
+        std::cout << "recall1@" << cuts[ci] << "=" << (r1[ci] * inv_nq) << "\n";
+      }
       for (std::size_t ci = 0; ci < cuts.size(); ++ci) {
         std::cout << "recall@" << cuts[ci] << "=" << (rt[ci] * inv_nq) << "\n";
       }

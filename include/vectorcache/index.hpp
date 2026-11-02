@@ -29,6 +29,16 @@ class LandmarkIndex {
   std::size_t scan_dim() const { return scan_dim_; }
   std::size_t size() const { return n_vectors_; }
 
+  /// Landmark FastScan / sign / flat codes only (excludes α, ‖r‖, basis).
+  std::size_t codes_bytes() const {
+    return blocked_codes_.size() + sign_codes_.size() + codes_flat_.size();
+  }
+  /// Codes + per-vector α/‖r‖ side data kept for scoring (not the float corpus).
+  std::size_t index_bytes() const {
+    return codes_bytes() + residual_norms_.size() * sizeof(float) +
+           scales_.size() * sizeof(float) + scale_resid_.size() * sizeof(float);
+  }
+
   /// Append flat n*dim vectors (L2-normalized or not).
   void add(std::span<const float> vectors);
   void prepare();
