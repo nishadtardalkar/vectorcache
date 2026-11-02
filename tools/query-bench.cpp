@@ -111,9 +111,11 @@ std::vector<std::size_t> exact_topk_ids(const Matrix& db, const float* query, st
   return ids;
 }
 
-bool recall_at_1_at_k(const std::vector<std::uint64_t>& approx, std::size_t exact_top1) {
-  for (auto id : approx) {
-    if (id == exact_top1) return true;
+bool recall_at_1_at_k(const std::vector<std::uint64_t>& approx, std::size_t exact_top1,
+                      std::size_t at_k) {
+  const std::size_t n = std::min(at_k, approx.size());
+  for (std::size_t i = 0; i < n; ++i) {
+    if (approx[i] == exact_top1) return true;
   }
   return false;
 }
@@ -364,7 +366,7 @@ int main(int argc, char** argv) {
   app.add_option("--sign-heap", sign_heap,
                  "Staged sign H99 collector capacity (default 2E via env VECTORCACHE_SIGN_HEAP)");
   app.add_option("--landmarks", landmarks, "Orthonormal landmark subspace dims");
-  app.add_flag("--recall", recall, "Compute Recall@1, Recall@1@k, and Recall@k");
+  app.add_flag("--recall", recall, "Compute Recall@1@t curve (t=1,2,4,...,k) and Recall@k");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
 
   CLI11_PARSE(app, argc, argv);
@@ -537,23 +539,36 @@ int main(int argc, char** argv) {
         }
       }
 
-      double r1 = 0.0;       // true NN is approx top-1 (turbovec "recall@1")
-      double r1_at_k = 0.0;  // true NN in approx top-k
+      // Turbovec-style Recall@1@t curve over t ∈ {1,2,4,...,k}, plus set-overlap Recall@k.
+      static constexpr std::size_t kCurve[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+      std::vector<std::size_t> cuts;
+      for (std::size_t t : kCurve) {
+        if (t <= k) cuts.push_back(t);
+      }
+      if (cuts.empty() || cuts.back() != k) cuts.push_back(k);
+
+      std::vector<double> r1_at(cuts.size(), 0.0);
       double rk = 0.0;
       for (std::size_t qi = 0; qi < queries.rows; ++qi) {
         const auto& exact = exact_ids_per_query[qi];
         std::vector<std::uint64_t> approx(last.ids.begin() + static_cast<std::ptrdiff_t>(qi * k),
                                           last.ids.begin() + static_cast<std::ptrdiff_t>((qi + 1) * k));
-        if (!exact.empty() && !approx.empty() && approx[0] == exact[0]) ++r1;
-        if (!exact.empty() && recall_at_1_at_k(approx, exact[0])) ++r1_at_k;
+        if (!exact.empty()) {
+          for (std::size_t ci = 0; ci < cuts.size(); ++ci) {
+            if (recall_at_1_at_k(approx, exact[0], cuts[ci])) ++r1_at[ci];
+          }
+        }
         rk += recall_at_k(approx, exact);
       }
-      r1 /= static_cast<double>(queries.rows);
-      r1_at_k /= static_cast<double>(queries.rows);
-      rk /= static_cast<double>(queries.rows);
-      std::cout << "recall@1=" << r1 << "\n";
-      std::cout << "recall@1@" << k << "=" << r1_at_k << "\n";
-      std::cout << "recall@" << k << "=" << rk << "\n";
+      const double inv_nq = 1.0 / static_cast<double>(queries.rows);
+      for (std::size_t ci = 0; ci < cuts.size(); ++ci) {
+        std::cout << "recall@1@" << cuts[ci] << "=" << (r1_at[ci] * inv_nq) << "\n";
+      }
+      // Alias: turbovec prints "recall@1" for the @1 cut.
+      if (!cuts.empty() && cuts[0] == 1) {
+        std::cout << "recall@1=" << (r1_at[0] * inv_nq) << "\n";
+      }
+      std::cout << "recall@" << k << "=" << (rk * inv_nq) << "\n";
     }
 
     // Print a sample of first query top-3.
