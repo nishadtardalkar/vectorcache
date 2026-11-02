@@ -93,7 +93,7 @@ ctest --output-on-failure
 
 OpenAI NPY corpora have no HDF5-style `test` split; `--query-split` defaults to `holdout` (last `--query-limit` rows) for them. GloVe and SIFT1M default to `test`.
 
-Reports median batch search latency (`ms_per_query`) and optional **Recall@1** (true NN is approx top-1; turbovec-comparable), **Recall@1@k**, and **Recall@k**. Exact top-k IDs are cached under `.cache/exact_topk/` (keyed by dataset/npy, split, index size, query split/limit, and k) and reused on later runs with the same ground-truth parameters.
+Reports median batch search latency (`ms_per_query`) and optional set-overlap **Recall@t** for `t=1,2,4,...,k` (approx top-t vs exact top-t from the same top-k list). Exact top-k IDs are cached under `.cache/exact_topk/` (keyed by dataset/npy, split, index size, query split/limit, and k) and reused on later runs with the same ground-truth parameters.
 
 Bucketed mode flags: `--bucketed`, `--n-probe`, `--max-bucket-size`, `--energy-soft` (plus deprecated `--cos-var-threshold` / `--min-bucket-size` no-ops). `expected_n` is set from the loaded corpus size so the densify pulse schedule runs.
 

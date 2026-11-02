@@ -123,7 +123,7 @@ help:
 	@echo "  K               --k top-k heap size (default $(K))"
 	@echo "  QUERY_LIMIT     --query-limit"
 	@echo "  QUERY_SPLIT     --query-split (test for glove/sift1m; holdout for openai)"
-	@echo "  RECALL=1        --recall (Recall@1 + Recall@1@k + Recall@k; caches exact top-k under .cache/exact_topk/)"
+	@echo "  RECALL=1        --recall (set-overlap Recall@t for t=1,2,4,...,k; caches exact top-k under .cache/exact_topk/)"
 	@echo "  FLOAT_RESCORE=1 exact-IP re-rank of ANN top-k (timed; default ON; 0 → --no-float-rescore)"
 	@echo "  OMP_NUM_THREADS=$(OMP_NUM_THREADS)  OpenMP pool for query-bench (default 8)"
 	@echo "  BENCH_EXTRA_ARGS  appended to query-bench as-is"

@@ -112,26 +112,22 @@ std::vector<std::size_t> exact_topk_ids(const Matrix& db, const float* query, st
   return ids;
 }
 
-bool recall_at_1_at_k(const std::vector<std::uint64_t>& approx, std::size_t exact_top1,
-                      std::size_t at_k) {
-  const std::size_t n = std::min(at_k, approx.size());
-  for (std::size_t i = 0; i < n; ++i) {
-    if (approx[i] == exact_top1) return true;
-  }
-  return false;
-}
-
-float recall_at_k(const std::vector<std::uint64_t>& approx, const std::vector<std::size_t>& exact) {
+/// Set-overlap Recall@t: |approx[:t] ∩ exact[:t]| / t using the prefix of a larger-k list.
+float recall_at_t(const std::vector<std::uint64_t>& approx, const std::vector<std::size_t>& exact,
+                  std::size_t t) {
+  const std::size_t n = std::min({t, approx.size(), exact.size()});
+  if (n == 0) return 0.f;
   std::size_t hit = 0;
-  for (auto e : exact) {
-    for (auto a : approx) {
-      if (a == e) {
+  for (std::size_t ei = 0; ei < n; ++ei) {
+    const std::size_t e = exact[ei];
+    for (std::size_t ai = 0; ai < n; ++ai) {
+      if (approx[ai] == e) {
         ++hit;
         break;
       }
     }
   }
-  return exact.empty() ? 0.f : static_cast<float>(hit) / static_cast<float>(exact.size());
+  return static_cast<float>(hit) / static_cast<float>(n);
 }
 
 struct ExactTopkCacheKey {
@@ -368,7 +364,8 @@ int main(int argc, char** argv) {
   app.add_option("--sign-heap", sign_heap,
                  "Staged sign H99 collector capacity (default 2E via env VECTORCACHE_SIGN_HEAP)");
   app.add_option("--landmarks", landmarks, "Orthonormal landmark subspace dims");
-  app.add_flag("--recall", recall, "Compute Recall@1@t curve (t=1,2,4,...,k) and Recall@k");
+  app.add_flag("--recall", recall,
+               "Compute set-overlap Recall@t curve (t=1,2,4,...,k) from the top-k list");
   app.add_flag("--float-rescore,!--no-float-rescore", float_rescore,
                "Exact-IP re-rank of ANN top-k using unit corpus (timed; default ON)");
   app.add_option("--timing-runs", timing_runs, "Timed search runs (median reported)");
@@ -548,7 +545,7 @@ int main(int argc, char** argv) {
         }
       }
 
-      // Turbovec-style Recall@1@t curve over t ∈ {1,2,4,...,k}, plus set-overlap Recall@k.
+      // Set-overlap Recall@t: approx[:t] vs exact[:t] for t ∈ {1,2,4,...,k}.
       static constexpr std::size_t kCurve[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
       std::vector<std::size_t> cuts;
       for (std::size_t t : kCurve) {
@@ -556,28 +553,19 @@ int main(int argc, char** argv) {
       }
       if (cuts.empty() || cuts.back() != k) cuts.push_back(k);
 
-      std::vector<double> r1_at(cuts.size(), 0.0);
-      double rk = 0.0;
+      std::vector<double> rt(cuts.size(), 0.0);
       for (std::size_t qi = 0; qi < queries.rows; ++qi) {
         const auto& exact = exact_ids_per_query[qi];
         std::vector<std::uint64_t> approx(last.ids.begin() + static_cast<std::ptrdiff_t>(qi * k),
                                           last.ids.begin() + static_cast<std::ptrdiff_t>((qi + 1) * k));
-        if (!exact.empty()) {
-          for (std::size_t ci = 0; ci < cuts.size(); ++ci) {
-            if (recall_at_1_at_k(approx, exact[0], cuts[ci])) ++r1_at[ci];
-          }
+        for (std::size_t ci = 0; ci < cuts.size(); ++ci) {
+          rt[ci] += recall_at_t(approx, exact, cuts[ci]);
         }
-        rk += recall_at_k(approx, exact);
       }
       const double inv_nq = 1.0 / static_cast<double>(queries.rows);
       for (std::size_t ci = 0; ci < cuts.size(); ++ci) {
-        std::cout << "recall@1@" << cuts[ci] << "=" << (r1_at[ci] * inv_nq) << "\n";
+        std::cout << "recall@" << cuts[ci] << "=" << (rt[ci] * inv_nq) << "\n";
       }
-      // Alias: turbovec prints "recall@1" for the @1 cut.
-      if (!cuts.empty() && cuts[0] == 1) {
-        std::cout << "recall@1=" << (r1_at[0] * inv_nq) << "\n";
-      }
-      std::cout << "recall@" << k << "=" << (rk * inv_nq) << "\n";
     }
 
     // Print a sample of first query top-3.
