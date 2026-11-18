@@ -105,7 +105,7 @@ QUERY_BENCH_ARGS = \
 	$(call flag_arg,RECALL,recall) \
 	$(if $(filter 0 OFF off false FALSE no NO,$(FLOAT_RESCORE)),--no-float-rescore,)
 
-.PHONY: help login compute benchmark turbovec turbovec-setup clean
+.PHONY: help login compute benchmark gpu turbovec turbovec-setup clean
 
 .DEFAULT_GOAL := help
 
@@ -114,6 +114,7 @@ help:
 	@echo ""
 	@echo "  make login          Configure CMake, fetch dependencies, download datasets (login node)"
 	@echo "  make compute        Build, test, and query-bench offline (compute node)"
+	@echo "  make gpu            Build CUDA full-index TQ FastScan and run gpu-bench"
 	@echo "  make benchmark      Ours-only paper pack → one results file (dual recall, split timing, ablations)"
 	@echo "  make turbovec-setup Login node: bootstrap Rust/maturin/deps, clone+build turbovec (needs net)"
 	@echo "  make turbovec       Compute node: run official suite offline (needs prior turbovec-setup)"
@@ -163,6 +164,8 @@ help:
 	@echo "Example: make compute DATASET=sift1m QUERY_LIMIT=10000"
 	@echo "Example: make compute LANDMARKS=512 K=64 RECALL=1"
 	@echo "Example: make compute BITS=2 LANDMARKS=1024 K=64"
+	@echo "Example: make gpu                               # CUDA full-index LUT FastScan"
+	@echo "Example: make gpu DATASET=openai-1536 BITS=4 K=64 RECALL=1"
 	@echo "Example: make benchmark                         # ours paper pack → results/"
 	@echo "Example: make benchmark SKIP_ABLATIONS=1        # primary A/B cells only"
 	@echo "Example: make turbovec-setup                    # login node (internet)"
@@ -170,6 +173,12 @@ help:
 	@echo "Example: make turbovec ... SKIP_FAISS=1         # recommended on tight-RAM nodes"
 	@echo "Example: make turbovec TURBOVEC_SUITE=recall BITS=4"
 	@echo "For native SIMD: make compute CMAKE_OPTS='-DCMAKE_CXX_FLAGS=-march=native'"
+	@echo ""
+	@echo "GPU variables (make gpu):"
+	@echo "  Requires CUDA toolkit (nvcc) + a GPU. Uses VECTORCACHE_BUILD_GPU=ON."
+	@echo "  DATASET=$(DATASET)  LIMIT=$(LIMIT)  BITS=$(BITS)  K=$(K)  QUERY_LIMIT=$(QUERY_LIMIT)"
+	@echo "  RECALL=1  → --recall (1-recall@k vs exact IP on up to 100 queries)"
+	@echo "  CMAKE_CUDA_ARCHITECTURES  (default 75;86;89)"
 
 login: $(LOGIN_READY)
 
@@ -234,6 +243,66 @@ compute:
 		"$$QUERY_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) $(QUERY_BENCH_ARGS)
 	fi
 
+# CUDA full-index TurboQuant: FWHT rotate + Lloyd–Max quant + float LUT FastScan.
+# Needs nvcc and a GPU. Uses BUILD_DIR_GPU (default build-gpu) so CPU `build/`
+# is not clobbered by a different host toolchain (MSVC on Windows).
+BUILD_DIR_GPU     ?= build-gpu
+BUILD_DIR_GPU_ABS := $(abspath $(BUILD_DIR_GPU))
+
+gpu:
+	@if [ -z "$(strip $(DATASET)$(NPY))" ]; then \
+		echo "DATASET or NPY is required, e.g. make gpu"; \
+		exit 1; \
+	fi
+	set -euo pipefail
+	if [ -f "$(ENV_SCRIPT)" ]; then source $(ENV_SCRIPT); fi
+	if ! command -v nvcc >/dev/null 2>&1; then
+		echo "nvcc not found; load CUDA toolkit / add it to PATH."
+		exit 1
+	fi
+	# On Windows, nvcc needs MSVC — do not force MinGW via CMAKE_COMPILER_FLAGS.
+	GPU_CMAKE_COMPILERS="$(CMAKE_COMPILER_FLAGS)"
+	uname_s="$$(uname -s 2>/dev/null || true)"
+	case "$$uname_s" in
+		MINGW*|MSYS*|CYGWIN*|Windows_NT) GPU_CMAKE_COMPILERS="" ;;
+	esac
+	if command -v cl >/dev/null 2>&1; then
+		GPU_CMAKE_COMPILERS=""
+	fi
+	cmake -S . -B $(BUILD_DIR_GPU) $$GPU_CMAKE_COMPILERS \
+		$(CMAKE_COMMON_FLAGS) \
+		-DVECTORCACHE_BUILD_GPU=ON \
+		-DVECTORCACHE_BUILD_TESTS=OFF \
+		$(if $(strip $(CMAKE_CUDA_ARCHITECTURES)),-DCMAKE_CUDA_ARCHITECTURES="$(CMAKE_CUDA_ARCHITECTURES)",)
+	cmake --build $(BUILD_DIR_GPU) --target gpu-bench -j$(JOBS)
+	GPU_BENCH=""
+	for candidate in \
+		"$(BUILD_DIR_GPU_ABS)/gpu-bench" \
+		"$(BUILD_DIR_GPU_ABS)/$(BUILD_TYPE)/gpu-bench" \
+		"$(BUILD_DIR_GPU_ABS)/gpu-bench.exe" \
+		"$(BUILD_DIR_GPU_ABS)/$(BUILD_TYPE)/gpu-bench.exe"; do
+		if [ -x "$$candidate" ] || [ -f "$$candidate" ]; then
+			GPU_BENCH="$$candidate"
+			break
+		fi
+	done
+	if [ -z "$$GPU_BENCH" ]; then
+		GPU_BENCH="$$(find "$(BUILD_DIR_GPU_ABS)" -maxdepth 3 \
+			\( -name 'gpu-bench' -o -name 'gpu-bench.exe' \) -type f -print -quit 2>/dev/null || true)"
+	fi
+	if [ -z "$$GPU_BENCH" ] || [ ! -f "$$GPU_BENCH" ]; then
+		echo "gpu-bench not found under $(BUILD_DIR_GPU_ABS)."
+		exit 1
+	fi
+	QLIMIT="$(if $(strip $(QUERY_LIMIT)),$(QUERY_LIMIT),1000)"
+	if [ -n "$(strip $(NPY))" ]; then
+		"$$GPU_BENCH" --npy $(NPY) --data-dir $(DATA_DIR) --limit $(LIMIT) --bits $(BITS) \
+			--k $(K) --query-limit $$QLIMIT $(call flag_arg,RECALL,recall)
+	else
+		"$$GPU_BENCH" --dataset $(DATASET) --data-dir $(DATA_DIR) --limit $(LIMIT) --bits $(BITS) \
+			--k $(K) --query-limit $$QLIMIT $(call flag_arg,RECALL,recall)
+	fi
+
 # Ours-only paper pack (PAPER_OUTLINE.md §8): ± float re-rank + ablations → one
 # timestamped file under results/. Requires prior `make login`. No turbovec/FAISS.
 benchmark:
@@ -289,4 +358,4 @@ turbovec:
 		bash "$(TURBOVEC_SCRIPT)"
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(BUILD_DIR_GPU)

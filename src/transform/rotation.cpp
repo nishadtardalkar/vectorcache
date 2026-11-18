@@ -122,6 +122,20 @@ void permute_gather_signed(const float* src, const std::uint32_t* perm, const fl
 
 }  // namespace
 
+std::span<const float> Rotation::signs(std::size_t r) const {
+  if (r >= signs_.size()) {
+    throw std::out_of_range("rotation signs round out of range");
+  }
+  return signs_[r];
+}
+
+std::span<const std::uint32_t> Rotation::perm(std::size_t r) const {
+  if (r >= perms_.size()) {
+    throw std::out_of_range("rotation perm round out of range");
+  }
+  return perms_[r];
+}
+
 Rotation::Rotation(std::size_t dim) : dim_(dim) {
   if (dim == 0 || dim % 8 != 0) {
     throw std::invalid_argument("rotation dim must be a positive multiple of 8");

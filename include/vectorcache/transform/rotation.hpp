@@ -23,6 +23,11 @@ class Rotation {
   void apply_scaled_into(std::span<const float> src, float inv, std::span<float> dst,
                          std::span<float> scratch) const;
 
+  float inv_sqrt_block() const { return inv_sqrt_block_; }
+  /// Round `r` in `[0, kRotationRounds)`.
+  std::span<const float> signs(std::size_t r) const;
+  std::span<const std::uint32_t> perm(std::size_t r) const;
+
  private:
   std::size_t dim_ = 0;
   std::size_t block_ = 0;

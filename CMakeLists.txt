@@ -17,6 +17,7 @@ option(VECTORCACHE_OPENMP "Enable OpenMP parallelism" ON)
 option(VECTORCACHE_NATIVE "Enable -march=native / host ISA" OFF)
 option(VECTORCACHE_FETCH_DATASETS "Build fetch-datasets (requires libcurl)" ON)
 option(VECTORCACHE_FETCH_OPENAI "Download/convert OpenAI parquet shards (requires Arrow)" ON)
+option(VECTORCACHE_BUILD_GPU "Build CUDA full-index FastScan (gpu-bench)" OFF)
 
 include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
@@ -140,6 +141,39 @@ endif()
 if(VECTORCACHE_BUILD_TOOLS)
   add_executable(query-bench tools/query-bench.cpp)
   target_link_libraries(query-bench PRIVATE vectorcache CLI11::CLI11)
+endif()
+
+if(VECTORCACHE_BUILD_GPU)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+    # 75+ covers T4/RTX20; 86 for Ampere laptops; native when supported.
+    set(CMAKE_CUDA_ARCHITECTURES "75;86;89" CACHE STRING "CUDA archs" FORCE)
+  endif()
+
+  add_library(vectorcache_gpu STATIC
+    src/gpu/flat_index.cpp
+    src/gpu/kernels.cu
+  )
+  set_target_properties(vectorcache_gpu PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(vectorcache_gpu PUBLIC include PRIVATE src/gpu)
+  target_link_libraries(vectorcache_gpu PUBLIC vectorcache CUDA::cudart)
+  target_compile_definitions(vectorcache_gpu PUBLIC VECTORCACHE_HAS_GPU=1)
+  if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    target_compile_options(vectorcache_gpu PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    )
+  endif()
+
+  if(VECTORCACHE_BUILD_TOOLS)
+    add_executable(gpu-bench tools/gpu-bench.cpp)
+    target_link_libraries(gpu-bench PRIVATE vectorcache_gpu CLI11::CLI11)
+  endif()
 endif()
 
 if(VECTORCACHE_BUILD_TESTS)
