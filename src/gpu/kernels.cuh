@@ -7,10 +7,18 @@ namespace vectorcache::gpu::detail {
 
 inline constexpr int kGpuTile = 32;
 inline constexpr int kScanThreads = 256;
+/// Pack this many byte-groups into one uint32 for coalesced vector loads.
+inline constexpr int kGroupsPerU32 = 4;
+/// Queries fused per scan block (one codes stream, NQ heaps).
+/// Shared: NQ query rows (~24 KiB @ d=1536). Centroids live in registers.
+inline constexpr int kNqBatch = 4;
+/// Fallback fuse width when k is large (register/local pressure).
+inline constexpr int kNqBatchLargeK = 2;
 
 struct CudaBuffers {
   float* d_vectors = nullptr;
-  std::uint8_t* d_codes = nullptr;
+  /// Layout: [tile][g4][lane] as uint32 (4 consecutive byte-groups packed LE).
+  std::uint32_t* d_codes = nullptr;
   float* d_scales = nullptr;
   float* d_centroids = nullptr;
   float* d_boundaries = nullptr;
@@ -18,16 +26,15 @@ struct CudaBuffers {
   float* d_signs = nullptr;
   float* d_queries = nullptr;
   float* d_q_rot = nullptr;
-  float* d_scores = nullptr;  // nq * n_pad score buffer
   float* d_out_scores = nullptr;
   std::uint64_t* d_out_ids = nullptr;
 
   std::size_t n = 0;
-  std::size_t n_pad = 0;  // padded to kScanThreads
   std::size_t dim = 0;
   std::size_t bits = 0;
   std::size_t n_cent = 0;
   std::size_t n_byte_groups = 0;
+  std::size_t nbg4 = 0;  // ceil(n_byte_groups / 4)
   std::size_t n_tiles = 0;
   std::size_t block = 0;
   float inv_sqrt_block = 0.f;

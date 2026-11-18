@@ -190,6 +190,6 @@ int main(int argc, char** argv) {
               << eval_n << ")\n";
   }
 
-  std::cout << "backend=gpu_fwht_lut_fastscan\n";
+  std::cout << "backend=gpu_fwht_lut_fastscan_mq4\n";
   return 0;
 }

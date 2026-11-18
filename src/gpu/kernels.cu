@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace vectorcache::gpu::detail {
 namespace {
@@ -57,11 +58,19 @@ __device__ float block_reduce_sum(float local, int tid) {
   return red[0];
 }
 
-__global__ void encode_coop(const float* __restrict__ vectors, std::uint8_t* __restrict__ codes_tiled,
+__device__ inline unsigned pack_byte_4bit(unsigned c0, unsigned c1) {
+  return ((c0 & 0xfu) << 4) | (c1 & 0xfu);
+}
+
+__device__ inline unsigned pack_byte_2bit(unsigned c0, unsigned c1, unsigned c2, unsigned c3) {
+  return ((((c0 & 3u) << 2) | (c1 & 3u)) << 4) | (((c2 & 3u) << 2) | (c3 & 3u));
+}
+
+__global__ void encode_coop(const float* __restrict__ vectors, std::uint32_t* __restrict__ codes_u32,
                             float* __restrict__ scales, const float* __restrict__ centroids,
                             const float* __restrict__ boundaries, const unsigned* __restrict__ perm,
                             const float* __restrict__ signs, int n, int dim, int bits, int n_cent,
-                            int n_bounds, int nbg, int wht_block, float inv_sqrt) {
+                            int n_bounds, int nbg, int nbg4, int wht_block, float inv_sqrt) {
   const int vi = blockIdx.x;
   if (vi >= n) return;
   const int tid = threadIdx.x;
@@ -101,22 +110,26 @@ __global__ void encode_coop(const float* __restrict__ vectors, std::uint8_t* __r
 
   const int tile = vi / kGpuTile;
   const int lane = vi - tile * kGpuTile;
-  if (bits == 4 || bits == 3) {
-    for (int g = tid; g < nbg; g += blockDim.x) {
-      const unsigned c0 = static_cast<unsigned>(__float_as_int(buf[2 * g]));
-      const unsigned c1 = static_cast<unsigned>(__float_as_int(buf[2 * g + 1]));
-      codes_tiled[(static_cast<std::size_t>(tile) * nbg + g) * kGpuTile + lane] =
-          static_cast<std::uint8_t>(((c0 & 0xfu) << 4) | (c1 & 0xfu));
+  // Pack 4 byte-groups into one LE uint32: [b0 | b1<<8 | b2<<16 | b3<<24]
+  for (int g4 = tid; g4 < nbg4; g4 += blockDim.x) {
+    unsigned bytes[4] = {0, 0, 0, 0};
+    for (int t = 0; t < kGroupsPerU32; ++t) {
+      const int g = g4 * kGroupsPerU32 + t;
+      if (g >= nbg) break;
+      if (bits == 2) {
+        const unsigned c0 = static_cast<unsigned>(__float_as_int(buf[4 * g]));
+        const unsigned c1 = static_cast<unsigned>(__float_as_int(buf[4 * g + 1]));
+        const unsigned c2 = static_cast<unsigned>(__float_as_int(buf[4 * g + 2]));
+        const unsigned c3 = static_cast<unsigned>(__float_as_int(buf[4 * g + 3]));
+        bytes[t] = pack_byte_2bit(c0, c1, c2, c3);
+      } else {
+        const unsigned c0 = static_cast<unsigned>(__float_as_int(buf[2 * g]));
+        const unsigned c1 = static_cast<unsigned>(__float_as_int(buf[2 * g + 1]));
+        bytes[t] = pack_byte_4bit(c0, c1);
+      }
     }
-  } else {
-    for (int g = tid; g < nbg; g += blockDim.x) {
-      const unsigned c0 = static_cast<unsigned>(__float_as_int(buf[4 * g])) & 3u;
-      const unsigned c1 = static_cast<unsigned>(__float_as_int(buf[4 * g + 1])) & 3u;
-      const unsigned c2 = static_cast<unsigned>(__float_as_int(buf[4 * g + 2])) & 3u;
-      const unsigned c3 = static_cast<unsigned>(__float_as_int(buf[4 * g + 3])) & 3u;
-      codes_tiled[(static_cast<std::size_t>(tile) * nbg + g) * kGpuTile + lane] =
-          static_cast<std::uint8_t>((((c0 << 2) | c1) << 4) | ((c2 << 2) | c3));
-    }
+    const unsigned packed = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
+    codes_u32[(static_cast<std::size_t>(tile) * nbg4 + g4) * kGpuTile + lane] = packed;
   }
 }
 
@@ -147,42 +160,6 @@ __global__ void rotate_query_coop(const float* __restrict__ queries, float* __re
     wht_shared(buf + off, wht_block, inv_sqrt, tid, blockDim.x);
   }
   for (int j = tid; j < dim; j += blockDim.x) dst[j] = buf[j];
-}
-
-__device__ inline float score_vector_4bit(const std::uint8_t* __restrict__ base,
-                                         const float* __restrict__ sq, const float* __restrict__ sc,
-                                         int nbg) {
-  float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-  int g = 0;
-  for (; g + 3 < nbg; g += 4) {
-    const unsigned b0 = base[g * kGpuTile];
-    const unsigned b1 = base[(g + 1) * kGpuTile];
-    const unsigned b2 = base[(g + 2) * kGpuTile];
-    const unsigned b3 = base[(g + 3) * kGpuTile];
-    a0 += sq[2 * g] * sc[b0 >> 4] + sq[2 * g + 1] * sc[b0 & 0xfu];
-    a1 += sq[2 * (g + 1)] * sc[b1 >> 4] + sq[2 * (g + 1) + 1] * sc[b1 & 0xfu];
-    a2 += sq[2 * (g + 2)] * sc[b2 >> 4] + sq[2 * (g + 2) + 1] * sc[b2 & 0xfu];
-    a3 += sq[2 * (g + 3)] * sc[b3 >> 4] + sq[2 * (g + 3) + 1] * sc[b3 & 0xfu];
-  }
-  for (; g < nbg; ++g) {
-    const unsigned b = base[g * kGpuTile];
-    a0 += sq[2 * g] * sc[b >> 4] + sq[2 * g + 1] * sc[b & 0xfu];
-  }
-  return (a0 + a1) + (a2 + a3);
-}
-
-__device__ inline float score_vector_2bit(const std::uint8_t* __restrict__ base,
-                                         const float* __restrict__ sq, const float* __restrict__ sc,
-                                         int nbg) {
-  float a0 = 0.f, a1 = 0.f;
-  for (int g = 0; g < nbg; ++g) {
-    const unsigned b = base[g * kGpuTile];
-    const unsigned lo = b >> 4;
-    const unsigned hi = b & 0xfu;
-    a0 += sq[4 * g] * sc[(lo >> 2) & 3u] + sq[4 * g + 1] * sc[lo & 3u];
-    a1 += sq[4 * g + 2] * sc[(hi >> 2) & 3u] + sq[4 * g + 3] * sc[hi & 3u];
-  }
-  return a0 + a1;
 }
 
 __device__ inline void heap_push_min(float* hs, int* hi, int& sz, int k, float score, int id) {
@@ -239,27 +216,124 @@ __device__ void sort_desc(float* s, int* ids, int n) {
   }
 }
 
-template <int kCap>
-__global__ void __launch_bounds__(kScanThreads, 4)
-    scan_fused_topk_k(const std::uint8_t* __restrict__ codes_tiled, const float* __restrict__ scales,
-                      const float* __restrict__ q_rot, const float* __restrict__ centroids,
-                      float* __restrict__ out_scores, unsigned long long* __restrict__ out_ids, int n,
-                      int dim, int bits, int n_cent, int nbg, int k) {
-  const int qi = blockIdx.x;
+/// Score NQ queries from one codes stream (codes loaded once; q in shared, centroids in regs).
+template <int NQ>
+__device__ inline void score_mq_u32_4bit(const std::uint32_t* __restrict__ base_u32,
+                                        const float* __restrict__ sq, int dim,
+                                        const float* __restrict__ cent, int nbg4, float out[NQ]) {
+  float a[NQ];
+#pragma unroll
+  for (int qi = 0; qi < NQ; ++qi) a[qi] = 0.f;
+  for (int g4 = 0; g4 + 1 < nbg4; g4 += 2) {
+    const unsigned p0 = __ldg(base_u32 + g4 * kGpuTile);
+    const unsigned p1 = __ldg(base_u32 + (g4 + 1) * kGpuTile);
+    const int g = g4 * kGroupsPerU32;
+    const unsigned b0 = p0 & 0xffu, b1 = (p0 >> 8) & 0xffu, b2 = (p0 >> 16) & 0xffu,
+                   b3 = (p0 >> 24) & 0xffu;
+    const unsigned b4 = p1 & 0xffu, b5 = (p1 >> 8) & 0xffu, b6 = (p1 >> 16) & 0xffu,
+                   b7 = (p1 >> 24) & 0xffu;
+#pragma unroll
+    for (int qi = 0; qi < NQ; ++qi) {
+      const float* q = sq + static_cast<std::size_t>(qi) * dim;
+      a[qi] += q[2 * g] * cent[b0 >> 4] + q[2 * g + 1] * cent[b0 & 0xfu];
+      a[qi] += q[2 * (g + 1)] * cent[b1 >> 4] + q[2 * (g + 1) + 1] * cent[b1 & 0xfu];
+      a[qi] += q[2 * (g + 2)] * cent[b2 >> 4] + q[2 * (g + 2) + 1] * cent[b2 & 0xfu];
+      a[qi] += q[2 * (g + 3)] * cent[b3 >> 4] + q[2 * (g + 3) + 1] * cent[b3 & 0xfu];
+      a[qi] += q[2 * (g + 4)] * cent[b4 >> 4] + q[2 * (g + 4) + 1] * cent[b4 & 0xfu];
+      a[qi] += q[2 * (g + 5)] * cent[b5 >> 4] + q[2 * (g + 5) + 1] * cent[b5 & 0xfu];
+      a[qi] += q[2 * (g + 6)] * cent[b6 >> 4] + q[2 * (g + 6) + 1] * cent[b6 & 0xfu];
+      a[qi] += q[2 * (g + 7)] * cent[b7 >> 4] + q[2 * (g + 7) + 1] * cent[b7 & 0xfu];
+    }
+  }
+  if (nbg4 & 1) {
+    const int g4 = nbg4 - 1;
+    const unsigned p = __ldg(base_u32 + g4 * kGpuTile);
+    const int g = g4 * kGroupsPerU32;
+#pragma unroll
+    for (int qi = 0; qi < NQ; ++qi) {
+      const float* q = sq + static_cast<std::size_t>(qi) * dim;
+#pragma unroll
+      for (int bi = 0; bi < 4; ++bi) {
+        const unsigned byte = (p >> (8 * bi)) & 0xffu;
+        const int j = 2 * (g + bi);
+        a[qi] += q[j] * cent[byte >> 4] + q[j + 1] * cent[byte & 0xfu];
+      }
+    }
+  }
+#pragma unroll
+  for (int qi = 0; qi < NQ; ++qi) out[qi] = a[qi];
+}
+
+template <int NQ>
+__device__ inline void score_mq_u32_2bit(const std::uint32_t* __restrict__ base_u32,
+                                        const float* __restrict__ sq, int dim,
+                                        const float* __restrict__ cent, int nbg4, float out[NQ]) {
+  float a[NQ];
+#pragma unroll
+  for (int qi = 0; qi < NQ; ++qi) a[qi] = 0.f;
+  for (int g4 = 0; g4 < nbg4; ++g4) {
+    const unsigned p = __ldg(base_u32 + g4 * kGpuTile);
+#pragma unroll
+    for (int qi = 0; qi < NQ; ++qi) {
+      const float* q = sq + static_cast<std::size_t>(qi) * dim;
+      const int g = g4 * kGroupsPerU32;
+#pragma unroll
+      for (int bi = 0; bi < 4; ++bi) {
+        const unsigned byte = (p >> (8 * bi)) & 0xffu;
+        const unsigned lo = byte >> 4;
+        const unsigned hi = byte & 0xfu;
+        const int j = 4 * (g + bi);
+        a[qi] += q[j] * cent[(lo >> 2) & 3u] + q[j + 1] * cent[lo & 3u] +
+                 q[j + 2] * cent[(hi >> 2) & 3u] + q[j + 3] * cent[hi & 3u];
+      }
+    }
+  }
+#pragma unroll
+  for (int qi = 0; qi < NQ; ++qi) out[qi] = a[qi];
+}
+
+/// Multi-query fused scan: shared queries + register centroids, codes loaded once per vector.
+template <int NQ, int kCap, int kLocal, int Bits>
+__global__ void __launch_bounds__(kScanThreads, 2)
+    scan_mq_topk(const std::uint32_t* __restrict__ codes_u32, const float* __restrict__ scales,
+                 const float* __restrict__ q_rot, const float* __restrict__ centroids,
+                 float* __restrict__ out_scores, unsigned long long* __restrict__ out_ids, int n,
+                 int nq_total, int dim, int n_cent, int nbg4, int k) {
+  static_assert(kLocal <= kCap, "kLocal");
+  const int q_base = blockIdx.x * NQ;
+  if (q_base >= nq_total) return;
+  const int nq_local = (q_base + NQ <= nq_total) ? NQ : (nq_total - q_base);
   const int tid = threadIdx.x;
   extern __shared__ float smem[];
   float* sq = smem;
-  float* sc = sq + dim;
+  float* sc = sq + static_cast<std::size_t>(NQ) * dim;
 
-  for (int j = tid; j < dim; j += blockDim.x) {
-    sq[j] = q_rot[static_cast<std::size_t>(qi) * dim + j];
+  for (int qi = 0; qi < NQ; ++qi) {
+    float* dst = sq + static_cast<std::size_t>(qi) * dim;
+    if (qi < nq_local) {
+      const float* src = q_rot + static_cast<std::size_t>(q_base + qi) * dim;
+      for (int j = tid; j < dim; j += blockDim.x) dst[j] = src[j];
+    } else {
+      for (int j = tid; j < dim; j += blockDim.x) dst[j] = 0.f;
+    }
   }
   for (int j = tid; j < n_cent; j += blockDim.x) sc[j] = centroids[j];
   __syncthreads();
 
-  float loc_s[kCap];
-  int loc_i[kCap];
-  int loc_sz = 0;
+  // Centroids are tiny — keep in registers for the hot path.
+  float cent[16];
+#pragma unroll
+  for (int c = 0; c < 16; ++c) cent[c] = (c < n_cent) ? sc[c] : 0.f;
+
+  float loc_s[NQ][kLocal];
+  int loc_i[NQ][kLocal];
+  int loc_sz[NQ];
+  float thr_s[NQ];
+#pragma unroll
+  for (int qi = 0; qi < NQ; ++qi) {
+    loc_sz[qi] = 0;
+    thr_s[qi] = -1e30f;
+  }
   const int kk = (k < kCap) ? k : kCap;
 
   const int n_tiles = (n + kGpuTile - 1) / kGpuTile;
@@ -268,12 +342,24 @@ __global__ void __launch_bounds__(kScanThreads, 4)
     const int lane = tid & (kGpuTile - 1);
     const int vi = tile * kGpuTile + lane;
     if (vi >= n) continue;
-    const std::uint8_t* base =
-        codes_tiled + static_cast<std::size_t>(tile) * nbg * kGpuTile + lane;
-    float s = (bits == 2) ? score_vector_2bit(base, sq, sc, nbg)
-                          : score_vector_4bit(base, sq, sc, nbg);
-    s *= __ldg(scales + vi);
-    heap_push_min(loc_s, loc_i, loc_sz, kk, s, vi);
+    const std::uint32_t* base =
+        codes_u32 + static_cast<std::size_t>(tile) * nbg4 * kGpuTile + lane;
+    const float scale = __ldg(scales + vi);
+
+    float scores[NQ];
+    if constexpr (Bits == 2) {
+      score_mq_u32_2bit<NQ>(base, sq, dim, cent, nbg4, scores);
+    } else {
+      score_mq_u32_4bit<NQ>(base, sq, dim, cent, nbg4, scores);
+    }
+#pragma unroll
+    for (int qi = 0; qi < NQ; ++qi) {
+      if (qi >= nq_local) continue;
+      const float s = scores[qi] * scale;
+      if (loc_sz[qi] >= kLocal && s <= thr_s[qi]) continue;
+      heap_push_min(loc_s[qi], loc_i[qi], loc_sz[qi], kLocal, s, vi);
+      thr_s[qi] = loc_s[qi][0];
+    }
   }
 
   __shared__ float warp_s[kScanThreads / 32][kCap];
@@ -281,40 +367,45 @@ __global__ void __launch_bounds__(kScanThreads, 4)
   __shared__ int warp_n[kScanThreads / 32];
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  if (lane == 0) warp_n[warp] = 0;
-  __syncwarp();
-  for (int t = 0; t < 32; ++t) {
-    if (lane == t) {
-      for (int i = 0; i < loc_sz; ++i) {
-        heap_push_min(warp_s[warp], warp_i[warp], warp_n[warp], kk, loc_s[i], loc_i[i]);
-      }
-    }
-    __syncwarp();
-  }
-  __syncthreads();
 
-  if (tid == 0) {
-    float blk_s[kCap];
-    int blk_i[kCap];
-    int blk_n = 0;
-    const int nwarps = blockDim.x >> 5;
-    for (int w = 0; w < nwarps; ++w) {
-      for (int i = 0; i < warp_n[w]; ++i) {
-        heap_push_min(blk_s, blk_i, blk_n, kk, warp_s[w][i], warp_i[w][i]);
+  for (int qi = 0; qi < nq_local; ++qi) {
+    if (lane == 0) warp_n[warp] = 0;
+    __syncwarp();
+    for (int t = 0; t < 32; ++t) {
+      if (lane == t) {
+        for (int i = 0; i < loc_sz[qi]; ++i) {
+          heap_push_min(warp_s[warp], warp_i[warp], warp_n[warp], kk, loc_s[qi][i], loc_i[qi][i]);
+        }
+      }
+      __syncwarp();
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      float blk_s[kCap];
+      int blk_i[kCap];
+      int blk_n = 0;
+      const int nwarps = blockDim.x >> 5;
+      for (int w = 0; w < nwarps; ++w) {
+        for (int i = 0; i < warp_n[w]; ++i) {
+          heap_push_min(blk_s, blk_i, blk_n, kk, warp_s[w][i], warp_i[w][i]);
+        }
+      }
+      sort_desc(blk_s, blk_i, blk_n);
+      const int qg = q_base + qi;
+      float* os = out_scores + static_cast<std::size_t>(qg) * k;
+      unsigned long long* oi = out_ids + static_cast<std::size_t>(qg) * k;
+      for (int i = 0; i < k; ++i) {
+        if (i < blk_n) {
+          os[i] = blk_s[i];
+          oi[i] = static_cast<unsigned long long>(blk_i[i]);
+        } else {
+          os[i] = -1e30f;
+          oi[i] = 0;
+        }
       }
     }
-    sort_desc(blk_s, blk_i, blk_n);
-    float* os = out_scores + static_cast<std::size_t>(qi) * k;
-    unsigned long long* oi = out_ids + static_cast<std::size_t>(qi) * k;
-    for (int i = 0; i < k; ++i) {
-      if (i < blk_n) {
-        os[i] = blk_s[i];
-        oi[i] = static_cast<unsigned long long>(blk_i[i]);
-      } else {
-        os[i] = -1e30f;
-        oi[i] = 0;
-      }
-    }
+    __syncthreads();
   }
 }
 
@@ -360,7 +451,6 @@ void free_buffers(CudaBuffers& b) {
   free_p(b.d_signs);
   free_p(b.d_queries);
   free_p(b.d_q_rot);
-  free_p(b.d_scores);
   free_p(b.d_out_scores);
   free_p(b.d_out_ids);
   b.capacity_q = 0;
@@ -371,24 +461,24 @@ void alloc_index_buffers(CudaBuffers& b, std::size_t n, std::size_t dim, std::si
                          std::size_t block, float inv_sqrt_block) {
   free_buffers(b);
   b.n = n;
-  b.n_pad = 0;
   b.dim = dim;
   b.bits = bits;
   b.n_cent = 1u << bits;
   b.n_byte_groups = dim / (8 / bits);
+  b.nbg4 = (b.n_byte_groups + kGroupsPerU32 - 1) / kGroupsPerU32;
   b.n_tiles = (n + kGpuTile - 1) / kGpuTile;
   b.block = block;
   b.inv_sqrt_block = inv_sqrt_block;
 
-  const std::size_t codes_bytes = b.n_tiles * b.n_byte_groups * kGpuTile;
+  const std::size_t codes_u32 = b.n_tiles * b.nbg4 * kGpuTile;
   VC_CUDA(cudaMalloc(&b.d_vectors, n * dim * sizeof(float)));
-  VC_CUDA(cudaMalloc(&b.d_codes, codes_bytes));
+  VC_CUDA(cudaMalloc(&b.d_codes, codes_u32 * sizeof(std::uint32_t)));
   VC_CUDA(cudaMalloc(&b.d_scales, n * sizeof(float)));
   VC_CUDA(cudaMalloc(&b.d_centroids, b.n_cent * sizeof(float)));
   VC_CUDA(cudaMalloc(&b.d_boundaries, (b.n_cent > 1 ? b.n_cent - 1 : 1) * sizeof(float)));
   VC_CUDA(cudaMalloc(&b.d_perm, dim * sizeof(std::uint32_t)));
   VC_CUDA(cudaMalloc(&b.d_signs, dim * sizeof(float)));
-  VC_CUDA(cudaMemset(b.d_codes, 0, codes_bytes));
+  VC_CUDA(cudaMemset(b.d_codes, 0, codes_u32 * sizeof(std::uint32_t)));
 }
 
 void ensure_query_capacity(CudaBuffers& b, std::size_t nq, std::size_t k) {
@@ -434,7 +524,8 @@ void encode_on_device(CudaBuffers& b) {
       b.d_vectors, b.d_codes, b.d_scales, b.d_centroids, b.d_boundaries, b.d_perm, b.d_signs,
       static_cast<int>(b.n), static_cast<int>(b.dim), static_cast<int>(b.bits),
       static_cast<int>(b.n_cent), static_cast<int>(b.n_cent > 1 ? b.n_cent - 1 : 0),
-      static_cast<int>(b.n_byte_groups), static_cast<int>(b.block), b.inv_sqrt_block);
+      static_cast<int>(b.n_byte_groups), static_cast<int>(b.nbg4), static_cast<int>(b.block),
+      b.inv_sqrt_block);
   VC_CUDA(cudaGetLastError());
   cuda_sync();
 }
@@ -452,22 +543,54 @@ void search_on_device(CudaBuffers& b, const float* host_queries, std::size_t nq,
   VC_CUDA(cudaGetLastError());
 
   {
-    const std::size_t shmem = (b.dim + b.n_cent) * sizeof(float);
-    const int nqi = static_cast<int>(nq);
     const int ni = static_cast<int>(b.n);
+    const int nqi = static_cast<int>(nq);
     const int di = static_cast<int>(b.dim);
-    const int bi = static_cast<int>(b.bits);
     const int nc = static_cast<int>(b.n_cent);
-    const int nbg = static_cast<int>(b.n_byte_groups);
+    const int nbg4 = static_cast<int>(b.nbg4);
     const int ki = static_cast<int>(k);
-    if (k <= 64) {
-      scan_fused_topk_k<64><<<nqi, kScanThreads, shmem>>>(
-          b.d_codes, b.d_scales, b.d_q_rot, b.d_centroids, b.d_out_scores, b.d_out_ids, ni, di, bi,
-          nc, nbg, ki);
+    const int bits = static_cast<int>(b.bits);
+
+    auto launch_mq = [&](auto nq_tag, auto k_tag, auto local_tag, auto bits_tag) {
+      constexpr int NQ = decltype(nq_tag)::value;
+      constexpr int kCap = decltype(k_tag)::value;
+      constexpr int kLocal = decltype(local_tag)::value;
+      constexpr int Bits = decltype(bits_tag)::value;
+      const std::size_t shmem =
+          (static_cast<std::size_t>(NQ) * b.dim + b.n_cent) * sizeof(float);
+      const int grid = static_cast<int>((nq + NQ - 1) / NQ);
+      scan_mq_topk<NQ, kCap, kLocal, Bits><<<grid, kScanThreads, shmem>>>(
+          b.d_codes, b.d_scales, b.d_q_rot, b.d_centroids, b.d_out_scores, b.d_out_ids, ni, nqi, di,
+          nc, nbg4, ki);
+    };
+
+    auto launch_bits = [&](auto nq_tag, auto k_tag, auto local_tag) {
+      if (bits == 2) {
+        launch_mq(nq_tag, k_tag, local_tag, std::integral_constant<int, 2>{});
+      } else {
+        launch_mq(nq_tag, k_tag, local_tag, std::integral_constant<int, 4>{});
+      }
+    };
+
+    if (k <= 16) {
+      if (nq >= 4) {
+        launch_bits(std::integral_constant<int, kNqBatch>{}, std::integral_constant<int, 16>{},
+                    std::integral_constant<int, 4>{});
+      } else {
+        launch_bits(std::integral_constant<int, 1>{}, std::integral_constant<int, 16>{},
+                    std::integral_constant<int, 4>{});
+      }
+    } else if (k <= 64) {
+      if (nq >= 4) {
+        launch_bits(std::integral_constant<int, kNqBatch>{}, std::integral_constant<int, 64>{},
+                    std::integral_constant<int, 8>{});
+      } else {
+        launch_bits(std::integral_constant<int, 1>{}, std::integral_constant<int, 64>{},
+                    std::integral_constant<int, 8>{});
+      }
     } else {
-      scan_fused_topk_k<256><<<nqi, kScanThreads, shmem>>>(
-          b.d_codes, b.d_scales, b.d_q_rot, b.d_centroids, b.d_out_scores, b.d_out_ids, ni, di, bi,
-          nc, nbg, ki);
+      launch_bits(std::integral_constant<int, kNqBatchLargeK>{},
+                  std::integral_constant<int, 256>{}, std::integral_constant<int, 16>{});
     }
     VC_CUDA(cudaGetLastError());
   }
