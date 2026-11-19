@@ -111,6 +111,9 @@ int main(int argc, char** argv) {
   std::size_t query_limit = 1000;
   std::size_t bits = 4;
   std::size_t k = 64;
+  std::size_t landmarks = 0;
+  std::uint64_t landmark_seed = 0;
+  bool project_then_quant = false;
   int warmup = 2;
   int runs = 5;
   bool do_recall = false;
@@ -123,6 +126,10 @@ int main(int argc, char** argv) {
   app.add_option("--query-limit", query_limit, "Query rows");
   app.add_option("--bits", bits, "Quant bits 2-4")->check(CLI::Range(2, 4));
   app.add_option("--k", k, "Top-k");
+  app.add_option("--landmarks", landmarks, "Ortho landmarks m (0=full-dim scan)");
+  app.add_option("--landmark-seed", landmark_seed, "Landmark RNG seed");
+  app.add_flag("--project-then-quant", project_then_quant,
+               "FWHT float project then TQ in landmark dim");
   app.add_option("--warmup", warmup, "Warmup searches");
   app.add_option("--runs", runs, "Timed search repeats");
   app.add_flag("--recall", do_recall, "Compute 1-recall@k vs exact IP");
@@ -148,10 +155,15 @@ int main(int argc, char** argv) {
                       db.data.begin() + static_cast<std::ptrdiff_t>(nq * db.cols));
 
   std::cout << "gpu-bench device corpus=" << db.rows << " dim=" << db.cols << " bits=" << bits
-            << " nq=" << nq << " k=" << k << "\n";
+            << " nq=" << nq << " k=" << k << " landmarks=" << landmarks << "\n";
 
-  vectorcache::gpu::FlatIndex index(db.cols, bits);
-  std::cout << "device: " << index.device_name() << "\n";
+  vectorcache::gpu::FlatIndex index(db.cols, bits, landmarks, landmark_seed, project_then_quant);
+  std::cout << "device: " << index.device_name();
+  if (index.uses_landmarks()) {
+    std::cout << " scan_dim=" << index.scan_dim()
+              << (project_then_quant ? " project_then_quant" : "");
+  }
+  std::cout << "\n";
 
   const auto t0 = std::chrono::steady_clock::now();
   index.add(db.data);
@@ -190,6 +202,10 @@ int main(int argc, char** argv) {
               << eval_n << ")\n";
   }
 
-  std::cout << "backend=gpu_fwht_lut_fastscan_mq4\n";
+  if (landmarks > 0) {
+    std::cout << "backend=gpu_fwht_landmark_mq4\n";
+  } else {
+    std::cout << "backend=gpu_fwht_lut_fastscan_mq4\n";
+  }
   return 0;
 }

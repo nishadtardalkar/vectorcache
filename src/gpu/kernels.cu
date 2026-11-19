@@ -292,13 +292,113 @@ __device__ inline void score_mq_u32_2bit(const std::uint32_t* __restrict__ base_
   for (int qi = 0; qi < NQ; ++qi) out[qi] = a[qi];
 }
 
+__global__ void encode_prerotated_coop(const float* __restrict__ vectors,
+                                      std::uint32_t* __restrict__ codes_u32,
+                                      float* __restrict__ scales, const float* __restrict__ centroids,
+                                      const float* __restrict__ boundaries, int n, int dim, int bits,
+                                      int n_cent, int n_bounds, int nbg, int nbg4) {
+  const int vi = blockIdx.x;
+  if (vi >= n) return;
+  const int tid = threadIdx.x;
+  extern __shared__ float smem[];
+  float* buf = smem;
+  const float* src = vectors + static_cast<std::size_t>(vi) * dim;
+
+  float local = 0.f;
+  for (int j = tid; j < dim; j += blockDim.x) {
+    const float x = __ldg(src + j);
+    local += x * x;
+  }
+  const float norm = sqrtf(block_reduce_sum(local, tid));
+  const float inv = (norm > kMinNorm) ? (1.f / norm) : 0.f;
+
+  for (int j = tid; j < dim; j += blockDim.x) buf[j] = __ldg(src + j) * inv;
+  __syncthreads();
+
+  float partial_inner = 0.f;
+  for (int j = tid; j < dim; j += blockDim.x) {
+    const float x = buf[j];
+    unsigned code = quantize_code(x, boundaries, n_bounds);
+    if (static_cast<int>(code) >= n_cent) code = static_cast<unsigned>(n_cent - 1);
+    partial_inner += x * centroids[code];
+    buf[j] = __int_as_float(static_cast<int>(code));
+  }
+  const float inner = block_reduce_sum(partial_inner, tid);
+  if (tid == 0) {
+    scales[vi] = (static_cast<double>(inner) > kDegenerateInner) ? (norm / inner) : 0.f;
+  }
+  __syncthreads();
+
+  const int tile = vi / kGpuTile;
+  const int lane = vi - tile * kGpuTile;
+  for (int g4 = tid; g4 < nbg4; g4 += blockDim.x) {
+    unsigned bytes[4] = {0, 0, 0, 0};
+    for (int t = 0; t < kGroupsPerU32; ++t) {
+      const int g = g4 * kGroupsPerU32 + t;
+      if (g >= nbg) break;
+      if (bits == 2) {
+        bytes[t] = pack_byte_2bit(static_cast<unsigned>(__float_as_int(buf[4 * g])),
+                                  static_cast<unsigned>(__float_as_int(buf[4 * g + 1])),
+                                  static_cast<unsigned>(__float_as_int(buf[4 * g + 2])),
+                                  static_cast<unsigned>(__float_as_int(buf[4 * g + 3])));
+      } else {
+        bytes[t] = pack_byte_4bit(static_cast<unsigned>(__float_as_int(buf[2 * g])),
+                                  static_cast<unsigned>(__float_as_int(buf[2 * g + 1])));
+      }
+    }
+    const unsigned packed = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
+    codes_u32[(static_cast<std::size_t>(tile) * nbg4 + g4) * kGpuTile + lane] = packed;
+  }
+}
+
+/// q_land = q_rot @ L (L column-major dim×m); q_perp = sqrt(max(0, ‖q_rot‖² - ‖q_L‖²)).
+__global__ void project_queries_landmarks(const float* __restrict__ q_rot,
+                                          const float* __restrict__ L, float* __restrict__ q_land,
+                                          float* __restrict__ q_perp, int nq, int dim, int m,
+                                          int scan_dim) {
+  const int qi = blockIdx.x;
+  if (qi >= nq) return;
+  const int tid = threadIdx.x;
+  extern __shared__ float smem[];
+  float* sq = smem;
+  const float* q = q_rot + static_cast<std::size_t>(qi) * dim;
+  float* out = q_land + static_cast<std::size_t>(qi) * scan_dim;
+
+  float qn = 0.f;
+  for (int d = tid; d < dim; d += blockDim.x) {
+    const float v = __ldg(q + d);
+    sq[d] = v;
+    qn += v * v;
+  }
+  qn = block_reduce_sum(qn, tid);
+  __syncthreads();
+
+  float land_n = 0.f;
+  for (int j = tid; j < scan_dim; j += blockDim.x) {
+    float s = 0.f;
+    if (j < m) {
+      const float* col = L + static_cast<std::size_t>(j) * dim;
+      for (int d = 0; d < dim; ++d) s += sq[d] * __ldg(col + d);
+      land_n += s * s;
+    }
+    out[j] = s;
+  }
+  land_n = block_reduce_sum(land_n, tid);
+  if (tid == 0) {
+    const float r2 = qn - land_n;
+    q_perp[qi] = (r2 > 0.f) ? sqrtf(r2) : 0.f;
+  }
+}
+
 /// Multi-query fused scan: shared queries + register centroids, codes loaded once per vector.
+/// Optional residual: score = α·s_L + ‖q_⊥‖·‖r_i‖ (CPU LandmarkIndex parity).
 template <int NQ, int kCap, int kLocal, int Bits>
 __global__ void __launch_bounds__(kScanThreads, 2)
     scan_mq_topk(const std::uint32_t* __restrict__ codes_u32, const float* __restrict__ scales,
-                 const float* __restrict__ q_rot, const float* __restrict__ centroids,
+                 const float* __restrict__ residual_norms, const float* __restrict__ q_scan,
+                 const float* __restrict__ q_perp, const float* __restrict__ centroids,
                  float* __restrict__ out_scores, unsigned long long* __restrict__ out_ids, int n,
-                 int nq_total, int dim, int n_cent, int nbg4, int k) {
+                 int nq_total, int dim, int n_cent, int nbg4, int k, int use_residual) {
   static_assert(kLocal <= kCap, "kLocal");
   const int q_base = blockIdx.x * NQ;
   if (q_base >= nq_total) return;
@@ -307,23 +407,28 @@ __global__ void __launch_bounds__(kScanThreads, 2)
   extern __shared__ float smem[];
   float* sq = smem;
   float* sc = sq + static_cast<std::size_t>(NQ) * dim;
+  float* qp = sc + n_cent;
 
   for (int qi = 0; qi < NQ; ++qi) {
     float* dst = sq + static_cast<std::size_t>(qi) * dim;
     if (qi < nq_local) {
-      const float* src = q_rot + static_cast<std::size_t>(q_base + qi) * dim;
+      const float* src = q_scan + static_cast<std::size_t>(q_base + qi) * dim;
       for (int j = tid; j < dim; j += blockDim.x) dst[j] = src[j];
+      if (tid == 0) qp[qi] = use_residual ? __ldg(q_perp + (q_base + qi)) : 0.f;
     } else {
       for (int j = tid; j < dim; j += blockDim.x) dst[j] = 0.f;
+      if (tid == 0) qp[qi] = 0.f;
     }
   }
   for (int j = tid; j < n_cent; j += blockDim.x) sc[j] = centroids[j];
   __syncthreads();
 
-  // Centroids are tiny — keep in registers for the hot path.
   float cent[16];
 #pragma unroll
   for (int c = 0; c < 16; ++c) cent[c] = (c < n_cent) ? sc[c] : 0.f;
+  float qperp_reg[NQ];
+#pragma unroll
+  for (int qi = 0; qi < NQ; ++qi) qperp_reg[qi] = qp[qi];
 
   float loc_s[NQ][kLocal];
   int loc_i[NQ][kLocal];
@@ -345,6 +450,7 @@ __global__ void __launch_bounds__(kScanThreads, 2)
     const std::uint32_t* base =
         codes_u32 + static_cast<std::size_t>(tile) * nbg4 * kGpuTile + lane;
     const float scale = __ldg(scales + vi);
+    const float resid = use_residual ? __ldg(residual_norms + vi) : 0.f;
 
     float scores[NQ];
     if constexpr (Bits == 2) {
@@ -355,7 +461,7 @@ __global__ void __launch_bounds__(kScanThreads, 2)
 #pragma unroll
     for (int qi = 0; qi < NQ; ++qi) {
       if (qi >= nq_local) continue;
-      const float s = scores[qi] * scale;
+      const float s = scores[qi] * scale + qperp_reg[qi] * resid;
       if (loc_sz[qi] >= kLocal && s <= thr_s[qi]) continue;
       heap_push_min(loc_s[qi], loc_i[qi], loc_sz[qi], kLocal, s, vi);
       thr_s[qi] = loc_s[qi][0];
@@ -445,40 +551,52 @@ void free_buffers(CudaBuffers& b) {
   free_p(b.d_vectors);
   free_p(b.d_codes);
   free_p(b.d_scales);
+  free_p(b.d_residual_norms);
   free_p(b.d_centroids);
   free_p(b.d_boundaries);
   free_p(b.d_perm);
   free_p(b.d_signs);
+  free_p(b.d_landmark_basis);
   free_p(b.d_queries);
   free_p(b.d_q_rot);
+  free_p(b.d_q_land);
+  free_p(b.d_q_perp);
   free_p(b.d_out_scores);
   free_p(b.d_out_ids);
   b.capacity_q = 0;
   b.capacity_k = 0;
 }
 
-void alloc_index_buffers(CudaBuffers& b, std::size_t n, std::size_t dim, std::size_t bits,
-                         std::size_t block, float inv_sqrt_block) {
+void alloc_index_buffers(CudaBuffers& b, std::size_t n, std::size_t ambient_dim,
+                         std::size_t scan_dim, std::size_t bits, std::size_t block,
+                         float inv_sqrt_block, std::size_t n_landmarks) {
   free_buffers(b);
   b.n = n;
-  b.dim = dim;
+  b.dim = ambient_dim;
+  b.scan_dim = scan_dim;
+  b.n_landmarks = n_landmarks;
   b.bits = bits;
   b.n_cent = 1u << bits;
-  b.n_byte_groups = dim / (8 / bits);
+  b.n_byte_groups = scan_dim / (8 / bits);
   b.nbg4 = (b.n_byte_groups + kGroupsPerU32 - 1) / kGroupsPerU32;
   b.n_tiles = (n + kGpuTile - 1) / kGpuTile;
   b.block = block;
   b.inv_sqrt_block = inv_sqrt_block;
+  b.use_residual = n_landmarks > 0;
 
   const std::size_t codes_u32 = b.n_tiles * b.nbg4 * kGpuTile;
-  VC_CUDA(cudaMalloc(&b.d_vectors, n * dim * sizeof(float)));
+  VC_CUDA(cudaMalloc(&b.d_vectors, n * scan_dim * sizeof(float)));
   VC_CUDA(cudaMalloc(&b.d_codes, codes_u32 * sizeof(std::uint32_t)));
   VC_CUDA(cudaMalloc(&b.d_scales, n * sizeof(float)));
   VC_CUDA(cudaMalloc(&b.d_centroids, b.n_cent * sizeof(float)));
   VC_CUDA(cudaMalloc(&b.d_boundaries, (b.n_cent > 1 ? b.n_cent - 1 : 1) * sizeof(float)));
-  VC_CUDA(cudaMalloc(&b.d_perm, dim * sizeof(std::uint32_t)));
-  VC_CUDA(cudaMalloc(&b.d_signs, dim * sizeof(float)));
+  VC_CUDA(cudaMalloc(&b.d_perm, ambient_dim * sizeof(std::uint32_t)));
+  VC_CUDA(cudaMalloc(&b.d_signs, ambient_dim * sizeof(float)));
   VC_CUDA(cudaMemset(b.d_codes, 0, codes_u32 * sizeof(std::uint32_t)));
+  if (b.use_residual) {
+    VC_CUDA(cudaMalloc(&b.d_residual_norms, n * sizeof(float)));
+    VC_CUDA(cudaMalloc(&b.d_landmark_basis, ambient_dim * n_landmarks * sizeof(float)));
+  }
 }
 
 void ensure_query_capacity(CudaBuffers& b, std::size_t nq, std::size_t k) {
@@ -491,6 +609,8 @@ void ensure_query_capacity(CudaBuffers& b, std::size_t nq, std::size_t k) {
   };
   free_p(b.d_queries);
   free_p(b.d_q_rot);
+  free_p(b.d_q_land);
+  free_p(b.d_q_perp);
   free_p(b.d_out_scores);
   free_p(b.d_out_ids);
 
@@ -500,6 +620,10 @@ void ensure_query_capacity(CudaBuffers& b, std::size_t nq, std::size_t k) {
   VC_CUDA(cudaMalloc(&b.d_q_rot, b.capacity_q * b.dim * sizeof(float)));
   VC_CUDA(cudaMalloc(&b.d_out_scores, b.capacity_q * b.capacity_k * sizeof(float)));
   VC_CUDA(cudaMalloc(&b.d_out_ids, b.capacity_q * b.capacity_k * sizeof(std::uint64_t)));
+  if (b.use_residual) {
+    VC_CUDA(cudaMalloc(&b.d_q_land, b.capacity_q * b.scan_dim * sizeof(float)));
+    VC_CUDA(cudaMalloc(&b.d_q_perp, b.capacity_q * sizeof(float)));
+  }
 }
 
 void upload_rotation(CudaBuffers& b, const std::uint32_t* perm, const float* signs) {
@@ -516,16 +640,37 @@ void upload_codebook(CudaBuffers& b, const float* centroids, const float* bounda
 }
 
 void upload_vectors(CudaBuffers& b, const float* host_vectors, std::size_t n) {
-  VC_CUDA(cudaMemcpy(b.d_vectors, host_vectors, n * b.dim * sizeof(float), cudaMemcpyHostToDevice));
+  VC_CUDA(cudaMemcpy(b.d_vectors, host_vectors, n * b.scan_dim * sizeof(float),
+                     cudaMemcpyHostToDevice));
+}
+
+void upload_residuals(CudaBuffers& b, const float* host_residuals, std::size_t n) {
+  if (!b.d_residual_norms) throw std::runtime_error("upload_residuals without residual buffer");
+  VC_CUDA(cudaMemcpy(b.d_residual_norms, host_residuals, n * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+void upload_landmark_basis(CudaBuffers& b, const float* host_L, std::size_t dim, std::size_t m) {
+  if (!b.d_landmark_basis) throw std::runtime_error("upload_landmark_basis without basis buffer");
+  VC_CUDA(cudaMemcpy(b.d_landmark_basis, host_L, dim * m * sizeof(float), cudaMemcpyHostToDevice));
 }
 
 void encode_on_device(CudaBuffers& b) {
-  encode_coop<<<static_cast<int>(b.n), 256, b.dim * sizeof(float)>>>(
+  encode_coop<<<static_cast<int>(b.n), 256, b.scan_dim * sizeof(float)>>>(
       b.d_vectors, b.d_codes, b.d_scales, b.d_centroids, b.d_boundaries, b.d_perm, b.d_signs,
-      static_cast<int>(b.n), static_cast<int>(b.dim), static_cast<int>(b.bits),
+      static_cast<int>(b.n), static_cast<int>(b.scan_dim), static_cast<int>(b.bits),
       static_cast<int>(b.n_cent), static_cast<int>(b.n_cent > 1 ? b.n_cent - 1 : 0),
       static_cast<int>(b.n_byte_groups), static_cast<int>(b.nbg4), static_cast<int>(b.block),
       b.inv_sqrt_block);
+  VC_CUDA(cudaGetLastError());
+  cuda_sync();
+}
+
+void encode_prerotated_on_device(CudaBuffers& b) {
+  encode_prerotated_coop<<<static_cast<int>(b.n), 256, b.scan_dim * sizeof(float)>>>(
+      b.d_vectors, b.d_codes, b.d_scales, b.d_centroids, b.d_boundaries, static_cast<int>(b.n),
+      static_cast<int>(b.scan_dim), static_cast<int>(b.bits), static_cast<int>(b.n_cent),
+      static_cast<int>(b.n_cent > 1 ? b.n_cent - 1 : 0), static_cast<int>(b.n_byte_groups),
+      static_cast<int>(b.nbg4));
   VC_CUDA(cudaGetLastError());
   cuda_sync();
 }
@@ -542,14 +687,24 @@ void search_on_device(CudaBuffers& b, const float* host_queries, std::size_t nq,
       static_cast<int>(b.block), b.inv_sqrt_block);
   VC_CUDA(cudaGetLastError());
 
+  const float* q_scan = b.d_q_rot;
+  if (b.use_residual) {
+    project_queries_landmarks<<<static_cast<int>(nq), 256, b.dim * sizeof(float)>>>(
+        b.d_q_rot, b.d_landmark_basis, b.d_q_land, b.d_q_perp, static_cast<int>(nq),
+        static_cast<int>(b.dim), static_cast<int>(b.n_landmarks), static_cast<int>(b.scan_dim));
+    VC_CUDA(cudaGetLastError());
+    q_scan = b.d_q_land;
+  }
+
   {
     const int ni = static_cast<int>(b.n);
     const int nqi = static_cast<int>(nq);
-    const int di = static_cast<int>(b.dim);
+    const int di = static_cast<int>(b.scan_dim);
     const int nc = static_cast<int>(b.n_cent);
     const int nbg4 = static_cast<int>(b.nbg4);
     const int ki = static_cast<int>(k);
     const int bits = static_cast<int>(b.bits);
+    const int use_res = b.use_residual ? 1 : 0;
 
     auto launch_mq = [&](auto nq_tag, auto k_tag, auto local_tag, auto bits_tag) {
       constexpr int NQ = decltype(nq_tag)::value;
@@ -557,11 +712,11 @@ void search_on_device(CudaBuffers& b, const float* host_queries, std::size_t nq,
       constexpr int kLocal = decltype(local_tag)::value;
       constexpr int Bits = decltype(bits_tag)::value;
       const std::size_t shmem =
-          (static_cast<std::size_t>(NQ) * b.dim + b.n_cent) * sizeof(float);
+          (static_cast<std::size_t>(NQ) * b.scan_dim + b.n_cent + NQ) * sizeof(float);
       const int grid = static_cast<int>((nq + NQ - 1) / NQ);
       scan_mq_topk<NQ, kCap, kLocal, Bits><<<grid, kScanThreads, shmem>>>(
-          b.d_codes, b.d_scales, b.d_q_rot, b.d_centroids, b.d_out_scores, b.d_out_ids, ni, nqi, di,
-          nc, nbg4, ki);
+          b.d_codes, b.d_scales, b.d_residual_norms, q_scan, b.d_q_perp, b.d_centroids,
+          b.d_out_scores, b.d_out_ids, ni, nqi, di, nc, nbg4, ki, use_res);
     };
 
     auto launch_bits = [&](auto nq_tag, auto k_tag, auto local_tag) {

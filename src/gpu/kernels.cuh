@@ -20,17 +20,23 @@ struct CudaBuffers {
   /// Layout: [tile][g4][lane] as uint32 (4 consecutive byte-groups packed LE).
   std::uint32_t* d_codes = nullptr;
   float* d_scales = nullptr;
+  float* d_residual_norms = nullptr;  // optional; landmark mode
   float* d_centroids = nullptr;
   float* d_boundaries = nullptr;
   std::uint32_t* d_perm = nullptr;
   float* d_signs = nullptr;
+  float* d_landmark_basis = nullptr;  // column-major dim * m (search project)
   float* d_queries = nullptr;
-  float* d_q_rot = nullptr;
+  float* d_q_rot = nullptr;   // full ambient dim
+  float* d_q_land = nullptr;  // scan_dim (landmark mode)
+  float* d_q_perp = nullptr;  // nq residual norms
   float* d_out_scores = nullptr;
   std::uint64_t* d_out_ids = nullptr;
 
   std::size_t n = 0;
-  std::size_t dim = 0;
+  std::size_t dim = 0;       // ambient dim (rotation)
+  std::size_t scan_dim = 0;  // FastScan dim (== dim if no landmarks)
+  std::size_t n_landmarks = 0;
   std::size_t bits = 0;
   std::size_t n_cent = 0;
   std::size_t n_byte_groups = 0;
@@ -38,6 +44,7 @@ struct CudaBuffers {
   std::size_t n_tiles = 0;
   std::size_t block = 0;
   float inv_sqrt_block = 0.f;
+  bool use_residual = false;
   std::size_t capacity_q = 0;
   std::size_t capacity_k = 0;
 };
@@ -45,16 +52,23 @@ struct CudaBuffers {
 void cuda_check(int err, const char* what);
 void cuda_sync();
 
-void alloc_index_buffers(CudaBuffers& b, std::size_t n, std::size_t dim, std::size_t bits,
-                         std::size_t block, float inv_sqrt_block);
+void alloc_index_buffers(CudaBuffers& b, std::size_t n, std::size_t ambient_dim,
+                         std::size_t scan_dim, std::size_t bits, std::size_t block,
+                         float inv_sqrt_block, std::size_t n_landmarks);
 void free_buffers(CudaBuffers& b);
 void ensure_query_capacity(CudaBuffers& b, std::size_t nq, std::size_t k);
 
 void upload_rotation(CudaBuffers& b, const std::uint32_t* perm, const float* signs);
 void upload_codebook(CudaBuffers& b, const float* centroids, const float* boundaries);
 void upload_vectors(CudaBuffers& b, const float* host_vectors, std::size_t n);
+void upload_residuals(CudaBuffers& b, const float* host_residuals, std::size_t n);
+void upload_landmark_basis(CudaBuffers& b, const float* host_L, std::size_t dim, std::size_t m);
 
+/// Full-dim path: L2 + FWHT + quantize + pack (ambient dim == scan_dim).
 void encode_on_device(CudaBuffers& b);
+/// Landmark path: L2 + quantize + pack over scan_dim (no FWHT).
+void encode_prerotated_on_device(CudaBuffers& b);
+
 void search_on_device(CudaBuffers& b, const float* host_queries, std::size_t nq, std::size_t k,
                       float* host_out_scores, std::uint64_t* host_out_ids);
 
